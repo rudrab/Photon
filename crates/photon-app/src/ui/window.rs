@@ -40,6 +40,7 @@ pub struct MainWindow {
     pub window: adw::ApplicationWindow,
     pub window_title: adw::WindowTitle,
     pub timeline_container: GtkBox,
+    pub viewer_container: GtkBox,
     pub db: Database,
     pub engine: Arc<ImportEngine>,
     pub status_label: Label,
@@ -255,10 +256,15 @@ impl MainWindow {
         popover.set_child(Some(&pop_box));
         filter_btn.set_popover(Some(&popover));
 
+        let viewer_container = GtkBox::new(Orientation::Vertical, 0);
+        viewer_container.set_vexpand(true);
+        viewer_container.set_hexpand(true);
+
         let stack = Stack::new();
         stack.set_vexpand(true);
         stack.add_named(&scrolled, Some("cards"));
         stack.add_named(timeline.widget(), Some("timeline"));
+        stack.add_named(&viewer_container, Some("viewer"));
         content_box.append(&stack);
 
         // ── Status bar / In-App Notification ─────────────
@@ -298,6 +304,7 @@ impl MainWindow {
             window,
             window_title,
             timeline_container,
+            viewer_container,
             db,
             engine,
             status_label,
@@ -476,7 +483,6 @@ impl MainWindow {
                 self.show_month(*y, *m);
             }
             UIAction::ViewPhoto(idx) => {
-                self.show_cards();
                 self.show_viewer(*idx);
             }
             UIAction::FilterByTag(_) => {}
@@ -490,19 +496,14 @@ impl MainWindow {
         self.timeline_stale.set(true);
         self.sidebar.refresh_events();
         let action = self.last_grid_action.borrow().clone();
-        let showing_timeline = self.stack.visible_child_name().as_deref() == Some("timeline");
-        let showing_viewer = !showing_timeline
-            && matches!(
-                action,
-                UIAction::ShowAll | UIAction::FilterByDay(..) | UIAction::Search(_)
-            )
-            && self.timeline_container.first_child().is_some();
+        let showing_viewer = self.stack.visible_child_name().as_deref() == Some("viewer");
         if !showing_viewer {
             self.navigate(&action);
         }
     }
 
     fn show_cards(&self) {
+        self.clear_viewer();
         self.clear_timeline();
         self.stack.set_visible_child_name("cards");
     }
@@ -554,6 +555,7 @@ impl MainWindow {
             };
             return self.show_empty(&msg);
         }
+        self.clear_viewer();
         self.clear_timeline(); // drop a viewer we are returning from
         self.stack.set_visible_child_name("timeline");
     }
@@ -647,6 +649,7 @@ impl MainWindow {
         let back_action = self.last_grid_action.borrow().clone();
         let prefs = self.prefs.borrow();
 
+        self.clear_viewer();
         let viewer = detail::build_viewer(
             photos,
             index,
@@ -656,10 +659,17 @@ impl MainWindow {
             back_action,
             &self.db,
         );
-        self.timeline_container.append(&viewer);
+        self.viewer_container.append(&viewer);
+        self.stack.set_visible_child_name("viewer");
     }
 
     // ── Helpers ─────────────────────────────────────────
+
+    fn clear_viewer(&self) {
+        while let Some(c) = self.viewer_container.first_child() {
+            self.viewer_container.remove(&c);
+        }
+    }
 
     fn clear_timeline(&self) {
         while let Some(c) = self.timeline_container.first_child() {

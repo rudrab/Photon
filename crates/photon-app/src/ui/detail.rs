@@ -56,6 +56,15 @@ pub fn build_viewer(
     toolbar.set_margin_top(8);
     toolbar.set_margin_bottom(8);
 
+    let back_btn = Button::from_icon_name("view-grid-symbolic");
+    back_btn.add_css_class("flat");
+    back_btn.set_tooltip_text(Some("Back to library (Esc)"));
+    let tx_b = nav_tx.clone();
+    let ba_b = back_action.clone();
+    back_btn.connect_clicked(move |_| {
+        let _ = tx_b.send_blocking(ba_b.clone());
+    });
+
     let nav_group = GtkBox::new(Orientation::Horizontal, 0);
     nav_group.add_css_class("linked");
 
@@ -130,6 +139,7 @@ pub fn build_viewer(
     open_btn.add_css_class("flat");
     open_btn.set_tooltip_text(Some("Open in editor"));
 
+    toolbar.append(&back_btn);
     toolbar.append(&nav_group);
     toolbar.append(&cull_group);
     toolbar.append(&rating_btn);
@@ -144,11 +154,14 @@ pub fn build_viewer(
     // ── Body: image | info side panel ───────────────────
     let body = GtkBox::new(Orientation::Horizontal, 0);
     body.set_vexpand(true);
+    body.set_hexpand(true);
     root.append(&body);
 
     let image_box = GtkBox::new(Orientation::Vertical, 0);
     image_box.set_vexpand(true);
     image_box.set_hexpand(true);
+    image_box.set_halign(Align::Fill);
+    image_box.set_valign(Align::Fill);
     body.append(&image_box);
 
     let info_revealer = Revealer::new();
@@ -485,33 +498,13 @@ fn render_photo(
     let large = thumb_path(cache_dir, ThumbSize::Large, &image.hash);
     let grid = thumb_path(cache_dir, ThumbSize::Grid, &image.hash);
     let picture = Picture::new();
+    if grid.exists() {
+        picture.set_filename(Some(&grid));
+    }
     if large.exists() {
         load_texture_async(&picture, &large);
     } else {
-        if grid.exists() {
-            picture.set_filename(Some(&grid));
-        }
         load_large_preview(&picture, image, cache_dir);
-    }
-
-    let scrolled = ScrolledWindow::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .hscrollbar_policy(if is_zoomed { gtk4::PolicyType::Automatic } else { gtk4::PolicyType::Never })
-        .vscrollbar_policy(if is_zoomed { gtk4::PolicyType::Automatic } else { gtk4::PolicyType::Never })
-        .build();
-
-    if is_zoomed {
-        let w = image.width.unwrap_or(2000) as i32;
-        let h = image.height.unwrap_or(1500) as i32;
-        picture.set_size_request(w, h);
-        picture.set_content_fit(gtk4::ContentFit::Fill);
-    } else {
-        picture.set_size_request(-1, -1);
-        picture.set_content_fit(gtk4::ContentFit::Contain);
-        picture.set_can_shrink(true);
-        picture.set_hexpand(true);
-        picture.set_vexpand(true);
     }
 
     let click = GestureClick::new();
@@ -521,11 +514,43 @@ fn render_photo(
             otz();
         }
     });
-    scrolled.add_controller(click);
 
-    scrolled.set_child(Some(&picture));
-    image_box.append(&scrolled);
+    if is_zoomed {
+        let scrolled = ScrolledWindow::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .hscrollbar_policy(gtk4::PolicyType::Automatic)
+            .vscrollbar_policy(gtk4::PolicyType::Automatic)
+            .build();
+        let w = image.width.unwrap_or(2000) as i32;
+        let h = image.height.unwrap_or(1500) as i32;
+        picture.set_size_request(w, h);
+        picture.set_content_fit(gtk4::ContentFit::Fill);
+        picture.set_can_shrink(false);
+        picture.add_controller(click);
+        scrolled.set_child(Some(&picture));
+        image_box.append(&scrolled);
+    } else {
+        picture.set_size_request(-1, -1);
+        picture.set_content_fit(gtk4::ContentFit::Contain);
+        picture.set_can_shrink(true);
+        picture.set_hexpand(true);
+        picture.set_vexpand(true);
+        picture.set_halign(Align::Fill);
+        picture.set_valign(Align::Fill);
+        picture.add_controller(click);
+        image_box.append(&picture);
+    }
 
+    populate_info_panel(info_box, image, prefs, db);
+}
+
+fn populate_info_panel(
+    info_box: &GtkBox,
+    image: &Image,
+    prefs: &Preferences,
+    db: &Database,
+) {
     // ── Info panel content: sections stacked vertically ─
     let columns = GtkBox::new(Orientation::Vertical, 20);
 
@@ -830,8 +855,8 @@ fn render_compare(
     img_a: &Image,
     img_b: &Image,
     cache_dir: &Path,
-    _prefs: &Preferences,
-    _db: &Database,
+    prefs: &Preferences,
+    db: &Database,
 ) {
     clear(image_box);
     clear(info_box);
@@ -840,11 +865,22 @@ fn render_compare(
     split_box.set_hexpand(true);
     split_box.set_vexpand(true);
     split_box.set_homogeneous(true);
+    split_box.set_halign(Align::Fill);
+    split_box.set_valign(Align::Fill);
 
     // Left pane (Image A)
     let left_box = GtkBox::new(Orientation::Vertical, 6);
+    left_box.set_hexpand(true);
+    left_box.set_vexpand(true);
+    left_box.set_halign(Align::Fill);
+    left_box.set_valign(Align::Fill);
+
     let pic_a = Picture::new();
     let large_a = thumb_path(cache_dir, ThumbSize::Large, &img_a.hash);
+    let grid_a = thumb_path(cache_dir, ThumbSize::Grid, &img_a.hash);
+    if grid_a.exists() {
+        pic_a.set_filename(Some(&grid_a));
+    }
     if large_a.exists() {
         load_texture_async(&pic_a, &large_a);
     } else {
@@ -854,6 +890,8 @@ fn render_compare(
     pic_a.set_can_shrink(true);
     pic_a.set_hexpand(true);
     pic_a.set_vexpand(true);
+    pic_a.set_halign(Align::Fill);
+    pic_a.set_valign(Align::Fill);
 
     let flag_str_a = match img_a.flagged {
         1 => " [Pick ✓]",
@@ -869,8 +907,17 @@ fn render_compare(
 
     // Right pane (Image B)
     let right_box = GtkBox::new(Orientation::Vertical, 6);
+    right_box.set_hexpand(true);
+    right_box.set_vexpand(true);
+    right_box.set_halign(Align::Fill);
+    right_box.set_valign(Align::Fill);
+
     let pic_b = Picture::new();
     let large_b = thumb_path(cache_dir, ThumbSize::Large, &img_b.hash);
+    let grid_b = thumb_path(cache_dir, ThumbSize::Grid, &img_b.hash);
+    if grid_b.exists() {
+        pic_b.set_filename(Some(&grid_b));
+    }
     if large_b.exists() {
         load_texture_async(&pic_b, &large_b);
     } else {
@@ -880,6 +927,8 @@ fn render_compare(
     pic_b.set_can_shrink(true);
     pic_b.set_hexpand(true);
     pic_b.set_vexpand(true);
+    pic_b.set_halign(Align::Fill);
+    pic_b.set_valign(Align::Fill);
 
     let flag_str_b = match img_b.flagged {
         1 => " [Pick ✓]",
@@ -894,4 +943,5 @@ fn render_compare(
     split_box.append(&right_box);
 
     image_box.append(&split_box);
+    populate_info_panel(info_box, img_a, prefs, db);
 }
