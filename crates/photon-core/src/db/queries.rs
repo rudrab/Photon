@@ -19,13 +19,15 @@ pub fn insert_image(tx: &Transaction, img: &Image) -> Result<Option<i64>, Photon
             created_at, imported_at, format, has_sidecar, metadata_json, thumbnail_hash,
             camera_make, camera_model, lens_model, focal_length, aperture, shutter_speed, iso,
             latitude, longitude, location_name,
-            rating, flagged, hidden, title, description, group_hash, orientation, original_filename
+            rating, flagged, hidden, title, description, group_hash, orientation, original_filename,
+            thumbhash
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6,
             ?7, ?8, ?9, ?10, ?11, ?12,
             ?13, ?14, ?15, ?16, ?17, ?18, ?19,
             ?20, ?21, ?22,
-            ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30
+            ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
+            ?31
         )",
     )?;
     let changed = stmt.execute(params![
@@ -59,6 +61,7 @@ pub fn insert_image(tx: &Transaction, img: &Image) -> Result<Option<i64>, Photon
             img.group_hash,
             img.orientation,
             img.original_filename,
+            img.thumbhash,
     ])?;
 
     if changed > 0 {
@@ -152,13 +155,14 @@ pub fn duplicate_keys(conn: &Connection) -> Result<HashSet<DuplicateKey>, Photon
 // 19: iso         20: latitude     21: longitude    22: location_name
 // 23: rating      24: flagged      25: hidden       26: title
 // 27: description 28: group_hash 29: orientation 30: original_filename
+// 31: thumbhash
 
 const IMAGE_SELECT: &str = "SELECT id, hash, path, filename, size_bytes, width, height,
             created_at, imported_at, format, has_sidecar, metadata_json, thumbnail_hash,
             camera_make, camera_model, lens_model, focal_length, aperture, shutter_speed, iso,
             latitude, longitude, location_name,
             rating, flagged, hidden, title, description, group_hash, orientation,
-            original_filename
+            original_filename, thumbhash
      FROM images";
 
 fn row_to_image(row: &rusqlite::Row) -> rusqlite::Result<Image> {
@@ -195,6 +199,7 @@ fn row_to_image(row: &rusqlite::Row) -> rusqlite::Result<Image> {
         group_hash: row.get(28)?,
         orientation: row.get(29)?,
         original_filename: row.get(30)?,
+        thumbhash: row.get(31)?,
     })
 }
 
@@ -284,7 +289,7 @@ pub fn timeline_items(
     conn: &Connection,
     filter: &TimelineFilter,
 ) -> Result<Vec<TimelineItem>, PhotonError> {
-    const COLS: &str = "SELECT id, hash, created_at, width, height, orientation FROM images";
+    const COLS: &str = "SELECT id, hash, created_at, width, height, orientation, thumbhash FROM images";
     const ORDER: &str = "ORDER BY COALESCE(created_at, imported_at) DESC, id DESC";
 
     let map = |r: &rusqlite::Row| -> rusqlite::Result<TimelineItem> {
@@ -295,6 +300,7 @@ pub fn timeline_items(
             width: r.get(3)?,
             height: r.get(4)?,
             orientation: r.get(5)?,
+            thumbhash: r.get(6)?,
         })
     };
 
@@ -320,6 +326,22 @@ pub fn timeline_items(
         }
     };
     Ok(items)
+}
+
+/// Save a computed thumbhash for an image.
+pub fn save_thumbhash(conn: &Connection, id: i64, thumbhash: &[u8]) -> Result<(), PhotonError> {
+    conn.execute(
+        "UPDATE images SET thumbhash = ?1 WHERE id = ?2",
+        params![thumbhash, id],
+    )?;
+    Ok(())
+}
+
+/// Get all image ids and hashes that don't have a thumbhash yet (for backfilling).
+pub fn get_images_missing_thumbhash(conn: &Connection) -> Result<Vec<(i64, String)>, PhotonError> {
+    let mut stmt = conn.prepare("SELECT id, hash FROM images WHERE thumbhash IS NULL")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
 /// Turn free text into a safe FTS5 query: each word becomes a quoted prefix
@@ -429,6 +451,20 @@ pub fn get_images_in_group(
 // ---------------------------------------------------------------------------
 // Sidebar / Hierarchy
 // ---------------------------------------------------------------------------
+
+/// Photo counts per day for the whole library, newest first, in one query
+/// (the `(year, month, day)` index makes this a single index scan).
+/// Rows are `(year, month, day, count)`.
+pub fn date_tree(conn: &Connection) -> Result<Vec<(i32, u32, u32, u32)>, PhotonError> {
+    let mut stmt = conn.prepare(
+        "SELECT year, month, day, COUNT(*) FROM images
+         WHERE year IS NOT NULL AND year > 0 AND hidden = 0
+         GROUP BY year, month, day
+         ORDER BY year DESC, month DESC, day DESC",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
 
 pub fn get_years(conn: &Connection) -> Result<Vec<(i32, u32)>, PhotonError> {
     let mut stmt = conn.prepare(
@@ -769,6 +805,20 @@ mod tests {
 
         let id = all[0].id;
         assert_eq!(get_image(&conn, id).unwrap().unwrap().filename, "rotated.jpg");
+    }
+
+    #[test]
+    fn date_tree_counts_per_day_newest_first() {
+        let db = Database::open_in_memory().unwrap();
+        let mut conn = db.conn().unwrap();
+        insert(&mut conn, "a", 1_600_000_000, (3, 2), 1); // 2020-09-13
+        insert(&mut conn, "b", 1_600_000_100, (3, 2), 1); // same day
+        insert(&mut conn, "c", 1_700_000_000, (3, 2), 1); // 2023-11-14
+
+        assert_eq!(
+            date_tree(&conn).unwrap(),
+            vec![(2023, 11, 14, 1), (2020, 9, 13, 2)]
+        );
     }
 
     #[test]

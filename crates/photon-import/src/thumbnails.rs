@@ -127,6 +127,87 @@ impl ThumbnailGenerator {
         }
         result.map(|()| out)
     }
+
+    /// Return the grid rendition of `image`, computing its ThumbHash in the same pass.
+    pub fn ensure_grid(&self, image: &Image) -> Result<(PathBuf, Option<Vec<u8>>)> {
+        let out = thumb_path(&self.cache_root, ThumbSize::Grid, &image.hash);
+        if out.exists() {
+            let th = if image.thumbhash.is_some() {
+                image.thumbhash.clone()
+            } else {
+                self.thumbhash_from_disk(&image.hash)
+            };
+            return Ok((out, th));
+        }
+
+        let orientation = image
+            .orientation
+            .or_else(|| metadata::extract(&image.path).ok()?.orientation)
+            .unwrap_or(1);
+
+        let rgb = load_smart(&image.path, ThumbSize::Grid.long_edge())?.into_rgb8();
+        let resized = resize(rgb, ThumbSize::Grid.long_edge())?;
+        let oriented = apply_orientation(resized, orientation);
+
+        let th = compute_thumbhash(&oriented);
+
+        let dir = out.parent().expect("thumb path has a parent");
+        fs::create_dir_all(dir)?;
+        let tmp = dir.join(format!(".{}.{}.tmp", image.hash, uuid::Uuid::new_v4().simple()));
+        let result = (|| -> Result<()> {
+            let mut writer = BufWriter::new(File::create(&tmp)?);
+            JpegEncoder::new_with_quality(&mut writer, ThumbSize::Grid.quality()).encode_image(&oriented)?;
+            writer.into_inner().map_err(|e| e.into_error())?;
+            fs::rename(&tmp, &out)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        result.map(|()| (out, th))
+    }
+
+    /// Compute ThumbHash from an existing cached grid thumbnail on disk.
+    pub fn thumbhash_from_disk(&self, hash: &str) -> Option<Vec<u8>> {
+        let path = thumb_path(&self.cache_root, ThumbSize::Grid, hash);
+        if path.exists() {
+            if let Ok(img) = image::open(&path) {
+                return compute_thumbhash(&img.to_rgb8());
+            }
+        }
+        None
+    }
+}
+
+/// Compute ThumbHash from an in-memory upright RGB image.
+pub fn compute_thumbhash(img: &RgbImage) -> Option<Vec<u8>> {
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let max_dim = w.max(h);
+    let (tw, th) = if max_dim > 100 {
+        let scale = 100.0 / max_dim as f64;
+        (
+            ((w as f64 * scale).round() as u32).max(1),
+            ((h as f64 * scale).round() as u32).max(1),
+        )
+    } else {
+        (w, h)
+    };
+
+    let small = if (tw, th) != (w, h) {
+        resize(img.clone(), tw.max(th)).ok()?
+    } else {
+        img.clone()
+    };
+
+    let rgba = DynamicImage::ImageRgb8(small).to_rgba8();
+    Some(thumbhash::rgba_to_thumb_hash(
+        rgba.width() as usize,
+        rgba.height() as usize,
+        rgba.as_raw(),
+    ))
 }
 
 fn resize(src: RgbImage, long_edge: u32) -> Result<RgbImage> {

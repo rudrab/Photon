@@ -400,13 +400,13 @@ impl Inner {
                 let items = this.items.borrow().clone();
                 for tile in tiles {
                     let Some(item) = items.get(tile.index) else { continue };
-                    row_box.append(&Self::make_tile(this, tile, &item.hash));
+                    row_box.append(&Self::make_tile(this, tile, item));
                 }
             }
         }
     }
 
-    fn make_tile(this: &Rc<Self>, tile: &Tile, hash: &str) -> GtkBox {
+    fn make_tile(this: &Rc<Self>, tile: &Tile, item: &TimelineItem) -> GtkBox {
         let frame = GtkBox::new(Orientation::Vertical, 0);
         frame.set_size_request(tile.width, tile.height);
         frame.set_overflow(gtk4::Overflow::Hidden);
@@ -419,10 +419,15 @@ impl Inner {
         picture.set_vexpand(true);
         frame.append(&picture);
 
-        if let Some(texture) = this.textures.borrow_mut().get(hash) {
+        if let Some(texture) = this.textures.borrow_mut().get(&item.hash) {
             picture.set_paintable(Some(&texture));
         } else {
-            Self::load_texture_later(this, &picture, hash.to_string());
+            if let Some(ref th_bytes) = item.thumbhash {
+                if let Some(placeholder) = decode_thumbhash_texture(th_bytes) {
+                    picture.set_paintable(Some(&placeholder));
+                }
+            }
+            Self::load_texture_later(this, &picture, item.hash.clone());
         }
 
         let click = GestureClick::new();
@@ -511,6 +516,25 @@ fn install_css() {
     );
 }
 
+fn decode_thumbhash_texture(th: &[u8]) -> Option<gdk::Texture> {
+    let (w_us, h_us, rgba) = thumbhash::thumb_hash_to_rgba(th).ok()?;
+    let w = w_us as i32;
+    let h = h_us as i32;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let bytes = glib::Bytes::from_owned(rgba);
+    let stride = (w * 4) as usize;
+    let mem_texture = gdk::MemoryTexture::new(
+        w,
+        h,
+        gdk::MemoryFormat::R8g8b8a8,
+        &bytes,
+        stride,
+    );
+    Some(mem_texture.upcast())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,6 +549,7 @@ mod tests {
             width: Some(w),
             height: Some(h),
             orientation: None,
+            thumbhash: None,
         }
     }
 

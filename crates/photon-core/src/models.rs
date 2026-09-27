@@ -55,6 +55,8 @@ pub struct Image {
     // the same shot (RAW+JPG pair, _modified edits, XMP sidecars).
     // Computed from blake3(parent_dir + "/" + base_stem).
     pub group_hash: Option<String>,
+    /// Micro-preview representation (~25-30 bytes) for instant placeholder rendering.
+    pub thumbhash: Option<Vec<u8>>,
 }
 
 impl Image {
@@ -296,6 +298,7 @@ pub struct TimelineItem {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub orientation: Option<u16>,
+    pub thumbhash: Option<Vec<u8>>,
 }
 
 impl TimelineItem {

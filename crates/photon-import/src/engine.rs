@@ -255,10 +255,15 @@ impl ImportEngine {
                 read_rx
                     .into_iter()
                     .par_bridge()
-                    .for_each_with(ready_tx, |tx, (path, outcome)| {
-                        if let (FileOutcome::New(img), Some(thumbs)) = (&outcome, thumbs) {
-                            if let Err(e) = thumbs.ensure(img, ThumbSize::Grid) {
-                                log::warn!("Thumbnail failed for {}: {e:#}", img.path.display());
+                    .for_each_with(ready_tx, |tx, (path, mut outcome)| {
+                        if let (FileOutcome::New(img), Some(thumbs)) = (&mut outcome, thumbs) {
+                            match thumbs.ensure_grid(img) {
+                                Ok((_, th)) => {
+                                    img.thumbhash = th;
+                                }
+                                Err(e) => {
+                                    log::warn!("Thumbnail failed for {}: {e:#}", img.path.display());
+                                }
                             }
                         }
                         let _ = tx.send((path, outcome));
@@ -340,30 +345,52 @@ impl ImportEngine {
         let Some(thumb_gen) = &self.thumbnail_gen else {
             return Ok(0);
         };
-        let images = queries::get_all_images(&*self.db.conn()?, i32::MAX, 0)?;
+        let conn = self.db.conn()?;
+        let images = queries::get_all_images(&conn, i32::MAX, 0)?;
         let missing: Vec<&Image> = images
             .iter()
             .filter(|img| !thumb_gen.exists(img, ThumbSize::Grid))
             .collect();
+        let missing_hashes = queries::get_images_missing_thumbhash(&conn).unwrap_or_default();
 
+        let total = missing.len().max(1);
         let done = AtomicUsize::new(0);
         let generated = AtomicUsize::new(0);
         let offline = AtomicUsize::new(0);
+
         missing.par_iter().for_each(|img| {
             // Files on an unplugged drive: try again next time, quietly.
             if !img.path.exists() {
                 offline.fetch_add(1, Ordering::Relaxed);
-                on_progress(done.fetch_add(1, Ordering::Relaxed) + 1, missing.len());
+                on_progress(done.fetch_add(1, Ordering::Relaxed) + 1, total);
                 return;
             }
-            match thumb_gen.ensure(img, ThumbSize::Grid) {
+            match thumb_gen.ensure_grid(img) {
+                Ok((_, Some(th))) => {
+                    if let Some(id) = img.id {
+                        if let Ok(c) = self.db.conn() {
+                            let _ = queries::save_thumbhash(&c, id, &th);
+                        }
+                    }
+                    generated.fetch_add(1, Ordering::Relaxed);
+                }
                 Ok(_) => {
                     generated.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => log::warn!("Thumbnail failed for {}: {e:#}", img.path.display()),
             }
-            on_progress(done.fetch_add(1, Ordering::Relaxed) + 1, missing.len());
+            on_progress(done.fetch_add(1, Ordering::Relaxed) + 1, total);
         });
+
+        // Backfill thumbhash for existing thumbnails that were generated without it
+        missing_hashes.par_iter().for_each(|(id, hash)| {
+            if let Some(th) = thumb_gen.thumbhash_from_disk(hash) {
+                if let Ok(c) = self.db.conn() {
+                    let _ = queries::save_thumbhash(&c, *id, &th);
+                }
+            }
+        });
+
         let offline = offline.into_inner();
         if offline > 0 {
             log::info!("{offline} photos are offline (file not found); thumbnails deferred");

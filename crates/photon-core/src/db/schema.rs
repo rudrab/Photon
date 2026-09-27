@@ -30,6 +30,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), PhotonError> {
         (4, MIGRATION_004_GROUP_HASH),
         (5, MIGRATION_005_ORIENTATION_AND_PATH_INDEX),
         (6, MIGRATION_006_ORIGINAL_FILENAME),
+        (7, MIGRATION_007_THUMBHASH),
     ];
 
     for (version, sql) in migrations {
@@ -217,6 +218,14 @@ DROP INDEX IF EXISTS idx_images_hash;
 const MIGRATION_006_ORIGINAL_FILENAME: &str = "
 ALTER TABLE images ADD COLUMN original_filename TEXT;
 UPDATE images SET original_filename = filename;
+";
+
+// ---------------------------------------------------------------------------
+// Migration 007: ThumbHash micro-previews for fast placeholder rendering
+// ---------------------------------------------------------------------------
+
+const MIGRATION_007_THUMBHASH: &str = "
+ALTER TABLE images ADD COLUMN thumbhash BLOB;
 ";
 
 #[cfg(test)]

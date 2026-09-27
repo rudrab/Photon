@@ -8,6 +8,8 @@
 //!   Year  ...
 //!
 //! The events tree can be refreshed after import via `refresh_events()`.
+//! It is built lazily: one aggregated query, year rows up front, months and
+//! days only when opened, so a multi-decade library costs a few dozen widgets.
 
 use async_channel::Sender;
 use chrono::NaiveDate;
@@ -16,7 +18,8 @@ use gtk4::{Align, Box, Button, Expander, Image, Label, Orientation, ScrolledWind
 use photon_core::db::queries;
 use photon_core::db::Database;
 use photon_core::models::UIAction;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::thread;
 
@@ -30,112 +33,193 @@ pub struct Sidebar {
     /// Bumped per refresh; only the newest refresh may fill the tree, so
     /// overlapping refreshes can't both append (which duplicated every year).
     generation: Rc<Cell<u64>>,
+    /// The tree currently shown; a refresh with identical data is a no-op.
+    tree: Rc<RefCell<Rc<Vec<YearNode>>>>,
+    /// Open years `(year, None)` and months `(year, Some(month))`. Survives
+    /// refreshes, so live updates during an import don't snap the tree shut.
+    expanded: Rc<RefCell<HashSet<NodeKey>>>,
 }
 
-/// Data fetched from DB on background thread for the full tree.
-type TreeData = Vec<(i32, u32, Vec<(u32, u32, Vec<(u32, u32)>)>)>;
+type NodeKey = (i32, Option<u32>);
+
+#[derive(Debug, Clone, PartialEq)]
+struct YearNode {
+    year: i32,
+    count: u32,
+    months: Vec<MonthNode>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct MonthNode {
+    month: u32,
+    count: u32,
+    /// `(day, count)`, newest first.
+    days: Vec<(u32, u32)>,
+}
+
+/// Fold per-day counts (sorted newest first) into a year → month → day tree.
+fn build_tree(rows: &[(i32, u32, u32, u32)]) -> Vec<YearNode> {
+    let mut years: Vec<YearNode> = Vec::new();
+    for &(year, month, day, count) in rows {
+        if years.last().map(|y| y.year) != Some(year) {
+            years.push(YearNode {
+                year,
+                count: 0,
+                months: Vec::new(),
+            });
+        }
+        let y = years.last_mut().expect("just pushed");
+        y.count += count;
+        if y.months.last().map(|m| m.month) != Some(month) {
+            y.months.push(MonthNode {
+                month,
+                count: 0,
+                days: Vec::new(),
+            });
+        }
+        let m = y.months.last_mut().expect("just pushed");
+        m.count += count;
+        m.days.push((day, count));
+    }
+    years
+}
 
 impl Sidebar {
     /// Reload the year/month/day events tree from DB.
+    ///
+    /// Only the year rows are built here; a year's months and a month's days
+    /// are built the first time that expander opens. Nodes the user left open
+    /// are reopened (and so built) on every refresh.
     pub fn refresh_events(&self) {
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
 
         let db = self.db.clone();
-        let (tx_db, rx_db) = async_channel::unbounded::<TreeData>();
-
+        let (tx_db, rx_db) = async_channel::bounded::<Vec<(i32, u32, u32, u32)>>(1);
         thread::spawn(move || {
-            if let Ok(conn) = db.conn() {
-                if let Ok(years) = queries::get_years(&conn) {
-                    let mut tree_data: TreeData = Vec::new();
-                    for (year, year_count) in years {
-                        if let Ok(months) = queries::get_months_in_year(&conn, year) {
-                            let mut month_data = Vec::new();
-                            for (month, m_count) in months {
-                                let days = queries::get_days_in_month(&conn, year, month)
-                                    .unwrap_or_default();
-                                month_data.push((month, m_count, days));
-                            }
-                            tree_data.push((year, year_count, month_data));
-                        }
-                    }
-                    let _ = tx_db.send_blocking(tree_data);
+            let rows = db.conn().map_err(|e| e.to_string()).and_then(|conn| {
+                queries::date_tree(&conn).map_err(|e| e.to_string())
+            });
+            match rows {
+                Ok(rows) => {
+                    let _ = tx_db.send_blocking(rows);
                 }
+                Err(e) => log::error!("Sidebar query failed: {e}"),
             }
         });
 
-        let events_container = self.events_container.clone();
-        let sender = self.sender.clone();
-        let latest = self.generation.clone();
-
+        let this = self.clone();
         gtk4::glib::MainContext::default().spawn_local(async move {
-            if let Ok(tree_data) = rx_db.recv().await {
-                if latest.get() != generation {
-                    return; // a newer refresh will fill the tree
-                }
-                while let Some(child) = events_container.first_child() {
-                    events_container.remove(&child);
-                }
-                for (year, year_count, months) in tree_data {
-                    // ── Year expander ────────────────────────
-                    let year_expander = Expander::builder()
-                        .label(format!("{}  ·  {}", year, year_count))
-                        .expanded(false)
-                        .build();
+            let Ok(rows) = rx_db.recv().await else { return };
+            if this.generation.get() != generation {
+                return; // a newer refresh will fill the tree
+            }
+            let tree = build_tree(&rows);
+            if **this.tree.borrow() == tree {
+                return; // nothing changed: keep the widgets as they are
+            }
+            let tree = Rc::new(tree);
+            *this.tree.borrow_mut() = tree.clone();
+            this.rebuild(&tree);
+        });
+    }
 
-                    let year_box = Box::new(Orientation::Vertical, 2);
-                    year_box.set_margin_start(12);
+    fn rebuild(&self, tree: &Rc<Vec<YearNode>>) {
+        let scroll = self.widget.vadjustment();
+        let position = scroll.value();
 
-                    for (month, m_count, days) in &months {
-                        // ── Month expander (nested) ─────────
-                        let month_expander = Expander::builder()
-                            .label(format!("{}  ·  {}", month_name(*month), m_count))
-                            .expanded(false)
-                            .build();
+        while let Some(child) = self.events_container.first_child() {
+            self.events_container.remove(&child);
+        }
+        for index in 0..tree.len() {
+            let expander = self.year_expander(tree.clone(), index);
+            self.events_container.append(&expander);
+        }
 
-                        let month_box = Box::new(Orientation::Vertical, 2);
-                        month_box.set_margin_start(12);
+        // Rebuilt rows re-measure on the next frame; restore the scroll then.
+        scroll.set_value(position);
+        gtk4::glib::idle_add_local_once(move || scroll.set_value(position));
+    }
 
-                        // "All of <Month>" row → shows cover cards for dates
-                        let btn_month_all = make_row_with_count(
-                            &format!("All of {}", month_name(*month)),
-                            "folder-symbolic",
-                            Some(*m_count),
-                        );
-                        let tx = sender.clone();
-                        let y = year;
-                        let m = *month;
-                        btn_month_all.connect_clicked(move |_| {
-                            let _ = tx.send_blocking(UIAction::FilterByDate(y, m));
-                        });
-                        month_box.append(&btn_month_all);
+    fn year_expander(&self, tree: Rc<Vec<YearNode>>, index: usize) -> Expander {
+        let node = &tree[index];
+        let key: NodeKey = (node.year, None);
+        let expander = Expander::builder()
+            .label(format!("{}  ·  {}", node.year, node.count))
+            .build();
+        let body = Box::new(Orientation::Vertical, 2);
+        body.set_margin_start(12);
+        expander.set_child(Some(&body));
 
-                        for (day, d_count) in days {
-                            let day_label = short_date_label(year, *month, *day);
-                            let btn = make_row_with_count(
-                                &day_label,
-                                "x-office-calendar-symbolic",
-                                Some(*d_count),
-                            );
-                            let tx = sender.clone();
-                            let y = year;
-                            let m = *month;
-                            let d = *day;
-                            btn.connect_clicked(move |_| {
-                                let _ = tx.send_blocking(UIAction::FilterByDay(y, m, d));
-                            });
-                            month_box.append(&btn);
-                        }
-
-                        month_expander.set_child(Some(&month_box));
-                        year_box.append(&month_expander);
-                    }
-
-                    year_expander.set_child(Some(&year_box));
-                    events_container.append(&year_expander);
-                }
+        let this = self.clone();
+        self.lazy(&expander, key, move || {
+            let year = &tree[index];
+            for m in 0..year.months.len() {
+                body.append(&this.month_expander(tree.clone(), index, m));
             }
         });
+        expander
+    }
+
+    fn month_expander(&self, tree: Rc<Vec<YearNode>>, year_index: usize, index: usize) -> Expander {
+        let year = tree[year_index].year;
+        let node = &tree[year_index].months[index];
+        let (month, count) = (node.month, node.count);
+        let expander = Expander::builder()
+            .label(format!("{}  ·  {}", month_name(month), count))
+            .build();
+        let body = Box::new(Orientation::Vertical, 2);
+        body.set_margin_start(12);
+        expander.set_child(Some(&body));
+
+        let sender = self.sender.clone();
+        self.lazy(&expander, (year, Some(month)), move || {
+            // "All of <Month>" row → shows cover cards for dates
+            let all = make_row_with_count(
+                &format!("All of {}", month_name(month)),
+                "folder-symbolic",
+                Some(count),
+            );
+            let tx = sender.clone();
+            all.connect_clicked(move |_| {
+                let _ = tx.send_blocking(UIAction::FilterByDate(year, month));
+            });
+            body.append(&all);
+
+            for &(day, day_count) in &tree[year_index].months[index].days {
+                let btn = make_row_with_count(
+                    &short_date_label(year, month, day),
+                    "x-office-calendar-symbolic",
+                    Some(day_count),
+                );
+                let tx = sender.clone();
+                btn.connect_clicked(move |_| {
+                    let _ = tx.send_blocking(UIAction::FilterByDay(year, month, day));
+                });
+                body.append(&btn);
+            }
+        });
+        expander
+    }
+
+    /// Run `populate` the first time `expander` opens, track its open state
+    /// under `key`, and reopen it now if it was open before a refresh.
+    fn lazy(&self, expander: &Expander, key: NodeKey, populate: impl Fn() + 'static) {
+        let populated = Cell::new(false);
+        let expanded = self.expanded.clone();
+        expander.connect_expanded_notify(move |e| {
+            if e.is_expanded() {
+                expanded.borrow_mut().insert(key);
+                if !populated.replace(true) {
+                    populate();
+                }
+            } else {
+                expanded.borrow_mut().remove(&key);
+            }
+        });
+        if self.expanded.borrow().contains(&key) {
+            expander.set_expanded(true);
+        }
     }
 }
 
@@ -184,6 +268,8 @@ pub fn create(db: Database, sender: Sender<UIAction>) -> Sidebar {
         db,
         sender,
         generation: Rc::new(Cell::new(0)),
+        tree: Rc::new(RefCell::new(Rc::new(Vec::new()))),
+        expanded: Rc::new(RefCell::new(HashSet::new())),
     };
 
     // Initial load
@@ -302,4 +388,28 @@ fn make_separator() -> Separator {
     s.set_margin_top(8);
     s.set_margin_bottom(8);
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_year_month_day_tree_with_totals() {
+        let rows = [
+            (2024, 6, 16, 3),
+            (2024, 6, 15, 2),
+            (2024, 1, 1, 1),
+            (2023, 12, 31, 4),
+        ];
+        let tree = build_tree(&rows);
+
+        assert_eq!(tree.len(), 2);
+        assert_eq!((tree[0].year, tree[0].count), (2024, 6));
+        assert_eq!(tree[0].months.len(), 2);
+        assert_eq!((tree[0].months[0].month, tree[0].months[0].count), (6, 5));
+        assert_eq!(tree[0].months[0].days, vec![(16, 3), (15, 2)]);
+        assert_eq!((tree[1].year, tree[1].count), (2023, 4));
+        assert!(build_tree(&[]).is_empty());
+    }
 }
