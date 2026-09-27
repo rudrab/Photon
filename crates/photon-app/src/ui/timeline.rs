@@ -17,7 +17,7 @@ use gtk4::prelude::*;
 use gtk4::{gdk, gio, glib};
 use gtk4::{
     Align, Box as GtkBox, DrawingArea, GestureClick, Label, ListView, NoSelection, Orientation,
-    Overlay, Picture, ScrolledWindow, SignalListItemFactory,
+    Overlay, Picture, Revealer, ScrolledWindow, SignalListItemFactory,
 };
 use photon_core::models::TimelineItem;
 use photon_import::thumbnails::{thumb_path, ThumbSize};
@@ -218,6 +218,11 @@ struct Inner {
     scrolled: ScrolledWindow,
     store: gio::ListStore,
     items: RefCell<Rc<Vec<TimelineItem>>>,
+    rows: RefCell<Vec<Row>>,
+    row_y_offsets: RefCell<Vec<i32>>,
+    date_badge: Revealer,
+    date_label: Label,
+    hide_badge_timer: RefCell<Option<glib::SourceId>>,
     by_day: Cell<bool>,
     width: Cell<i32>,
     row_height: Cell<i32>,
@@ -252,6 +257,29 @@ impl Timeline {
             .child(&list)
             .build();
 
+        // Floating date indicator badge on scroll
+        let date_badge = Revealer::new();
+        date_badge.set_transition_type(gtk4::RevealerTransitionType::Crossfade);
+        date_badge.set_reveal_child(false);
+        date_badge.set_halign(Align::End);
+        date_badge.set_valign(Align::Start);
+        date_badge.set_margin_top(14);
+        date_badge.set_margin_end(28);
+        date_badge.set_can_target(false);
+
+        let badge_box = GtkBox::new(Orientation::Horizontal, 6);
+        badge_box.add_css_class("card");
+        badge_box.add_css_class("pill");
+        badge_box.set_margin_top(2);
+        badge_box.set_margin_bottom(2);
+        badge_box.set_margin_start(4);
+        badge_box.set_margin_end(4);
+
+        let date_label = Label::new(None);
+        date_label.set_css_classes(&["heading"]);
+        badge_box.append(&date_label);
+        date_badge.set_child(Some(&badge_box));
+
         // GTK4 has no resize signal on ordinary widgets; an invisible,
         // input-transparent DrawingArea overlaid on the view reports it.
         let size_probe = DrawingArea::new();
@@ -259,12 +287,18 @@ impl Timeline {
         let root = Overlay::new();
         root.set_child(Some(&scrolled));
         root.add_overlay(&size_probe);
+        root.add_overlay(&date_badge);
 
         let inner = Rc::new(Inner {
             root,
             scrolled,
             store,
             items: RefCell::new(Rc::new(Vec::new())),
+            rows: RefCell::new(Vec::new()),
+            row_y_offsets: RefCell::new(Vec::new()),
+            date_badge,
+            date_label,
+            hide_badge_timer: RefCell::new(None),
             by_day: Cell::new(true),
             width: Cell::new(0),
             row_height: Cell::new(row_height),
@@ -272,6 +306,48 @@ impl Timeline {
             cache_dir,
             textures: RefCell::new(TextureCache::new()),
             on_activate: RefCell::new(None),
+        });
+
+        // Update floating date pill on scroll
+        let weak_scroll = Rc::downgrade(&inner);
+        inner.scrolled.vadjustment().connect_value_changed(move |adj| {
+            if let Some(inner) = weak_scroll.upgrade() {
+                let offsets = inner.row_y_offsets.borrow();
+                if offsets.is_empty() {
+                    return;
+                }
+                let val = adj.value() as i32;
+                let row_idx = match offsets.binary_search(&val) {
+                    Ok(idx) => idx,
+                    Err(idx) => idx.saturating_sub(1),
+                };
+
+                let rows = inner.rows.borrow();
+                let active_header = (0..=row_idx.min(rows.len().saturating_sub(1)))
+                    .rev()
+                    .find_map(|i| match &rows[i] {
+                        Row::Header(h) => Some(h.clone()),
+                        _ => None,
+                    });
+
+                if let Some(header_text) = active_header {
+                    // Extract just the date part before the separator
+                    let date_part = header_text.split("  ·  ").next().unwrap_or(&header_text);
+                    inner.date_label.set_text(date_part);
+                    inner.date_badge.set_reveal_child(true);
+
+                    if let Some(timer) = inner.hide_badge_timer.borrow_mut().take() {
+                        timer.remove();
+                    }
+                    let weak_timer = Rc::downgrade(&inner);
+                    let source_id = glib::timeout_add_local_once(Duration::from_millis(900), move || {
+                        if let Some(inner) = weak_timer.upgrade() {
+                            inner.date_badge.set_reveal_child(false);
+                        }
+                    });
+                    *inner.hide_badge_timer.borrow_mut() = Some(source_id);
+                }
+            }
         });
 
         let weak = Rc::downgrade(&inner);
@@ -378,8 +454,22 @@ impl Inner {
             return; // laid out on first resize
         }
         let rows = layout(&self.items.borrow(), width, self.row_height.get(), self.by_day.get());
+
+        let mut y = 0;
+        let mut offsets = Vec::with_capacity(rows.len());
+        for row in &rows {
+            offsets.push(y);
+            let row_h = match row {
+                Row::Header(_) => 48,
+                Row::Photos(tiles) => tiles.first().map(|t| t.height).unwrap_or(0) + GAP,
+            };
+            y += row_h;
+        }
+        *self.row_y_offsets.borrow_mut() = offsets;
+
         let objects: Vec<glib::BoxedAnyObject> =
-            rows.into_iter().map(glib::BoxedAnyObject::new).collect();
+            rows.iter().cloned().map(glib::BoxedAnyObject::new).collect();
+        *self.rows.borrow_mut() = rows;
         self.store.splice(0, self.store.n_items(), &objects);
     }
 
