@@ -397,6 +397,80 @@ impl ImportEngine {
         }
         Ok(generated.into_inner())
     }
+
+    /// Fast pre-scan that inspects file headers to classify candidates into
+    /// new photos and already-imported duplicates, without full content hashing.
+    pub fn pre_scan(
+        &self,
+        files: &[PathBuf],
+        mode: FolderImportMode,
+    ) -> anyhow::Result<PreImportReport> {
+        let conn = self.db.conn()?;
+        let suspected = queries::duplicate_keys(&conn)?;
+        let known = if mode == FolderImportMode::InPlace {
+            queries::known_paths(&conn)?
+        } else {
+            HashSet::new()
+        };
+        drop(conn);
+
+        let mut report = PreImportReport::default();
+
+        for src in files {
+            let path_str = src.to_string_lossy();
+            if known.contains(path_str.as_ref()) {
+                let size = fs::metadata(src).map(|m| m.len() as i64).unwrap_or(0);
+                report.duplicates.push(PreImportItem {
+                    path: src.clone(),
+                    filename: file_name(src),
+                    size_bytes: size,
+                    created_at: None,
+                });
+                continue;
+            }
+
+            let fs_meta = match fs::metadata(src) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let original_name = file_name(src);
+            let meta = metadata::extract(src).unwrap_or_default();
+            let created_at = meta.capture_date.or_else(|| {
+                let mtime = fs_meta.modified().or_else(|_| fs_meta.created()).ok()?;
+                Some(chrono::DateTime::<chrono::Utc>::from(mtime).timestamp())
+            });
+
+            let key = DuplicateKey::new(&original_name, fs_meta.len() as i64, created_at);
+            let item = PreImportItem {
+                path: src.clone(),
+                filename: original_name,
+                size_bytes: fs_meta.len() as i64,
+                created_at,
+            };
+
+            if suspected.contains(&key) {
+                report.duplicates.push(item);
+            } else {
+                report.new_files.push(item);
+            }
+        }
+
+        Ok(report)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PreImportItem {
+    pub path: PathBuf,
+    pub filename: String,
+    pub size_bytes: i64,
+    pub created_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PreImportReport {
+    pub new_files: Vec<PreImportItem>,
+    pub duplicates: Vec<PreImportItem>,
 }
 
 /// Decide one file's fate with as little I/O as possible, and place it.
