@@ -7,6 +7,7 @@ pub mod dedup;
 pub mod engine;
 pub mod library;
 pub mod metadata;
+pub mod export;
 pub mod sidecar;
 pub mod sources;
 pub mod thumbnails;
@@ -15,4 +16,7 @@ pub mod thumbnails;
 mod testutil;
 
 pub use engine::{ImportConfig, ImportEngine};
+pub use export::{batch_export, export_single, ExportConfig, ExportFormat, ExportReport, ExportResize};
+pub use sidecar::sync_xmp_metadata;
 pub use sources::{DiskSource, ImportSource};
+pub use thumbnails::{compute_histogram, HistogramData};

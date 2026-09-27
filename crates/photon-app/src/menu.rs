@@ -44,6 +44,7 @@ pub fn setup_shortcuts(app: &impl IsA<Application>) {
     let app = app.as_ref();
     app.set_accels_for_action("win.import_folder", &["<Ctrl>o"]);
     app.set_accels_for_action("win.refresh", &["F5", "<Ctrl>r"]);
+    app.set_accels_for_action("win.search", &["<Ctrl>f"]);
     app.set_accels_for_action("app.quit", &["<Ctrl>q"]);
     app.set_accels_for_action("app.preferences", &["<Ctrl>comma"]);
     app.set_accels_for_action("win.shortcuts", &["<Ctrl>question"]);

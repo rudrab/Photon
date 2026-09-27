@@ -298,6 +298,7 @@ pub enum TimelineFilter {
     All,
     Day(i32, u32, u32),
     Search(String),
+    Tag(String),
 }
 
 /// Timeline tiles for `filter`, newest first. Only the columns needed for layout.
@@ -368,18 +369,99 @@ pub fn timeline_items_with_cull(
             let rows = stmt.query_map(params_refs.as_slice(), map)?;
             rows.collect::<Result<Vec<_>, _>>()?
         }
-        TimelineFilter::Search(text) => {
-            let fts = fts_query(text);
+        TimelineFilter::Tag(tag) => {
             let sql = format!(
-                "{COLS} WHERE hidden = 0 AND id IN (SELECT rowid FROM images_fts WHERE images_fts MATCH ?1) {extra} {ORDER}"
+                "{COLS} WHERE hidden = 0 AND id IN (
+                    SELECT it.image_id FROM image_tags it
+                    JOIN tags t ON t.id = it.tag_id
+                    WHERE t.name = ?1 COLLATE NOCASE
+                ) {extra} {ORDER}"
             );
             let mut stmt = conn.prepare(&sql)?;
-            let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(fts)];
+            let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(tag.clone())];
             all_params.extend(extra_params);
             let params_refs: Vec<&dyn rusqlite::types::ToSql> =
                 all_params.iter().map(|p| p.as_ref()).collect();
             let rows = stmt.query_map(params_refs.as_slice(), map)?;
             rows.collect::<Result<Vec<_>, _>>()?
+        }
+        TimelineFilter::Search(text) => {
+            let trimmed = text.trim();
+            if let Some(tag_query) = trimmed.strip_prefix("tag:") {
+                let sql = format!(
+                    "{COLS} WHERE hidden = 0 AND id IN (
+                        SELECT it.image_id FROM image_tags it
+                        JOIN tags t ON t.id = it.tag_id
+                        WHERE t.name LIKE ?1
+                    ) {extra} {ORDER}"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> =
+                    vec![Box::new(format!("%{}%", tag_query.trim()))];
+                all_params.extend(extra_params);
+                let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    all_params.iter().map(|p| p.as_ref()).collect();
+                let rows = stmt.query_map(params_refs.as_slice(), map)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            } else if let Some(cam_query) = trimmed
+                .strip_prefix("camera:")
+                .or_else(|| trimmed.strip_prefix("make:"))
+            {
+                let sql = format!(
+                    "{COLS} WHERE hidden = 0 AND (camera_make LIKE ?1 OR camera_model LIKE ?1) {extra} {ORDER}"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> =
+                    vec![Box::new(format!("%{}%", cam_query.trim()))];
+                all_params.extend(extra_params);
+                let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    all_params.iter().map(|p| p.as_ref()).collect();
+                let rows = stmt.query_map(params_refs.as_slice(), map)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            } else if let Some(lens_query) = trimmed.strip_prefix("lens:") {
+                let sql = format!(
+                    "{COLS} WHERE hidden = 0 AND lens_model LIKE ?1 {extra} {ORDER}"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> =
+                    vec![Box::new(format!("%{}%", lens_query.trim()))];
+                all_params.extend(extra_params);
+                let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    all_params.iter().map(|p| p.as_ref()).collect();
+                let rows = stmt.query_map(params_refs.as_slice(), map)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            } else if let Some(flag_query) = trimmed.strip_prefix("is:") {
+                let f_val = match flag_query.trim().to_lowercase().as_str() {
+                    "pick" | "picked" => 1,
+                    "reject" | "rejected" => -1,
+                    _ => 0,
+                };
+                let sql = format!("{COLS} WHERE hidden = 0 AND flagged = ?1 {extra} {ORDER}");
+                let mut stmt = conn.prepare(&sql)?;
+                let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(f_val)];
+                all_params.extend(extra_params);
+                let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    all_params.iter().map(|p| p.as_ref()).collect();
+                let rows = stmt.query_map(params_refs.as_slice(), map)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            } else {
+                let fts = fts_query(trimmed);
+                let tag_pattern = format!("%{}%", trimmed);
+                let sql = format!(
+                    "{COLS} WHERE hidden = 0 AND (
+                        id IN (SELECT rowid FROM images_fts WHERE images_fts MATCH ?1)
+                        OR id IN (SELECT it.image_id FROM image_tags it JOIN tags t ON t.id = it.tag_id WHERE t.name LIKE ?2)
+                    ) {extra} {ORDER}"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> =
+                    vec![Box::new(fts), Box::new(tag_pattern)];
+                all_params.extend(extra_params);
+                let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    all_params.iter().map(|p| p.as_ref()).collect();
+                let rows = stmt.query_map(params_refs.as_slice(), map)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
         }
     };
     Ok(items)
@@ -859,6 +941,50 @@ pub fn get_tags_for_image(conn: &Connection, image_id: i64) -> Result<Vec<Tag>, 
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+/// Get all tags that are assigned to at least one photo, with their photo counts.
+pub fn get_tags_with_counts(conn: &Connection) -> Result<Vec<(Tag, u32)>, PhotonError> {
+    let mut stmt = conn.prepare(
+        "SELECT t.id, t.name, t.color, t.is_category, COUNT(it.image_id) as count
+         FROM tags t
+         JOIN image_tags it ON it.tag_id = t.id
+         JOIN images i ON i.id = it.image_id
+         WHERE i.hidden = 0
+         GROUP BY t.id
+         HAVING count > 0
+         ORDER BY count DESC, t.name ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            Tag {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                color: row.get(2)?,
+                is_category: row.get::<_, i32>(3).unwrap_or(0) != 0,
+            },
+            row.get::<_, u32>(4)?,
+        ))
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Update title of an image.
+pub fn set_title(conn: &Connection, id: i64, title: &str) -> Result<(), PhotonError> {
+    conn.execute(
+        "UPDATE images SET title = ?1 WHERE id = ?2",
+        params![title, id],
+    )?;
+    Ok(())
+}
+
+/// Update description/caption of an image.
+pub fn set_description(conn: &Connection, id: i64, description: &str) -> Result<(), PhotonError> {
+    conn.execute(
+        "UPDATE images SET description = ?1 WHERE id = ?2",
+        params![description, id],
+    )?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Library metadata (key-value)
 // ---------------------------------------------------------------------------
@@ -1014,5 +1140,52 @@ mod tests {
 
         let top = timeline_items_with_cull(&conn, &TimelineFilter::All, Some(5), Some(1)).unwrap();
         assert_eq!(top.len(), 2);
+    }
+
+    #[test]
+    fn tag_filter_and_smart_search_work() {
+        let db = Database::open_in_memory().unwrap();
+        let mut conn = db.conn().unwrap();
+        insert(&mut conn, "img1.jpg", 1_700_000_000, (3, 2), 1);
+        insert(&mut conn, "img2.jpg", 1_700_000_100, (3, 2), 1);
+
+        let all = timeline_items(&conn, &TimelineFilter::All).unwrap();
+        let id1 = all.iter().find(|i| i.hash == "img1.jpg").unwrap().id;
+        let id2 = all.iter().find(|i| i.hash == "img2.jpg").unwrap().id;
+
+        // Set title and description
+        set_title(&conn, id1, "Sunset at Beach").unwrap();
+        set_description(&conn, id1, "Golden hour reflection on water").unwrap();
+
+        // Tag img1 with "landscape" and "sunset"
+        let t_land = create_tag(&conn, "landscape", None).unwrap();
+        let t_sun = create_tag(&conn, "sunset", None).unwrap();
+        tag_image(&conn, id1, t_land).unwrap();
+        tag_image(&conn, id1, t_sun).unwrap();
+
+        // Tag img2 with "landscape"
+        tag_image(&conn, id2, t_land).unwrap();
+
+        // Check get_tags_with_counts
+        let tag_counts = get_tags_with_counts(&conn).unwrap();
+        assert_eq!(tag_counts.len(), 2);
+        let land_count = tag_counts.iter().find(|(t, _)| t.name == "landscape").unwrap().1;
+        assert_eq!(land_count, 2);
+
+        // Test TimelineFilter::Tag
+        let tagged_sunset = timeline_items_with_cull(&conn, &TimelineFilter::Tag("sunset".to_string()), None, None).unwrap();
+        assert_eq!(tagged_sunset.len(), 1);
+        assert_eq!(tagged_sunset[0].id, id1);
+
+        // Test Smart Search syntax: "tag:sunset"
+        let search_tag = timeline_items_with_cull(&conn, &TimelineFilter::Search("tag:sunset".to_string()), None, None).unwrap();
+        assert_eq!(search_tag.len(), 1);
+        assert_eq!(search_tag[0].id, id1);
+
+        // Test Smart Search syntax: "is:pick"
+        set_flag(&conn, id2, 1).unwrap();
+        let search_pick = timeline_items_with_cull(&conn, &TimelineFilter::Search("is:pick".to_string()), None, None).unwrap();
+        assert_eq!(search_pick.len(), 1);
+        assert_eq!(search_pick[0].id, id2);
     }
 }

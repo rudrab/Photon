@@ -29,6 +29,8 @@ pub struct Context {
     pub prefs: Rc<RefCell<Preferences>>,
     /// Called after photos were removed from the library.
     pub on_library_changed: Rc<dyn Fn()>,
+    /// Called to export selected photos.
+    pub on_export: Rc<dyn Fn(Vec<Image>)>,
 }
 
 /// Build the bar and overlay it on `timeline`.
@@ -100,6 +102,15 @@ pub fn attach(timeline: &Timeline, ctx: Context) {
     let (w, c) = (weak.clone(), ctx.clone());
     copy.connect_clicked(move |_| copy_to_clipboard(&selected_images(&w, &c.db), &c.window));
 
+    let export = button("document-save-symbolic", "Export Selected (Ctrl+E)");
+    let (w, c) = (weak.clone(), ctx.clone());
+    export.connect_clicked(move |_| {
+        let imgs = selected_images(&w, &c.db);
+        if !imgs.is_empty() {
+            (c.on_export)(imgs);
+        }
+    });
+
     let remove = button("list-remove-symbolic", "Remove from Library");
     let (w, c) = (weak.clone(), ctx.clone());
     remove.connect_clicked(move |_| confirm_remove(&w, &c));
@@ -135,13 +146,23 @@ pub fn attach(timeline: &Timeline, ctx: Context) {
         });
     });
 
-    // Delete → Move to Trash (the timeline handles its own navigation keys).
+    // Delete → Move to Trash, Ctrl+E → Export Selected (the timeline handles its own navigation keys).
     let keys = EventControllerKey::new();
     let (w, c) = (weak, ctx);
-    keys.connect_key_pressed(move |_, key, _, _| {
+    keys.connect_key_pressed(move |_, key, _, state| {
         let has_selection = w.upgrade().is_some_and(|t| !t.selected_ids().is_empty());
         if key == gdk::Key::Delete && has_selection {
             confirm_trash(&w, &c);
+            return glib::Propagation::Stop;
+        }
+        if (key == gdk::Key::e || key == gdk::Key::E)
+            && state.contains(gdk::ModifierType::CONTROL_MASK)
+            && has_selection
+        {
+            let imgs = selected_images(&w, &c.db);
+            if !imgs.is_empty() {
+                (c.on_export)(imgs);
+            }
             return glib::Propagation::Stop;
         }
         glib::Propagation::Proceed

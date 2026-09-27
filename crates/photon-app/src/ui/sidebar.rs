@@ -28,6 +28,7 @@ use std::thread;
 pub struct Sidebar {
     pub widget: ScrolledWindow,
     pub events_container: Box,
+    pub tags_container: Box,
     pub db: Database,
     pub sender: Sender<UIAction>,
     /// Bumped per refresh; only the newest refresh may fill the tree, so
@@ -121,6 +122,50 @@ impl Sidebar {
             let tree = Rc::new(tree);
             *this.tree.borrow_mut() = tree.clone();
             this.rebuild(&tree);
+        });
+        self.refresh_tags();
+    }
+
+    /// Reload the tags list with photo counts.
+    pub fn refresh_tags(&self) {
+        let db = self.db.clone();
+        let (tx_tags, rx_tags) = async_channel::bounded::<Vec<(photon_core::models::Tag, u32)>>(1);
+        thread::spawn(move || {
+            let tags = db.conn().map_err(|e| e.to_string()).and_then(|conn| {
+                queries::get_tags_with_counts(&conn).map_err(|e| e.to_string())
+            });
+            if let Ok(tags) = tags {
+                let _ = tx_tags.send_blocking(tags);
+            }
+        });
+
+        let this = self.clone();
+        gtk4::glib::MainContext::default().spawn_local(async move {
+            let Ok(tags) = rx_tags.recv().await else { return };
+            while let Some(child) = this.tags_container.first_child() {
+                this.tags_container.remove(&child);
+            }
+
+            if tags.is_empty() {
+                let empty_lbl = Label::new(Some("No tags yet"));
+                empty_lbl.set_css_classes(&["caption", "dim-label"]);
+                empty_lbl.set_halign(Align::Start);
+                empty_lbl.set_margin_start(16);
+                empty_lbl.set_margin_top(4);
+                empty_lbl.set_margin_bottom(4);
+                this.tags_container.append(&empty_lbl);
+            } else {
+                for (tag, count) in tags {
+                    let label = format!("#{}", tag.name);
+                    let btn = make_row_with_count(&label, "tag-symbolic", Some(count));
+                    let tx = this.sender.clone();
+                    let tag_name = tag.name.clone();
+                    btn.connect_clicked(move |_| {
+                        let _ = tx.send_blocking(UIAction::FilterByTag(tag_name.clone()));
+                    });
+                    this.tags_container.append(&btn);
+                }
+            }
         });
     }
 
@@ -264,11 +309,21 @@ pub fn create(db: Database, sender: Sender<UIAction>) -> Sidebar {
     let events_container = Box::new(Orientation::Vertical, 2);
     root.append(&events_container);
 
+    root.append(&make_separator());
+
+    // ── Tags header ─────────────────────────────────────
+    let tags_label = make_caption("Tags");
+    root.append(&tags_label);
+
+    let tags_container = Box::new(Orientation::Vertical, 2);
+    root.append(&tags_container);
+
     scrolled.set_child(Some(&root));
 
     let sidebar = Sidebar {
         widget: scrolled,
         events_container,
+        tags_container,
         db,
         sender,
         generation: Rc::new(Cell::new(0)),
@@ -278,6 +333,7 @@ pub fn create(db: Database, sender: Sender<UIAction>) -> Sidebar {
 
     // Initial load
     sidebar.refresh_events();
+    sidebar.refresh_tags();
 
     sidebar
 }

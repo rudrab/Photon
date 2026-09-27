@@ -62,6 +62,103 @@ pub fn group_map(paths: &[PathBuf]) -> HashMap<PathBuf, String> {
     map
 }
 
+/// Write or update an XMP sidecar file with rating, flag, tags, title, and description.
+/// This writes metadata non-destructively to an adjacent sidecar file, preserving originals.
+pub fn sync_xmp_metadata(
+    image_path: &Path,
+    rating: Option<i32>,
+    flag: Option<i32>,
+    tags: &[String],
+    title: Option<&str>,
+    description: Option<&str>,
+) -> Result<PathBuf, std::io::Error> {
+    let xmp_path = find_xmp(image_path).unwrap_or_else(|| {
+        let mut appended = image_path.as_os_str().to_owned();
+        appended.push(".xmp");
+        PathBuf::from(appended)
+    });
+
+    let rating_attr = rating
+        .map(|r| format!(" xmp:Rating=\"{}\"", r))
+        .unwrap_or_default();
+    let flag_attr = flag
+        .map(|f| {
+            let label = match f {
+                1 => "Pick",
+                -1 => "Reject",
+                _ => "",
+            };
+            if !label.is_empty() {
+                format!(" xmp:Label=\"{}\"", label)
+            } else {
+                String::new()
+            }
+        })
+        .unwrap_or_default();
+
+    let mut tags_xml = String::new();
+    if !tags.is_empty() {
+        tags_xml.push_str("   <dc:subject>\n    <rdf:Bag>\n");
+        for tag in tags {
+            tags_xml.push_str(&format!(
+                "     <rdf:li>{}</rdf:li>\n",
+                quick_xml_escape(tag)
+            ));
+        }
+        tags_xml.push_str("    </rdf:Bag>\n   </dc:subject>\n");
+    }
+
+    let title_xml = title
+        .filter(|t| !t.trim().is_empty())
+        .map(|t| {
+            format!(
+                "   <dc:title>\n    <rdf:Alt>\n     <rdf:li xml:lang=\"x-default\">{}</rdf:li>\n    </rdf:Alt>\n   </dc:title>\n",
+                quick_xml_escape(t)
+            )
+        })
+        .unwrap_or_default();
+
+    let desc_xml = description
+        .filter(|d| !d.trim().is_empty())
+        .map(|d| {
+            format!(
+                "   <dc:description>\n    <rdf:Alt>\n     <rdf:li xml:lang=\"x-default\">{}</rdf:li>\n    </rdf:Alt>\n   </dc:description>\n",
+                quick_xml_escape(d)
+            )
+        })
+        .unwrap_or_default();
+
+    let content = format!(
+        r#"<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/"
+    xmlns:dc="http://purl.org/dc/elements/1.1/"{}{}>
+{title_xml}{desc_xml}{tags_xml}  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>
+"#,
+        rating_attr, flag_attr
+    );
+
+    let temp_path = xmp_path.with_extension("xmp.tmp");
+    std::fs::write(&temp_path, content)?;
+    std::fs::rename(&temp_path, &xmp_path)?;
+
+    Ok(xmp_path)
+}
+
+fn quick_xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +196,32 @@ mod tests {
             xmp_destination(src, Path::new("/card/IMG_001.xmp"), dest),
             Path::new("/lib/2024/01/01/IMG_001_1.xmp")
         );
+    }
+
+    #[test]
+    fn sync_xmp_metadata_writes_valid_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("photo.jpg");
+        std::fs::write(&img, b"fake jpg").unwrap();
+
+        let tags = vec!["landscape".to_string(), "sunset".to_string()];
+        let xmp = sync_xmp_metadata(
+            &img,
+            Some(4),
+            Some(1),
+            &tags,
+            Some("Golden Hour"),
+            Some("Beach sunset during golden hour"),
+        )
+        .unwrap();
+
+        assert!(xmp.exists());
+        let xml = std::fs::read_to_string(&xmp).unwrap();
+        assert!(xml.contains("xmp:Rating=\"4\""));
+        assert!(xml.contains("xmp:Label=\"Pick\""));
+        assert!(xml.contains("<rdf:li>landscape</rdf:li>"));
+        assert!(xml.contains("<rdf:li>sunset</rdf:li>"));
+        assert!(xml.contains("Golden Hour"));
+        assert!(xml.contains("Beach sunset during golden hour"));
     }
 }

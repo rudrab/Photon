@@ -15,13 +15,14 @@
 use async_channel::Sender;
 use gtk4::prelude::*;
 use gtk4::{
-    gio, glib, Align, Box as GtkBox, Button, EventControllerKey, GestureClick, Label, Orientation,
+    gio, glib, Align, Box as GtkBox, Button, Entry, EventControllerKey, FlowBox, GestureClick, Label, Orientation,
     Picture, Revealer, ScrolledWindow, ToggleButton,
 };
 use photon_core::db::queries;
 use photon_core::db::Database;
 use photon_core::models::{Image, Preferences, TimelineItem, UIAction};
 use photon_import::thumbnails::{thumb_path, ThumbSize, ThumbnailGenerator};
+use crate::ui::histogram::HistogramWidget;
 use crate::ui::widgets::load_texture_async;
 use std::cell::{Cell, RefCell};
 use std::path::Path;
@@ -42,6 +43,7 @@ pub fn build_viewer(
     nav_tx: &Sender<UIAction>,
     back_action: UIAction,
     db: &Database,
+    on_export: Option<Rc<dyn Fn(Vec<Image>)>>,
 ) -> GtkBox {
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.set_vexpand(true);
@@ -139,6 +141,10 @@ pub fn build_viewer(
     open_btn.add_css_class("flat");
     open_btn.set_tooltip_text(Some("Open in editor"));
 
+    let export_btn = Button::from_icon_name("document-save-symbolic");
+    export_btn.add_css_class("flat");
+    export_btn.set_tooltip_text(Some("Export Photo (Ctrl+E)"));
+
     toolbar.append(&back_btn);
     toolbar.append(&nav_group);
     toolbar.append(&cull_group);
@@ -149,6 +155,7 @@ pub fn build_viewer(
     toolbar.append(&counter_label);
     toolbar.append(&info_btn);
     toolbar.append(&open_btn);
+    toolbar.append(&export_btn);
     root.append(&toolbar);
 
     // ── Body: image | info side panel ───────────────────
@@ -304,6 +311,7 @@ pub fn build_viewer(
             let Some(item) = photos.get(idx) else { return };
             let img_id = item.id;
 
+            let mut img_info = None;
             if let Some(img) = current_image.borrow_mut().as_mut() {
                 if let Some(r) = new_rating {
                     img.rating = r;
@@ -311,6 +319,7 @@ pub fn build_viewer(
                 if let Some(f) = new_flag {
                     img.flagged = f;
                 }
+                img_info = Some((img.path.clone(), img.rating, img.flagged));
             }
 
             let db = db.clone();
@@ -321,6 +330,9 @@ pub fn build_viewer(
                     }
                     if let Some(f) = new_flag {
                         let _ = queries::set_flag(&mut conn, img_id, f);
+                    }
+                    if let Some((path, r, f)) = img_info {
+                        sync_image_xmp(&conn, img_id, &path, r, f);
                     }
                 }
             });
@@ -374,6 +386,19 @@ pub fn build_viewer(
         }
     });
 
+    let on_export_c = on_export.clone();
+    let image_export = current_image.clone();
+    let trigger_export: Rc<dyn Fn()> = Rc::new(move || {
+        if let Some(cb) = &on_export_c {
+            if let Some(image) = image_export.borrow().as_ref() {
+                cb(vec![image.clone()]);
+            }
+        }
+    });
+
+    let te = trigger_export.clone();
+    export_btn.connect_clicked(move |_| te());
+
     let step_prev = step.clone();
     prev_btn.connect_clicked(move |_| step_prev(-1));
     let step_next = step.clone();
@@ -388,9 +413,17 @@ pub fn build_viewer(
         #[strong] toggle_compare,
         #[strong] update_cull,
         #[strong] step,
+        #[strong] trigger_export,
         #[upgrade_or] glib::Propagation::Proceed,
         move |_, key, _, state| {
             let is_shift = state.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
+            let is_ctrl = state.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
+
+            if is_ctrl && (key == gtk4::gdk::Key::e || key == gtk4::gdk::Key::E) {
+                trigger_export();
+                return glib::Propagation::Stop;
+            }
+
             match key {
                 gtk4::gdk::Key::Escape => {
                     let _ = tx_esc.send_blocking(back_action.clone());
@@ -542,19 +575,202 @@ fn render_photo(
         image_box.append(&picture);
     }
 
-    populate_info_panel(info_box, image, prefs, db);
+    populate_info_panel(info_box, image, cache_dir, prefs, db);
+}
+
+fn sync_image_xmp(
+    conn: &rusqlite::Connection,
+    image_id: i64,
+    image_path: &Path,
+    rating: i32,
+    flagged: i32,
+) {
+    let tags = queries::get_tags_for_image(conn, image_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.name)
+        .collect::<Vec<_>>();
+    let (title, description): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT title, description FROM images WHERE id = ?1",
+            rusqlite::params![image_id],
+            |r: &rusqlite::Row| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap_or((None, None));
+
+    let _ = photon_import::sync_xmp_metadata(
+        image_path,
+        if rating > 0 { Some(rating) } else { None },
+        if flagged != 0 { Some(flagged) } else { None },
+        &tags,
+        title.as_deref(),
+        description.as_deref(),
+    );
 }
 
 fn populate_info_panel(
     info_box: &GtkBox,
     image: &Image,
+    cache_dir: &Path,
     prefs: &Preferences,
     db: &Database,
 ) {
     // ── Info panel content: sections stacked vertically ─
-    let columns = GtkBox::new(Orientation::Vertical, 20);
+    let columns = GtkBox::new(Orientation::Vertical, 16);
 
-    // Column 1: Metadata
+    // Section 1: Live RGB / Luminance Histogram
+    let hist_box = GtkBox::new(Orientation::Vertical, 4);
+    let hist = HistogramWidget::new();
+    let grid_path = thumb_path(cache_dir, ThumbSize::Grid, &image.hash);
+    if grid_path.exists() {
+        hist.load_for_path(&grid_path);
+    } else {
+        hist.load_for_path(&image.path);
+    }
+    hist_box.append(hist.widget());
+    columns.append(&hist_box);
+
+    // Section 2: Metadata & Tags Editor
+    let meta_edit_box = GtkBox::new(Orientation::Vertical, 6);
+    let meta_edit_header = Label::new(Some("Metadata & Tags"));
+    meta_edit_header.set_css_classes(&["title-4"]);
+    meta_edit_header.set_halign(Align::Start);
+    meta_edit_box.append(&meta_edit_header);
+
+    let img_id = image.id;
+    let img_path = image.path.clone();
+    let img_rating = image.rating;
+    let img_flag = image.flagged;
+
+    // Title
+    let title_lbl = Label::new(Some("Title"));
+    title_lbl.set_css_classes(&["caption-heading"]);
+    title_lbl.set_halign(Align::Start);
+    meta_edit_box.append(&title_lbl);
+
+    let title_entry = Entry::new();
+    title_entry.set_placeholder_text(Some("Add a title..."));
+    if let Some(ref t) = image.title {
+        title_entry.set_text(t);
+    }
+    let db_t = db.clone();
+    let p_t = img_path.clone();
+    title_entry.connect_activate(move |entry| {
+        let text = entry.text().to_string();
+        if let (Some(id), Ok(conn)) = (img_id, db_t.conn()) {
+            let _ = queries::set_title(&conn, id, &text);
+            sync_image_xmp(&conn, id, &p_t, img_rating, img_flag);
+        }
+    });
+    meta_edit_box.append(&title_entry);
+
+    // Caption / Description
+    let desc_lbl = Label::new(Some("Caption / Description"));
+    desc_lbl.set_css_classes(&["caption-heading"]);
+    desc_lbl.set_halign(Align::Start);
+    meta_edit_box.append(&desc_lbl);
+
+    let desc_entry = Entry::new();
+    desc_entry.set_placeholder_text(Some("Add a caption..."));
+    if let Some(ref d) = image.description {
+        desc_entry.set_text(d);
+    }
+    let db_d = db.clone();
+    let p_d = img_path.clone();
+    desc_entry.connect_activate(move |entry| {
+        let text = entry.text().to_string();
+        if let (Some(id), Ok(conn)) = (img_id, db_d.conn()) {
+            let _ = queries::set_description(&conn, id, &text);
+            sync_image_xmp(&conn, id, &p_d, img_rating, img_flag);
+        }
+    });
+    meta_edit_box.append(&desc_entry);
+
+    // Tags Section
+    let tags_lbl = Label::new(Some("Tags"));
+    tags_lbl.set_css_classes(&["caption-heading"]);
+    tags_lbl.set_halign(Align::Start);
+    meta_edit_box.append(&tags_lbl);
+
+    let chips_box = GtkBox::new(Orientation::Vertical, 4);
+    meta_edit_box.append(&chips_box);
+
+    let add_tag_entry = Entry::new();
+    add_tag_entry.set_placeholder_text(Some("+ Add tag and press Enter"));
+    meta_edit_box.append(&add_tag_entry);
+
+    if let Some(id) = img_id {
+        let render_tags: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+        let rt_self = render_tags.clone();
+        let rt_action = {
+            let db = db.clone();
+            let chips_box = chips_box.clone();
+            let img_path = img_path.clone();
+            let rt_recurse = rt_self.clone();
+            Rc::new(move || {
+                while let Some(c) = chips_box.first_child() {
+                    chips_box.remove(&c);
+                }
+                let Ok(conn) = db.conn() else { return };
+                let tags = queries::get_tags_for_image(&conn, id).unwrap_or_default();
+                let flow = FlowBox::new();
+                flow.set_selection_mode(gtk4::SelectionMode::None);
+                flow.set_max_children_per_line(12);
+                flow.set_row_spacing(4);
+                flow.set_column_spacing(4);
+
+                for tag in tags {
+                    let chip = GtkBox::new(Orientation::Horizontal, 4);
+                    chip.add_css_class("tag-chip");
+                    let lbl = Label::new(Some(&format!("#{}", tag.name)));
+                    chip.append(&lbl);
+
+                    let rm_btn = Button::from_icon_name("window-close-symbolic");
+                    rm_btn.add_css_class("flat");
+                    rm_btn.add_css_class("tag-remove-btn");
+                    let db_rm = db.clone();
+                    let p_rm = img_path.clone();
+                    let tid = tag.id;
+                    let rt_call = rt_recurse.clone();
+                    rm_btn.connect_clicked(move |_| {
+                        if let (Some(tag_id), Ok(conn)) = (tid, db_rm.conn()) {
+                            let _ = queries::untag_image(&conn, id, tag_id);
+                            sync_image_xmp(&conn, id, &p_rm, img_rating, img_flag);
+                            if let Some(r) = rt_call.borrow().as_ref() {
+                                r();
+                            }
+                        }
+                    });
+                    chip.append(&rm_btn);
+                    flow.append(&chip);
+                }
+                chips_box.append(&flow);
+            })
+        };
+        *render_tags.borrow_mut() = Some(rt_action.clone());
+        rt_action();
+
+        let db_at = db.clone();
+        let p_at = img_path.clone();
+        let rt_at = rt_action.clone();
+        add_tag_entry.connect_activate(move |entry| {
+            let text = entry.text().trim().to_string();
+            if !text.is_empty() {
+                if let Ok(conn) = db_at.conn() {
+                    if let Ok(tag_id) = queries::create_tag(&conn, &text, None) {
+                        let _ = queries::tag_image(&conn, id, tag_id);
+                        sync_image_xmp(&conn, id, &p_at, img_rating, img_flag);
+                    }
+                }
+                entry.set_text("");
+                rt_at();
+            }
+        });
+    }
+
+    columns.append(&meta_edit_box);
+
+    // Section 3: Details (Metadata)
     let meta_col = GtkBox::new(Orientation::Vertical, 3);
     let meta_header = Label::new(Some("Details"));
     meta_header.set_css_classes(&["title-4"]);
@@ -943,5 +1159,5 @@ fn render_compare(
     split_box.append(&right_box);
 
     image_box.append(&split_box);
-    populate_info_panel(info_box, img_a, prefs, db);
+    populate_info_panel(info_box, img_a, cache_dir, prefs, db);
 }

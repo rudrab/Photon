@@ -1429,6 +1429,7 @@ dependencies = [
  "log",
  "photon-core",
  "photon-import",
+ "rusqlite",
  "serde",
  "serde_json",
  "thumbhash",

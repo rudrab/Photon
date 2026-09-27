@@ -22,13 +22,13 @@ use gtk4::prelude::*;
 use gtk4::{gio, glib};
 use gtk4::{
     Align, Box as GtkBox, Button, Label, MenuButton, Orientation, Paned,
-    ProgressBar, Revealer, ScrolledWindow, Stack,
+    ProgressBar, Revealer, ScrolledWindow, Stack, ToggleButton,
 };
 use libadwaita as adw;
 use libadwaita::prelude::*;
 use photon_core::db::queries::{self, TimelineFilter};
 use photon_core::db::Database;
-use photon_core::models::{Preferences, TimelineItem, UIAction};
+use photon_core::models::{Image, Preferences, TimelineItem, UIAction};
 use photon_import::ImportEngine;
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -107,13 +107,6 @@ impl MainWindow {
         header_bar.set_title_widget(Some(&window_title));
 
         // End: Filter Button + Primary MenuButton (Hamburger)
-        let filter_btn = MenuButton::builder()
-            .icon_name("view-filter-symbolic")
-            .tooltip_text("Filter & Grid Options")
-            .build();
-        filter_btn.add_css_class("flat");
-        header_bar.pack_end(&filter_btn);
-
         let primary_menu = menu::build_primary_menu();
         let menu_btn = MenuButton::builder()
             .icon_name("open-menu-symbolic")
@@ -123,6 +116,20 @@ impl MainWindow {
             .build();
         menu_btn.add_css_class("flat");
         header_bar.pack_end(&menu_btn);
+
+        let filter_btn = MenuButton::builder()
+            .icon_name("view-filter-symbolic")
+            .tooltip_text("Filter & Grid Options")
+            .build();
+        filter_btn.add_css_class("flat");
+        header_bar.pack_end(&filter_btn);
+
+        let search_btn = ToggleButton::builder()
+            .icon_name("system-search-symbolic")
+            .tooltip_text("Search Library (Ctrl+F)")
+            .build();
+        search_btn.add_css_class("flat");
+        header_bar.pack_end(&search_btn);
 
         root_box.append(&header_bar);
 
@@ -259,6 +266,30 @@ impl MainWindow {
         let viewer_container = GtkBox::new(Orientation::Vertical, 0);
         viewer_container.set_vexpand(true);
         viewer_container.set_hexpand(true);
+
+        // ── Search Bar (GNOME HIG) ─────────────────────────
+        let search_bar = gtk4::SearchBar::new();
+        let search_entry = gtk4::SearchEntry::new();
+        search_entry.set_hexpand(true);
+        search_entry.set_placeholder_text(Some("Search by filename, tag:name, camera:make, lens:model, is:pick..."));
+        search_bar.set_child(Some(&search_entry));
+        search_bar.connect_entry(&search_entry);
+        search_bar.set_key_capture_widget(Some(&window));
+        search_bar
+            .bind_property("search-mode-enabled", &search_btn, "active")
+            .bidirectional()
+            .build();
+
+        let tx_search = nav_tx.clone();
+        search_entry.connect_search_changed(move |entry| {
+            let text = entry.text().to_string();
+            if text.trim().is_empty() {
+                let _ = tx_search.send_blocking(UIAction::ShowAll);
+            } else {
+                let _ = tx_search.send_blocking(UIAction::Search(text));
+            }
+        });
+        content_box.append(&search_bar);
 
         let stack = Stack::new();
         stack.set_vexpand(true);
@@ -436,9 +467,16 @@ impl MainWindow {
                 .build();
             about.present();
         });
-        mw.window.add_action(&act_about);
+        // ── Search Action ──────────────────────────────
+        let sbtn_act = search_btn.clone();
+        let act_search = gio::SimpleAction::new("search", None);
+        act_search.connect_activate(move |_, _| {
+            sbtn_act.set_active(!sbtn_act.is_active());
+        });
+        mw.window.add_action(&act_search);
 
         let mw_changed = mw.clone();
+        let mw_export = mw.clone();
         selection_bar::attach(
             &mw.timeline,
             selection_bar::Context {
@@ -446,6 +484,7 @@ impl MainWindow {
                 db: mw.db.clone(),
                 prefs: mw.prefs.clone(),
                 on_library_changed: Rc::new(move || mw_changed.refresh()),
+                on_export: Rc::new(move |images| mw_export.start_export(images)),
             },
         );
 
@@ -485,7 +524,9 @@ impl MainWindow {
             UIAction::ViewPhoto(idx) => {
                 self.show_viewer(*idx);
             }
-            UIAction::FilterByTag(_) => {}
+            UIAction::FilterByTag(tag) => {
+                self.show_timeline(TimelineFilter::Tag(tag.clone()), format!("Tag: #{tag}"));
+            }
         }
     }
 
@@ -495,6 +536,7 @@ impl MainWindow {
     pub fn refresh(&self) {
         self.timeline_stale.set(true);
         self.sidebar.refresh_events();
+        self.sidebar.refresh_tags();
         let action = self.last_grid_action.borrow().clone();
         let showing_viewer = self.stack.visible_child_name().as_deref() == Some("viewer");
         if !showing_viewer {
@@ -650,6 +692,8 @@ impl MainWindow {
         let prefs = self.prefs.borrow();
 
         self.clear_viewer();
+        let this = self.clone();
+        let on_export = Some(Rc::new(move |images| this.start_export(images)) as Rc<dyn Fn(Vec<Image>)>);
         let viewer = detail::build_viewer(
             photos,
             index,
@@ -658,9 +702,68 @@ impl MainWindow {
             &self.nav_tx,
             back_action,
             &self.db,
+            on_export,
         );
         self.viewer_container.append(&viewer);
         self.stack.set_visible_child_name("viewer");
+    }
+
+    /// Batch export dialog and progress reporting for photos.
+    pub fn start_export(&self, images: Vec<Image>) {
+        if images.is_empty() {
+            return;
+        }
+        let status = self.status_label.clone();
+        let pbar = self.progress_bar.clone();
+        let revealer = self.progress_revealer.clone();
+
+        let s1 = status.clone();
+        let p1 = pbar.clone();
+        let r1 = revealer.clone();
+        let on_start = move |total: usize| {
+            s1.set_text(&format!("Exporting {total} photos..."));
+            p1.set_fraction(0.0);
+            p1.set_text(Some(&format!("0/{total}")));
+            r1.set_reveal_child(true);
+        };
+
+        let s2 = status.clone();
+        let p2 = pbar.clone();
+        let on_progress = move |done: usize, total: usize| {
+            let s = s2.clone();
+            let p = p2.clone();
+            glib::idle_add_local_once(move || {
+                s.set_text(&format!("Exporting photo {done} of {total}..."));
+                p.set_fraction(done as f64 / total.max(1) as f64);
+                p.set_text(Some(&format!("{done}/{total}")));
+            });
+        };
+
+        let s3 = status.clone();
+        let p3 = pbar.clone();
+        let r3 = revealer.clone();
+        let on_done = move |report: photon_import::export::ExportReport| {
+            s3.set_text(&format!(
+                "Export complete: {} of {} exported ({} failed)",
+                report.exported,
+                report.total,
+                report.failed
+            ));
+            p3.set_fraction(1.0);
+            p3.set_text(Some("Complete"));
+            let r = r3.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_secs(4), move || {
+                r.set_reveal_child(false);
+            });
+        };
+
+        crate::ui::export_dialog::show(
+            &self.window,
+            images,
+            on_start,
+            on_progress,
+            on_done,
+        );
     }
 
     // ── Helpers ─────────────────────────────────────────

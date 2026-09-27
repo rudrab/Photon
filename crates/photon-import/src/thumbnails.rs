@@ -212,6 +212,79 @@ pub fn compute_thumbhash(img: &RgbImage) -> Option<Vec<u8>> {
     ))
 }
 
+#[derive(Debug, Clone)]
+pub struct HistogramData {
+    pub r: [u32; 256],
+    pub g: [u32; 256],
+    pub b: [u32; 256],
+    pub lum: [u32; 256],
+    pub max_val: u32,
+    pub shadow_clip: bool,
+    pub highlight_clip: bool,
+}
+
+impl Default for HistogramData {
+    fn default() -> Self {
+        Self {
+            r: [0u32; 256],
+            g: [0u32; 256],
+            b: [0u32; 256],
+            lum: [0u32; 256],
+            max_val: 0,
+            shadow_clip: false,
+            highlight_clip: false,
+        }
+    }
+}
+
+impl HistogramData {
+    pub fn compute(img: &RgbImage) -> Self {
+        let mut r = [0u32; 256];
+        let mut g = [0u32; 256];
+        let mut b = [0u32; 256];
+        let mut lum = [0u32; 256];
+
+        for pixel in img.pixels() {
+            let pr = pixel[0] as usize;
+            let pg = pixel[1] as usize;
+            let pb = pixel[2] as usize;
+            let plum = ((0.2126 * pixel[0] as f64 + 0.7152 * pixel[1] as f64 + 0.0722 * pixel[2] as f64)
+                .round() as usize)
+                .clamp(0, 255);
+
+            r[pr] += 1;
+            g[pg] += 1;
+            b[pb] += 1;
+            lum[plum] += 1;
+        }
+
+        let mut max_val = 1u32;
+        for i in 1..255 {
+            max_val = max_val.max(r[i]).max(g[i]).max(b[i]).max(lum[i]);
+        }
+
+        let total_pixels = (img.width() * img.height()) as f64;
+        let shadow_clip = (lum[0] as f64 / total_pixels) > 0.01;
+        let highlight_clip = (lum[255] as f64 / total_pixels) > 0.01;
+
+        Self {
+            r,
+            g,
+            b,
+            lum,
+            max_val,
+            shadow_clip,
+            highlight_clip,
+        }
+    }
+}
+
+/// Compute histogram from an image file (e.g. cached thumbnail or source).
+pub fn compute_histogram(path: &Path) -> Option<HistogramData> {
+    let img = image::open(path).ok()?.to_rgb8();
+    Some(HistogramData::compute(&img))
+}
+
 fn resize(src: RgbImage, long_edge: u32) -> Result<RgbImage> {
     let (w, h) = src.dimensions();
     if w == 0 || h == 0 {
