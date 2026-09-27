@@ -16,13 +16,13 @@ use chrono::DateTime;
 use gtk4::prelude::*;
 use gtk4::{gdk, gio, glib};
 use gtk4::{
-    Align, Box as GtkBox, DrawingArea, GestureClick, Label, ListView, NoSelection, Orientation,
-    Overlay, Picture, Revealer, ScrolledWindow, SignalListItemFactory,
+    Align, Box as GtkBox, DrawingArea, EventControllerKey, GestureClick, Label, ListView,
+    NoSelection, Orientation, Overlay, Picture, Revealer, ScrolledWindow, SignalListItemFactory,
 };
 use photon_core::models::TimelineItem;
 use photon_import::thumbnails::{thumb_path, ThumbSize};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
@@ -46,9 +46,25 @@ const CSS: &str = "
 .photon-tile {
     background-color: alpha(currentColor, 0.08);
     border-radius: 8px;
-    transition: opacity 150ms ease;
+    transition: opacity 150ms ease, outline-color 150ms ease, box-shadow 150ms ease;
+    outline: 3px solid transparent;
+    outline-offset: -3px;
 }
 .photon-tile:hover picture { opacity: 0.88; }
+.photon-tile.photon-tile-selected {
+    outline: 3px solid @accent_bg_color;
+    outline-offset: -3px;
+    box-shadow: 0 0 0 2px alpha(@accent_bg_color, 0.4);
+}
+.photon-tile.photon-tile-focused {
+    outline: 3px solid @accent_color;
+    outline-offset: -3px;
+}
+.photon-tile.photon-tile-selected.photon-tile-focused {
+    outline: 3px solid @accent_bg_color;
+    outline-offset: -3px;
+    box-shadow: 0 0 0 3px alpha(@accent_bg_color, 0.6);
+}
 .photon-section-header {
     font-weight: 700;
     font-size: 1.15em;
@@ -93,6 +109,80 @@ pub fn layout(items: &[TimelineItem], width: i32, target_height: i32, by_day: bo
         start = end;
     }
     rows
+}
+
+/// Given current rows and a focused item index, find the best tile index
+/// when moving vertically (up if `!down`, down if `down`).
+///
+/// Skips date header rows and selects the tile in the adjacent photo row
+/// whose horizontal center is closest to the current tile's horizontal center.
+pub fn navigate_2d(rows: &[Row], current_index: usize, down: bool) -> Option<usize> {
+    // 1. Locate row containing current_index and calculate its horizontal center.
+    let mut current_row_idx = None;
+    let mut current_tile_center = 0.0;
+
+    for (r_idx, row) in rows.iter().enumerate() {
+        if let Row::Photos(tiles) = row {
+            let mut x = 0;
+            for tile in tiles {
+                if tile.index == current_index {
+                    current_row_idx = Some(r_idx);
+                    current_tile_center = x as f64 + (tile.width as f64) / 2.0;
+                    break;
+                }
+                x += tile.width + GAP;
+            }
+            if current_row_idx.is_some() {
+                break;
+            }
+        }
+    }
+
+    let r_idx = current_row_idx?;
+
+    // 2. Search in target direction skipping Row::Header rows
+    let target_row_idx = if down {
+        let mut target = None;
+        for i in (r_idx + 1)..rows.len() {
+            if let Row::Photos(tiles) = &rows[i] {
+                if !tiles.is_empty() {
+                    target = Some(i);
+                    break;
+                }
+            }
+        }
+        target?
+    } else {
+        let mut target = None;
+        for i in (0..r_idx).rev() {
+            if let Row::Photos(tiles) = &rows[i] {
+                if !tiles.is_empty() {
+                    target = Some(i);
+                    break;
+                }
+            }
+        }
+        target?
+    };
+
+    // 3. Find the tile with closest horizontal center
+    if let Row::Photos(target_tiles) = &rows[target_row_idx] {
+        let mut best_tile_index = None;
+        let mut best_dist = f64::MAX;
+        let mut x = 0;
+        for tile in target_tiles {
+            let center = x as f64 + (tile.width as f64) / 2.0;
+            let dist = (center - current_tile_center).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best_tile_index = Some(tile.index);
+            }
+            x += tile.width + GAP;
+        }
+        best_tile_index
+    } else {
+        None
+    }
 }
 
 fn justify(
@@ -212,6 +302,7 @@ impl TextureCache {
 // ---------------------------------------------------------------------------
 
 type ActivateFn = Box<dyn Fn(usize)>;
+type SelectionFn = Box<dyn Fn(&HashSet<usize>)>;
 
 struct Inner {
     root: Overlay,
@@ -220,6 +311,10 @@ struct Inner {
     items: RefCell<Rc<Vec<TimelineItem>>>,
     rows: RefCell<Vec<Row>>,
     row_y_offsets: RefCell<Vec<i32>>,
+    focused_index: Cell<Option<usize>>,
+    selected_indices: RefCell<HashSet<usize>>,
+    anchor_index: Cell<Option<usize>>,
+    visible_tiles: RefCell<HashMap<usize, glib::WeakRef<GtkBox>>>,
     date_badge: Revealer,
     date_label: Label,
     hide_badge_timer: RefCell<Option<glib::SourceId>>,
@@ -230,6 +325,7 @@ struct Inner {
     cache_dir: PathBuf,
     textures: RefCell<TextureCache>,
     on_activate: RefCell<Option<ActivateFn>>,
+    on_selection_changed: RefCell<Option<SelectionFn>>,
 }
 
 /// The virtualized timeline widget. Cheap to clone (shared handle).
@@ -254,6 +350,7 @@ impl Timeline {
             .hscrollbar_policy(gtk4::PolicyType::External)
             .vexpand(true)
             .hexpand(true)
+            .focusable(true)
             .child(&list)
             .build();
 
@@ -285,6 +382,7 @@ impl Timeline {
         let size_probe = DrawingArea::new();
         size_probe.set_can_target(false);
         let root = Overlay::new();
+        root.set_focusable(true);
         root.set_child(Some(&scrolled));
         root.add_overlay(&size_probe);
         root.add_overlay(&date_badge);
@@ -296,6 +394,10 @@ impl Timeline {
             items: RefCell::new(Rc::new(Vec::new())),
             rows: RefCell::new(Vec::new()),
             row_y_offsets: RefCell::new(Vec::new()),
+            focused_index: Cell::new(None),
+            selected_indices: RefCell::new(HashSet::new()),
+            anchor_index: Cell::new(None),
+            visible_tiles: RefCell::new(HashMap::new()),
             date_badge,
             date_label,
             hide_badge_timer: RefCell::new(None),
@@ -306,7 +408,20 @@ impl Timeline {
             cache_dir,
             textures: RefCell::new(TextureCache::new()),
             on_activate: RefCell::new(None),
+            on_selection_changed: RefCell::new(None),
         });
+
+        // Key controller for 2D keyboard navigation and multi-selection
+        let key_controller = EventControllerKey::new();
+        let weak_key = Rc::downgrade(&inner);
+        key_controller.connect_key_pressed(move |_, keyval, _, state| {
+            if let Some(inner) = weak_key.upgrade() {
+                Inner::handle_key_pressed(&inner, keyval, state)
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        inner.scrolled.add_controller(key_controller);
 
         // Update floating date pill on scroll
         let weak_scroll = Rc::downgrade(&inner);
@@ -393,20 +508,77 @@ impl Timeline {
         &self.inner.root
     }
 
-    /// Called with the photo's index into the current items when a tile is clicked.
+    /// Called with the photo's index into the current items when a tile is clicked or activated.
     pub fn connect_activate(&self, f: impl Fn(usize) + 'static) {
         *self.inner.on_activate.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Called when the set of selected items changes.
+    #[allow(dead_code)]
+    pub fn connect_selection_changed(&self, f: impl Fn(&HashSet<usize>) + 'static) {
+        *self.inner.on_selection_changed.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Return the currently selected item indices.
+    #[allow(dead_code)]
+    pub fn selected_indices(&self) -> HashSet<usize> {
+        self.inner.selected_indices.borrow().clone()
+    }
+
+    /// Clear all selections.
+    #[allow(dead_code)]
+    pub fn clear_selection(&self) {
+        self.inner.selected_indices.borrow_mut().clear();
+        Inner::update_tile_styles(&self.inner);
+    }
+
+    /// Select all photos in the timeline.
+    #[allow(dead_code)]
+    pub fn select_all(&self) {
+        let n_items = self.inner.items.borrow().len();
+        let mut sel = self.inner.selected_indices.borrow_mut();
+        sel.clear();
+        for i in 0..n_items {
+            sel.insert(i);
+        }
+        drop(sel);
+        Inner::update_tile_styles(&self.inner);
+    }
+
+    /// Currently focused item index.
+    #[allow(dead_code)]
+    pub fn focused_index(&self) -> Option<usize> {
+        self.inner.focused_index.get()
     }
 
     /// Show `items`. With `keep_scroll`, the view stays where it was (used for
     /// live refreshes during an import); otherwise it starts at the top.
     pub fn set_items(&self, items: Rc<Vec<TimelineItem>>, by_day: bool, keep_scroll: bool) {
+        let len = items.len();
         *self.inner.items.borrow_mut() = items;
         self.inner.by_day.set(by_day);
+        if !keep_scroll {
+            self.inner.focused_index.set(None);
+            self.inner.anchor_index.set(None);
+            self.inner.selected_indices.borrow_mut().clear();
+        } else {
+            self.inner.selected_indices.borrow_mut().retain(|&idx| idx < len);
+            if let Some(idx) = self.inner.focused_index.get() {
+                if idx >= len {
+                    self.inner.focused_index.set(None);
+                }
+            }
+            if let Some(idx) = self.inner.anchor_index.get() {
+                if idx >= len {
+                    self.inner.anchor_index.set(None);
+                }
+            }
+        }
         let adj = self.inner.scrolled.vadjustment();
         let value = if keep_scroll { adj.value() } else { 0.0 };
         self.inner.relayout();
         restore_scroll(&adj, value);
+        Inner::update_tile_styles(&self.inner);
     }
 
     pub fn set_row_height(&self, height: i32) {
@@ -473,6 +645,184 @@ impl Inner {
         self.store.splice(0, self.store.n_items(), &objects);
     }
 
+    fn update_tile_styles(this: &Rc<Self>) {
+        let focus = this.focused_index.get();
+        let selected = this.selected_indices.borrow();
+        let mut visible = this.visible_tiles.borrow_mut();
+        visible.retain(|&idx, weak_box| {
+            if let Some(frame) = weak_box.upgrade() {
+                if selected.contains(&idx) {
+                    frame.add_css_class("photon-tile-selected");
+                } else {
+                    frame.remove_css_class("photon-tile-selected");
+                }
+
+                if focus == Some(idx) {
+                    frame.add_css_class("photon-tile-focused");
+                } else {
+                    frame.remove_css_class("photon-tile-focused");
+                }
+                true
+            } else {
+                false
+            }
+        });
+        if let Some(cb) = this.on_selection_changed.borrow().as_ref() {
+            cb(&selected);
+        }
+    }
+
+    fn scroll_to_item(this: &Rc<Self>, item_index: usize) {
+        let rows = this.rows.borrow();
+        let offsets = this.row_y_offsets.borrow();
+        for (r_idx, row) in rows.iter().enumerate() {
+            if let Row::Photos(tiles) = row {
+                if tiles.iter().any(|t| t.index == item_index) {
+                    let y = offsets.get(r_idx).copied().unwrap_or(0);
+                    let h = tiles.first().map(|t| t.height).unwrap_or(0) + GAP;
+                    let adj = this.scrolled.vadjustment();
+                    let current_val = adj.value();
+                    let page_size = adj.page_size();
+                    let target_top = y as f64;
+                    let target_bottom = (y + h) as f64;
+
+                    if target_top < current_val {
+                        adj.set_value(target_top.max(0.0));
+                    } else if target_bottom > current_val + page_size {
+                        adj.set_value((target_bottom - page_size).max(0.0));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    fn move_focus(this: &Rc<Self>, target_idx: usize, is_shift: bool, is_ctrl: bool) {
+        let anchor = this.anchor_index.get().unwrap_or(target_idx);
+        this.focused_index.set(Some(target_idx));
+
+        if is_shift {
+            let start = anchor.min(target_idx);
+            let end = anchor.max(target_idx);
+            let mut sel = this.selected_indices.borrow_mut();
+            sel.clear();
+            for i in start..=end {
+                sel.insert(i);
+            }
+        } else if is_ctrl {
+            this.anchor_index.set(Some(target_idx));
+        } else {
+            this.anchor_index.set(Some(target_idx));
+            let mut sel = this.selected_indices.borrow_mut();
+            sel.clear();
+            sel.insert(target_idx);
+        }
+
+        Self::update_tile_styles(this);
+        Self::scroll_to_item(this, target_idx);
+    }
+
+    fn handle_key_pressed(
+        this: &Rc<Self>,
+        keyval: gdk::Key,
+        state: gdk::ModifierType,
+    ) -> glib::Propagation {
+        let n_items = this.items.borrow().len();
+        if n_items == 0 {
+            return glib::Propagation::Proceed;
+        }
+
+        let is_shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+        let is_ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+        let current_focus = this.focused_index.get();
+
+        match keyval {
+            gdk::Key::Left | gdk::Key::KP_Left => {
+                let next_idx = match current_focus {
+                    Some(idx) => idx.saturating_sub(1),
+                    None => 0,
+                };
+                Self::move_focus(this, next_idx, is_shift, is_ctrl);
+                glib::Propagation::Stop
+            }
+            gdk::Key::Right | gdk::Key::KP_Right => {
+                let next_idx = match current_focus {
+                    Some(idx) => (idx + 1).min(n_items.saturating_sub(1)),
+                    None => 0,
+                };
+                Self::move_focus(this, next_idx, is_shift, is_ctrl);
+                glib::Propagation::Stop
+            }
+            gdk::Key::Up | gdk::Key::KP_Up => {
+                let next_idx = match current_focus {
+                    Some(idx) => {
+                        let rows = this.rows.borrow();
+                        navigate_2d(&rows, idx, false).unwrap_or(idx)
+                    }
+                    None => 0,
+                };
+                Self::move_focus(this, next_idx, is_shift, is_ctrl);
+                glib::Propagation::Stop
+            }
+            gdk::Key::Down | gdk::Key::KP_Down => {
+                let next_idx = match current_focus {
+                    Some(idx) => {
+                        let rows = this.rows.borrow();
+                        navigate_2d(&rows, idx, true).unwrap_or(idx)
+                    }
+                    None => 0,
+                };
+                Self::move_focus(this, next_idx, is_shift, is_ctrl);
+                glib::Propagation::Stop
+            }
+            gdk::Key::Home | gdk::Key::KP_Home => {
+                Self::move_focus(this, 0, is_shift, is_ctrl);
+                glib::Propagation::Stop
+            }
+            gdk::Key::End | gdk::Key::KP_End => {
+                Self::move_focus(this, n_items.saturating_sub(1), is_shift, is_ctrl);
+                glib::Propagation::Stop
+            }
+            gdk::Key::space | gdk::Key::KP_Space => {
+                if let Some(idx) = current_focus {
+                    let mut sel = this.selected_indices.borrow_mut();
+                    if sel.contains(&idx) {
+                        sel.remove(&idx);
+                    } else {
+                        sel.insert(idx);
+                    }
+                    drop(sel);
+                    Self::update_tile_styles(this);
+                }
+                glib::Propagation::Stop
+            }
+            gdk::Key::Return | gdk::Key::KP_Enter => {
+                if let Some(idx) = current_focus {
+                    if let Some(f) = this.on_activate.borrow().as_ref() {
+                        f(idx);
+                    }
+                }
+                glib::Propagation::Stop
+            }
+            gdk::Key::Escape => {
+                this.selected_indices.borrow_mut().clear();
+                Self::update_tile_styles(this);
+                glib::Propagation::Stop
+            }
+            gdk::Key::a | gdk::Key::A if is_ctrl => {
+                let mut sel = this.selected_indices.borrow_mut();
+                sel.clear();
+                for i in 0..n_items {
+                    sel.insert(i);
+                }
+                drop(sel);
+                Self::update_tile_styles(this);
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        }
+    }
+
     fn bind_row(this: &Rc<Self>, row_box: &GtkBox, row: &Row) {
         clear_children(row_box);
         match row {
@@ -503,6 +853,15 @@ impl Inner {
         frame.add_css_class("photon-tile");
         frame.set_cursor_from_name(Some("pointer"));
 
+        if this.selected_indices.borrow().contains(&tile.index) {
+            frame.add_css_class("photon-tile-selected");
+        }
+        if this.focused_index.get() == Some(tile.index) {
+            frame.add_css_class("photon-tile-focused");
+        }
+
+        this.visible_tiles.borrow_mut().insert(tile.index, frame.downgrade());
+
         let picture = Picture::new();
         picture.set_content_fit(gtk4::ContentFit::Cover);
         picture.set_can_shrink(true);
@@ -523,12 +882,48 @@ impl Inner {
         let click = GestureClick::new();
         let weak = Rc::downgrade(this);
         let index = tile.index;
-        click.connect_released(move |_, _, _, _| {
-            if let Some(inner) = weak.upgrade() {
+        click.connect_released(move |gesture, n_press, _, _| {
+            let Some(inner) = weak.upgrade() else { return };
+            inner.scrolled.grab_focus();
+
+            if n_press == 2 {
                 if let Some(f) = inner.on_activate.borrow().as_ref() {
                     f(index);
                 }
+                return;
             }
+
+            let state = gesture.current_event_state();
+            let is_shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+            let is_ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+
+            if is_shift {
+                let anchor = inner.anchor_index.get().unwrap_or(index);
+                inner.focused_index.set(Some(index));
+                let start = anchor.min(index);
+                let end = anchor.max(index);
+                let mut sel = inner.selected_indices.borrow_mut();
+                sel.clear();
+                for i in start..=end {
+                    sel.insert(i);
+                }
+            } else if is_ctrl {
+                inner.focused_index.set(Some(index));
+                inner.anchor_index.set(Some(index));
+                let mut sel = inner.selected_indices.borrow_mut();
+                if sel.contains(&index) {
+                    sel.remove(&index);
+                } else {
+                    sel.insert(index);
+                }
+            } else {
+                inner.focused_index.set(Some(index));
+                inner.anchor_index.set(Some(index));
+                let mut sel = inner.selected_indices.borrow_mut();
+                sel.clear();
+                sel.insert(index);
+            }
+            Inner::update_tile_styles(&inner);
         });
         frame.add_controller(click);
         frame
@@ -712,4 +1107,42 @@ mod tests {
         assert!(rows.len() > 10_000);
         assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
     }
+
+    #[test]
+    fn navigate_2d_jumps_correctly_across_rows_and_headers() {
+        // Row 0: Tiles [0 (w: 300), 1 (w: 300), 2 (w: 400)] -> x centers: 150, 454, 808
+        // Row 1: Header
+        // Row 2: Tiles [3 (w: 500), 4 (w: 500)] -> x centers: 250, 754
+        let rows = vec![
+            Row::Photos(vec![
+                Tile { index: 0, width: 300, height: 200 },
+                Tile { index: 1, width: 300, height: 200 },
+                Tile { index: 2, width: 400, height: 200 },
+            ]),
+            Row::Header("Yesterday".to_string()),
+            Row::Photos(vec![
+                Tile { index: 3, width: 500, height: 200 },
+                Tile { index: 4, width: 500, height: 200 },
+            ]),
+        ];
+
+        // Navigating down from 0 (center 150) should pick 3 (center 250 vs 754)
+        assert_eq!(navigate_2d(&rows, 0, true), Some(3));
+        // Navigating down from 1 (center 454) should pick 3 (|250-454|=204 vs |754-454|=300)
+        assert_eq!(navigate_2d(&rows, 1, true), Some(3));
+        // Navigating down from 2 (center 808) should pick 4 (|754-808|=54 vs |250-808|=558)
+        assert_eq!(navigate_2d(&rows, 2, true), Some(4));
+
+        // Navigating up from 3 (center 250) should pick 0 (|150-250|=100 vs |454-250|=204)
+        assert_eq!(navigate_2d(&rows, 3, false), Some(0));
+        // Navigating up from 4 (center 754) should pick 2 (|808-754|=54 vs |454-754|=300)
+        assert_eq!(navigate_2d(&rows, 4, false), Some(2));
+
+        // Top boundary: navigating up from Row 0 returns None
+        assert_eq!(navigate_2d(&rows, 0, false), None);
+        // Bottom boundary: navigating down from Row 2 returns None
+        assert_eq!(navigate_2d(&rows, 3, true), None);
+        assert_eq!(navigate_2d(&rows, 4, true), None);
+    }
 }
+
