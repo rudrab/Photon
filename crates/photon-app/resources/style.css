@@ -1,0 +1,196 @@
+/* Photon — GNOME HIG and Material 3 Design Stylesheet */
+
+/* ==========================================================================
+   1. BUTTON CORNER RADII (GNOME HIG PREFERRED) & STYLING
+   ========================================================================== */
+
+/* Standard GNOME HIG Buttons: 8px corner radius */
+button {
+    border-radius: 8px;
+    font-weight: 500;
+    transition: background 150ms ease, box-shadow 150ms ease, opacity 150ms ease, transform 100ms ease;
+}
+
+button:focus:focus-visible {
+    outline: 2px solid @accent_color;
+    outline-offset: 2px;
+}
+
+/* Flat / Toolbar buttons */
+button.flat {
+    border-radius: 8px;
+    padding: 6px 10px;
+}
+
+button.flat:hover {
+    background-color: alpha(currentColor, 0.08);
+}
+
+button.flat:active {
+    background-color: alpha(currentColor, 0.14);
+}
+
+/* Pill buttons: Full capsule radius */
+button.pill, .pill {
+    border-radius: 9999px;
+    padding-left: 16px;
+    padding-right: 16px;
+    padding-top: 6px;
+    padding-bottom: 6px;
+}
+
+/* Circular icon buttons */
+button.circular, .circular {
+    border-radius: 9999px;
+    min-width: 36px;
+    min-height: 36px;
+    padding: 0;
+}
+
+/* Suggested Action (Primary Call-to-Action) */
+button.suggested-action {
+    border-radius: 8px;
+    font-weight: 600;
+    background-color: @accent_bg_color;
+    color: @accent_fg_color;
+}
+
+button.suggested-action:hover {
+    background-color: color-mix(in srgb, @accent_bg_color 88%, white);
+}
+
+/* Destructive Action */
+button.destructive-action {
+    border-radius: 8px;
+    font-weight: 600;
+}
+
+/* Linked button group (Connected segmented controls) */
+.linked > button:first-child:not(:last-child) {
+    border-top-left-radius: 8px;
+    border-bottom-left-radius: 8px;
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+    margin-right: -1px;
+}
+
+.linked > button:last-child:not(:first-child) {
+    border-top-right-radius: 8px;
+    border-bottom-right-radius: 8px;
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+}
+
+.linked > button:not(:first-child):not(:last-child) {
+    border-radius: 0;
+    margin-right: -1px;
+}
+
+/* ==========================================================================
+   2. CARDS & SURFACES (MATERIAL 3 & GNOME HIG)
+   ========================================================================== */
+
+/* GNOME HIG Card standard: 12px border radius */
+.card, .photon-card {
+    border-radius: 12px;
+    background-color: @card_bg_color;
+    border: 1px solid alpha(currentColor, 0.08);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
+    transition: transform 180ms ease, box-shadow 180ms ease, border-color 180ms ease;
+}
+
+.card:hover, .photon-card:hover {
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12), 0 2px 4px rgba(0, 0, 0, 0.06);
+    border-color: alpha(currentColor, 0.16);
+}
+
+/* Photo tiles in timeline: 8px radius with smooth transitions */
+.photon-tile {
+    border-radius: 8px;
+    background-color: alpha(currentColor, 0.06);
+    transition: opacity 150ms ease;
+}
+
+.photon-tile:hover {
+    opacity: 0.90;
+}
+
+/* ==========================================================================
+   3. SIDEBAR (GNOME HIG NAVIGATION SIDEBAR)
+   ========================================================================== */
+
+.navigation-sidebar {
+    background-color: transparent;
+    padding: 8px 4px;
+}
+
+.navigation-sidebar button {
+    border-radius: 8px;
+    padding: 6px 10px;
+    margin: 2px 4px;
+    font-weight: 500;
+}
+
+.navigation-sidebar button:hover {
+    background-color: alpha(currentColor, 0.07);
+}
+
+.navigation-sidebar button:active, .navigation-sidebar button.selected {
+    background-color: alpha(currentColor, 0.12);
+}
+
+.caption-heading {
+    font-size: 0.82em;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: alpha(currentColor, 0.55);
+}
+
+/* Count badge pill */
+.photon-badge {
+    border-radius: 9999px;
+    padding: 2px 8px;
+    font-size: 0.82em;
+    font-weight: 600;
+    background-color: alpha(currentColor, 0.08);
+    color: alpha(currentColor, 0.7);
+}
+
+/* ==========================================================================
+   4. INLINE VIEWER & TOOLBARS
+   ========================================================================== */
+
+.viewer-toolbar {
+    border-radius: 10px;
+    background-color: alpha(@card_bg_color, 0.95);
+    border-bottom: 1px solid alpha(currentColor, 0.06);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+.info-sheet {
+    border-top-left-radius: 16px;
+    border-top-right-radius: 16px;
+    background-color: @card_bg_color;
+    border-top: 1px solid alpha(currentColor, 0.08);
+    box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.08);
+}
+
+/* Status floating card */
+.status-card {
+    border-radius: 12px;
+    background-color: @card_bg_color;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12), 0 1px 3px rgba(0, 0, 0, 0.06);
+    border: 1px solid alpha(currentColor, 0.08);
+}
+
+/* Progress bar styling */
+progressbar trough {
+    border-radius: 9999px;
+    min-height: 8px;
+}
+
+progressbar progress {
+    border-radius: 9999px;
+    background-color: @accent_bg_color;
+}

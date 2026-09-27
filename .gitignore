@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+photon.db
+photon.db-shm
+photon.db-wal
+*.log

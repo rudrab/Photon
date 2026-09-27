@@ -1,0 +1,20 @@
+[package]
+name = "photon-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+blake3.workspace = true
+rusqlite.workspace = true
+r2d2.workspace = true
+r2d2_sqlite.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3.10"
