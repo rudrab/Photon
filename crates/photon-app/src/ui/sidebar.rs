@@ -148,7 +148,9 @@ impl Sidebar {
             .label(format!("{}  ·  {}", node.year, node.count))
             .build();
         let body = Box::new(Orientation::Vertical, 2);
-        body.set_margin_start(12);
+        body.set_margin_start(10);
+        body.set_margin_top(2);
+        body.set_margin_bottom(2);
         expander.set_child(Some(&body));
 
         let this = self.clone();
@@ -168,8 +170,10 @@ impl Sidebar {
         let expander = Expander::builder()
             .label(format!("{}  ·  {}", month_name(month), count))
             .build();
-        let body = Box::new(Orientation::Vertical, 2);
+        let body = Box::new(Orientation::Vertical, 1);
         body.set_margin_start(12);
+        body.set_margin_top(2);
+        body.set_margin_bottom(2);
         expander.set_child(Some(&body));
 
         let sender = self.sender.clone();
@@ -343,11 +347,11 @@ fn make_row_with_count(text: &str, icon: &str, count: Option<u32>) -> Button {
         .build();
     btn.add_css_class("flat");
 
-    let b = Box::new(Orientation::Horizontal, 10);
-    b.set_margin_top(4);
-    b.set_margin_bottom(4);
-    b.set_margin_start(6);
-    b.set_margin_end(6);
+    let b = Box::new(Orientation::Horizontal, 8);
+    b.set_margin_top(1);
+    b.set_margin_bottom(1);
+    b.set_margin_start(4);
+    b.set_margin_end(4);
 
     let icon_widget = Image::from_icon_name(icon);
     b.append(&icon_widget);

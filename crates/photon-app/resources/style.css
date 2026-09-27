@@ -121,13 +121,35 @@ button.destructive-action {
 
 .navigation-sidebar {
     background-color: transparent;
-    padding: 8px 4px;
+    padding: 6px 4px;
+}
+
+.navigation-sidebar expander {
+    margin-top: 2px;
+    margin-bottom: 2px;
+}
+
+.navigation-sidebar expander title {
+    border-radius: 8px;
+    padding: 4px 6px;
+    min-height: 30px;
+    font-weight: 500;
+    transition: background-color 150ms ease;
+}
+
+.navigation-sidebar expander title:hover {
+    background-color: alpha(currentColor, 0.07);
+}
+
+.navigation-sidebar expander title:active {
+    background-color: alpha(currentColor, 0.12);
 }
 
 .navigation-sidebar button {
     border-radius: 8px;
-    padding: 6px 10px;
-    margin: 2px 4px;
+    padding: 4px 6px;
+    margin: 1px 0px;
+    min-height: 30px;
     font-weight: 500;
 }
 
@@ -140,18 +162,18 @@ button.destructive-action {
 }
 
 .caption-heading {
-    font-size: 0.82em;
+    font-size: 0.80em;
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.6px;
-    color: alpha(currentColor, 0.55);
+    color: alpha(currentColor, 0.50);
 }
 
 /* Count badge pill */
 .photon-badge {
     border-radius: 9999px;
-    padding: 2px 8px;
-    font-size: 0.82em;
+    padding: 1px 7px;
+    font-size: 0.80em;
     font-weight: 600;
     background-color: alpha(currentColor, 0.08);
     color: alpha(currentColor, 0.7);
