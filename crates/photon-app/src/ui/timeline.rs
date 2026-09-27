@@ -9,23 +9,32 @@
 //!   * **Lightweight data**: the layout needs only id/hash/size/date per photo
 //!     ([`TimelineItem`]), so 100k photos lay out in milliseconds.
 //!   * **Async tiles**: thumbnails decode on worker threads into a small LRU
-//!     of textures; a tile shows a neutral placeholder until its texture is
-//!     ready, and loads for rows scrolled past quickly are skipped.
+//!     of textures; a tile shows its ThumbHash placeholder until its texture
+//!     is ready, and loads for rows scrolled past quickly are skipped.
+//!   * **Selection by photo id**: focus/selection survive live refreshes
+//!     (imports insert photos and shift every index after them).
+//!   * **Scrubber rail**: a right-edge strip with year marks; dragging jumps
+//!     anywhere in the library. Positions come from the exact row heights of
+//!     the layout, not from GTK's estimated scroll range.
 
-use chrono::DateTime;
+use chrono::{DateTime, Datelike};
 use gtk4::prelude::*;
 use gtk4::{gdk, gio, glib};
 use gtk4::{
-    Align, Box as GtkBox, DrawingArea, EventControllerKey, GestureClick, Label, ListView,
-    NoSelection, Orientation, Overlay, Picture, Revealer, ScrolledWindow, SignalListItemFactory,
+    graphene, Align, Box as GtkBox, DrawingArea, EventControllerKey, EventControllerMotion,
+    EventControllerScroll, EventControllerScrollFlags, Fixed, GestureClick, GestureDrag, Label,
+    ListItem, ListScrollFlags, ListView, NoSelection, Orientation, Overlay, Picture,
+    PropagationPhase, Revealer, ScrolledWindow, SignalListItemFactory,
 };
+use photon_core::db::{queries, Database};
 use photon_core::models::TimelineItem;
 use photon_import::thumbnails::{thumb_path, ThumbSize};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Space between tiles and between rows, in logical pixels.
 const GAP: i32 = 4;
@@ -36,41 +45,16 @@ const TEXTURE_CACHE_SIZE: usize = 160;
 /// A tile must stay on screen this long before its thumbnail is decoded, so
 /// flinging through thousands of rows doesn't queue thousands of decodes.
 const LOAD_DELAY: Duration = Duration::from_millis(40);
-
-const CSS: &str = "
-.photon-timeline, .photon-timeline > row, .photon-timeline > row:hover,
-.photon-timeline > row:selected {
-    background: none;
-    padding: 0;
-}
-.photon-tile {
-    background-color: alpha(currentColor, 0.08);
-    border-radius: 8px;
-    transition: opacity 150ms ease, outline-color 150ms ease, box-shadow 150ms ease;
-    outline: 3px solid transparent;
-    outline-offset: -3px;
-}
-.photon-tile:hover picture { opacity: 0.88; }
-.photon-tile.photon-tile-selected {
-    outline: 3px solid @accent_bg_color;
-    outline-offset: -3px;
-    box-shadow: 0 0 0 2px alpha(@accent_bg_color, 0.4);
-}
-.photon-tile.photon-tile-focused {
-    outline: 3px solid @accent_color;
-    outline-offset: -3px;
-}
-.photon-tile.photon-tile-selected.photon-tile-focused {
-    outline: 3px solid @accent_bg_color;
-    outline-offset: -3px;
-    box-shadow: 0 0 0 3px alpha(@accent_bg_color, 0.6);
-}
-.photon-section-header {
-    font-weight: 700;
-    font-size: 1.15em;
-    letter-spacing: -0.2px;
-}
-";
+/// Fixed height of a date header row.
+const HEADER_HEIGHT: i32 = 48;
+/// Scrubber rail: pointer-sensitive strip width, marks area width, and the
+/// inset of the rail's range from the top/bottom edges.
+const RAIL_WIDTH: i32 = 32;
+const MARKS_WIDTH: i32 = 132;
+const RAIL_INSET: f64 = 16.0;
+const RAIL_THUMB_WIDTH: i32 = 20;
+/// How long the rail's year marks stay visible after the last activity.
+const RAIL_LINGER: Duration = Duration::from_millis(1200);
 
 // ---------------------------------------------------------------------------
 // Layout (pure: no GTK, unit-tested)
@@ -141,28 +125,11 @@ pub fn navigate_2d(rows: &[Row], current_index: usize, down: bool) -> Option<usi
     let r_idx = current_row_idx?;
 
     // 2. Search in target direction skipping Row::Header rows
+    let is_photo_row = |i: &usize| matches!(&rows[*i], Row::Photos(t) if !t.is_empty());
     let target_row_idx = if down {
-        let mut target = None;
-        for i in (r_idx + 1)..rows.len() {
-            if let Row::Photos(tiles) = &rows[i] {
-                if !tiles.is_empty() {
-                    target = Some(i);
-                    break;
-                }
-            }
-        }
-        target?
+        ((r_idx + 1)..rows.len()).find(is_photo_row)?
     } else {
-        let mut target = None;
-        for i in (0..r_idx).rev() {
-            if let Row::Photos(tiles) = &rows[i] {
-                if !tiles.is_empty() {
-                    target = Some(i);
-                    break;
-                }
-            }
-        }
-        target?
+        (0..r_idx).rev().find(is_photo_row)?
     };
 
     // 3. Find the tile with closest horizontal center
@@ -183,6 +150,77 @@ pub fn navigate_2d(rows: &[Row], current_index: usize, down: bool) -> Option<usi
     } else {
         None
     }
+}
+
+/// For every row, the index of the header row of its section (if any).
+fn header_of_rows(rows: &[Row]) -> Vec<Option<usize>> {
+    let mut current = None;
+    rows.iter()
+        .enumerate()
+        .map(|(i, row)| {
+            if matches!(row, Row::Header(_)) {
+                current = Some(i);
+            }
+            current
+        })
+        .collect()
+}
+
+/// Content y of every row and the total height. Exact, because header rows
+/// have a fixed height and photo rows are their tiles' height plus the gap.
+fn row_tops(rows: &[Row]) -> (Vec<f64>, f64) {
+    let mut y = 0.0;
+    let tops = rows
+        .iter()
+        .map(|row| {
+            let top = y;
+            y += match row {
+                Row::Header(_) => HEADER_HEIGHT,
+                Row::Photos(tiles) => tiles.first().map_or(0, |t| t.height) + GAP,
+            } as f64;
+            top
+        })
+        .collect();
+    (tops, y)
+}
+
+/// Which year marks to label when they don't all fit: `marks` are
+/// `(year, y)` in rail order; a year's weight is its extent on the rail (up to
+/// the next mark, or `end`). Heavier years win, and no two chosen labels are
+/// closer than `min_gap`. Returned in rail order.
+fn pick_rail_marks(marks: &[(i32, f64)], end: f64, min_gap: f64) -> Vec<(i32, f64)> {
+    let weight = |i: usize| marks.get(i + 1).map_or(end, |&(_, y)| y) - marks[i].1;
+    let mut order: Vec<usize> = (0..marks.len()).collect();
+    order.sort_by(|&a, &b| weight(b).total_cmp(&weight(a)));
+
+    let mut chosen: Vec<usize> = Vec::new();
+    for i in order {
+        if chosen.iter().all(|&c| (marks[c].1 - marks[i].1).abs() >= min_gap) {
+            chosen.push(i);
+        }
+    }
+    chosen.sort_unstable();
+    chosen.into_iter().map(|i| marks[i]).collect()
+}
+
+/// x of the rail thumb inside the marks area (centered on the rail strip).
+fn thumb_x() -> f64 {
+    (MARKS_WIDTH - RAIL_WIDTH / 2 - RAIL_THUMB_WIDTH / 2) as f64
+}
+
+/// Photo ids at `indices` of `items`.
+fn ids_at(items: &[TimelineItem], indices: impl IntoIterator<Item = usize>) -> Vec<i64> {
+    indices
+        .into_iter()
+        .filter_map(|i| items.get(i).map(|item| item.id))
+        .collect()
+}
+
+/// Where each of `ids` now sits in `items` (ids no longer present are dropped).
+fn indices_of(items: &[TimelineItem], ids: &[i64]) -> Vec<usize> {
+    let position: HashMap<i64, usize> =
+        items.iter().enumerate().map(|(i, item)| (item.id, i)).collect();
+    ids.iter().filter_map(|id| position.get(id).copied()).collect()
 }
 
 fn justify(
@@ -307,10 +345,29 @@ type SelectionFn = Box<dyn Fn(&HashSet<usize>)>;
 struct Inner {
     root: Overlay,
     scrolled: ScrolledWindow,
+    list: ListView,
     store: gio::ListStore,
     items: RefCell<Rc<Vec<TimelineItem>>>,
     rows: RefCell<Vec<Row>>,
-    row_y_offsets: RefCell<Vec<i32>>,
+    /// For each row, the index of its section's header row.
+    header_of_row: RefCell<Vec<Option<usize>>>,
+    /// Every row widget the list has created (the recycling pool).
+    list_items: RefCell<Vec<glib::WeakRef<ListItem>>>,
+    /// Scroll changes before this instant are programmatic (restores after a
+    /// refresh), not the user scrolling: don't flash the date label.
+    quiet_until: Cell<Option<Instant>>,
+    date_update_pending: Cell<bool>,
+    /// Content y of every row (exact: header and tile heights are fixed).
+    row_tops: RefCell<Vec<f64>>,
+    content_height: Cell<f64>,
+    view_height: Cell<i32>,
+    rail_marks: Fixed,
+    rail_thumb: GtkBox,
+    rail_hovered: Cell<bool>,
+    rail_dragging: Cell<bool>,
+    rail_drag_start: Cell<f64>,
+    rail_hide_timer: RefCell<Option<glib::SourceId>>,
+    jump_target: Cell<Option<usize>>,
     focused_index: Cell<Option<usize>>,
     selected_indices: RefCell<HashSet<usize>>,
     anchor_index: Cell<Option<usize>>,
@@ -324,6 +381,7 @@ struct Inner {
     relayout_generation: Cell<u64>,
     cache_dir: PathBuf,
     textures: RefCell<TextureCache>,
+    db: RefCell<Option<Database>>,
     on_activate: RefCell<Option<ActivateFn>>,
     on_selection_changed: RefCell<Option<SelectionFn>>,
 }
@@ -334,10 +392,19 @@ pub struct Timeline {
     inner: Rc<Inner>,
 }
 
+/// A handle that doesn't keep the timeline alive; for closures owned by
+/// widgets inside the timeline (which would otherwise form a cycle).
+#[derive(Clone)]
+pub struct WeakTimeline(Weak<Inner>);
+
+impl WeakTimeline {
+    pub fn upgrade(&self) -> Option<Timeline> {
+        self.0.upgrade().map(|inner| Timeline { inner })
+    }
+}
+
 impl Timeline {
     pub fn new(cache_dir: PathBuf, row_height: i32) -> Self {
-        install_css();
-
         let store = gio::ListStore::new::<glib::BoxedAnyObject>();
         let factory = SignalListItemFactory::new();
         let list = ListView::new(Some(NoSelection::new(Some(store.clone()))), Some(factory.clone()));
@@ -353,6 +420,8 @@ impl Timeline {
             .focusable(true)
             .child(&list)
             .build();
+        // Rows and tiles are not focus targets; focus is tracked by photo.
+        list.set_focusable(false);
 
         // Floating date indicator badge on scroll
         let date_badge = Revealer::new();
@@ -381,19 +450,56 @@ impl Timeline {
         // input-transparent DrawingArea overlaid on the view reports it.
         let size_probe = DrawingArea::new();
         size_probe.set_can_target(false);
+        // Scrubber: year marks + position thumb (never takes input), under a
+        // transparent strip that does. The native scrollbar is hidden; the
+        // thumb shows the position instead.
+        scrolled.set_vscrollbar_policy(gtk4::PolicyType::External);
+        let rail_marks = Fixed::new();
+        rail_marks.set_halign(Align::End);
+        rail_marks.set_valign(Align::Fill);
+        rail_marks.set_size_request(MARKS_WIDTH, -1);
+        rail_marks.set_can_target(false);
+        rail_marks.add_css_class("photon-scrubber-marks");
+        let rail_thumb = GtkBox::new(Orientation::Horizontal, 0);
+        rail_thumb.set_size_request(RAIL_THUMB_WIDTH, 4);
+        rail_thumb.add_css_class("photon-scrubber-thumb");
+        rail_marks.put(&rail_thumb, thumb_x(), RAIL_INSET);
+        let rail = GtkBox::new(Orientation::Vertical, 0);
+        rail.set_halign(Align::End);
+        rail.set_valign(Align::Fill);
+        rail.set_size_request(RAIL_WIDTH, -1);
+        rail.set_cursor_from_name(Some("pointer"));
+        rail.set_tooltip_text(Some("Drag to jump through your library"));
+
         let root = Overlay::new();
         root.set_focusable(true);
         root.set_child(Some(&scrolled));
         root.add_overlay(&size_probe);
         root.add_overlay(&date_badge);
+        root.add_overlay(&rail_marks);
+        root.add_overlay(&rail);
 
         let inner = Rc::new(Inner {
             root,
             scrolled,
+            list,
             store,
             items: RefCell::new(Rc::new(Vec::new())),
             rows: RefCell::new(Vec::new()),
-            row_y_offsets: RefCell::new(Vec::new()),
+            header_of_row: RefCell::new(Vec::new()),
+            list_items: RefCell::new(Vec::new()),
+            quiet_until: Cell::new(None),
+            date_update_pending: Cell::new(false),
+            row_tops: RefCell::new(Vec::new()),
+            content_height: Cell::new(0.0),
+            view_height: Cell::new(0),
+            rail_marks,
+            rail_thumb,
+            rail_hovered: Cell::new(false),
+            rail_dragging: Cell::new(false),
+            rail_drag_start: Cell::new(0.0),
+            rail_hide_timer: RefCell::new(None),
+            jump_target: Cell::new(None),
             focused_index: Cell::new(None),
             selected_indices: RefCell::new(HashSet::new()),
             anchor_index: Cell::new(None),
@@ -407,12 +513,16 @@ impl Timeline {
             relayout_generation: Cell::new(0),
             cache_dir,
             textures: RefCell::new(TextureCache::new()),
+            db: RefCell::new(None),
             on_activate: RefCell::new(None),
             on_selection_changed: RefCell::new(None),
         });
 
         // Key controller for 2D keyboard navigation and multi-selection
         let key_controller = EventControllerKey::new();
+        // Capture phase: arrows must reach us before the inner ListView's own
+        // cursor bindings, wherever focus is inside the view.
+        key_controller.set_propagation_phase(PropagationPhase::Capture);
         let weak_key = Rc::downgrade(&inner);
         key_controller.connect_key_pressed(move |_, keyval, _, state| {
             if let Some(inner) = weak_key.upgrade() {
@@ -423,57 +533,107 @@ impl Timeline {
         });
         inner.scrolled.add_controller(key_controller);
 
-        // Update floating date pill on scroll
-        let weak_scroll = Rc::downgrade(&inner);
-        inner.scrolled.vadjustment().connect_value_changed(move |adj| {
-            if let Some(inner) = weak_scroll.upgrade() {
-                let offsets = inner.row_y_offsets.borrow();
-                if offsets.is_empty() {
-                    return;
-                }
-                let val = adj.value() as i32;
-                let row_idx = match offsets.binary_search(&val) {
-                    Ok(idx) => idx,
-                    Err(idx) => idx.saturating_sub(1),
-                };
-
-                let rows = inner.rows.borrow();
-                let active_header = (0..=row_idx.min(rows.len().saturating_sub(1)))
-                    .rev()
-                    .find_map(|i| match &rows[i] {
-                        Row::Header(h) => Some(h.clone()),
-                        _ => None,
-                    });
-
-                if let Some(header_text) = active_header {
-                    // Extract just the date part before the separator
-                    let date_part = header_text.split("  ·  ").next().unwrap_or(&header_text);
-                    inner.date_label.set_text(date_part);
-                    inner.date_badge.set_reveal_child(true);
-
-                    if let Some(timer) = inner.hide_badge_timer.borrow_mut().take() {
-                        timer.remove();
+        // Scroll controller for Ctrl+Wheel zoom
+        let scroll_controller = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
+        let weak_zoom = Rc::downgrade(&inner);
+        scroll_controller.connect_scroll(move |controller, _dx, dy| {
+            let state = controller.current_event_state();
+            if state.contains(gdk::ModifierType::CONTROL_MASK) {
+                if let Some(inner) = weak_zoom.upgrade() {
+                    let old_h = inner.row_height.get();
+                    let delta = if dy < 0.0 { 20 } else { -20 };
+                    let new_h = (old_h + delta).clamp(110, 500);
+                    if new_h != old_h {
+                        inner.row_height.set(new_h);
+                        let fraction = scroll_fraction(&inner.scrolled.vadjustment());
+                        inner.relayout();
+                        inner.restore_scroll_fraction(fraction);
                     }
-                    let weak_timer = Rc::downgrade(&inner);
-                    let source_id = glib::timeout_add_local_once(Duration::from_millis(900), move || {
-                        if let Some(inner) = weak_timer.upgrade() {
-                            inner.date_badge.set_reveal_child(false);
-                        }
-                    });
-                    *inner.hide_badge_timer.borrow_mut() = Some(source_id);
                 }
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
             }
+        });
+        inner.scrolled.add_controller(scroll_controller);
+
+        // Floating date label while the user scrolls.
+        let weak_scroll = Rc::downgrade(&inner);
+        inner.scrolled.vadjustment().connect_value_changed(move |_| {
+            let Some(inner) = weak_scroll.upgrade() else { return };
+            if inner.date_update_pending.replace(true) {
+                return;
+            }
+            // Rows at the new position are bound during the next layout; idle
+            // priority runs after it. One update per frame, however many
+            // scroll events arrive.
+            let weak = Rc::downgrade(&inner);
+            glib::idle_add_local_once(move || {
+                if let Some(inner) = weak.upgrade() {
+                    inner.date_update_pending.set(false);
+                    Inner::on_scrolled(&inner);
+                }
+            });
         });
 
         let weak = Rc::downgrade(&inner);
-        size_probe.connect_resize(move |_, width, _| {
+        size_probe.connect_resize(move |_, width, height| {
             if let Some(inner) = weak.upgrade() {
+                if inner.view_height.replace(height) != height {
+                    inner.place_rail_marks();
+                }
                 Inner::schedule_relayout(&inner, width - 2 * MARGIN);
             }
         });
 
-        factory.connect_setup(|_, obj| {
+        // Rail input: hover reveals the marks, press/drag scrubs.
+        let motion = EventControllerMotion::new();
+        let weak = Rc::downgrade(&inner);
+        motion.connect_enter(move |_, _, _| {
+            if let Some(inner) = weak.upgrade() {
+                inner.rail_hovered.set(true);
+                Inner::activate_rail(&inner);
+            }
+        });
+        let weak = Rc::downgrade(&inner);
+        motion.connect_leave(move |_| {
+            if let Some(inner) = weak.upgrade() {
+                inner.rail_hovered.set(false);
+                Inner::activate_rail(&inner);
+            }
+        });
+        rail.add_controller(motion);
+
+        let drag = GestureDrag::new();
+        let weak = Rc::downgrade(&inner);
+        drag.connect_drag_begin(move |_, _, y| {
+            if let Some(inner) = weak.upgrade() {
+                inner.rail_dragging.set(true);
+                inner.rail_drag_start.set(y);
+                Inner::scrub_to(&inner, y);
+            }
+        });
+        let weak = Rc::downgrade(&inner);
+        drag.connect_drag_update(move |_, _, dy| {
+            if let Some(inner) = weak.upgrade() {
+                Inner::scrub_to(&inner, inner.rail_drag_start.get() + dy);
+            }
+        });
+        let weak = Rc::downgrade(&inner);
+        drag.connect_drag_end(move |_, _, _| {
+            if let Some(inner) = weak.upgrade() {
+                inner.rail_dragging.set(false);
+                Inner::activate_rail(&inner);
+            }
+        });
+        rail.add_controller(drag);
+
+        let weak = Rc::downgrade(&inner);
+        factory.connect_setup(move |_, obj| {
             let item = obj.downcast_ref::<gtk4::ListItem>().expect("ListItem");
+            if let Some(inner) = weak.upgrade() {
+                inner.list_items.borrow_mut().push(item.downgrade());
+            }
             item.set_activatable(false);
             item.set_selectable(false);
             item.set_focusable(false);
@@ -508,13 +668,16 @@ impl Timeline {
         &self.inner.root
     }
 
+    pub fn downgrade(&self) -> WeakTimeline {
+        WeakTimeline(Rc::downgrade(&self.inner))
+    }
+
     /// Called with the photo's index into the current items when a tile is clicked or activated.
     pub fn connect_activate(&self, f: impl Fn(usize) + 'static) {
         *self.inner.on_activate.borrow_mut() = Some(Box::new(f));
     }
 
     /// Called when the set of selected items changes.
-    #[allow(dead_code)]
     pub fn connect_selection_changed(&self, f: impl Fn(&HashSet<usize>) + 'static) {
         *self.inner.on_selection_changed.borrow_mut() = Some(Box::new(f));
     }
@@ -525,8 +688,15 @@ impl Timeline {
         self.inner.selected_indices.borrow().clone()
     }
 
+    /// Ids of the selected photos. Use these (not indices) for batch actions:
+    /// they stay correct even if the timeline refreshes in between.
+    pub fn selected_ids(&self) -> Vec<i64> {
+        let items = self.inner.items.borrow();
+        let selected = self.inner.selected_indices.borrow();
+        ids_at(&items, selected.iter().copied())
+    }
+
     /// Clear all selections.
-    #[allow(dead_code)]
     pub fn clear_selection(&self) {
         self.inner.selected_indices.borrow_mut().clear();
         Inner::update_tile_styles(&self.inner);
@@ -553,41 +723,60 @@ impl Timeline {
 
     /// Show `items`. With `keep_scroll`, the view stays where it was (used for
     /// live refreshes during an import); otherwise it starts at the top.
+    ///
+    /// Focus and selection follow the *photos*, not their positions: a live
+    /// refresh that inserts photos above them must not move the selection
+    /// onto different photos.
     pub fn set_items(&self, items: Rc<Vec<TimelineItem>>, by_day: bool, keep_scroll: bool) {
-        let len = items.len();
-        *self.inner.items.borrow_mut() = items;
-        self.inner.by_day.set(by_day);
-        if !keep_scroll {
-            self.inner.focused_index.set(None);
-            self.inner.anchor_index.set(None);
-            self.inner.selected_indices.borrow_mut().clear();
+        let inner = &self.inner;
+        if keep_scroll {
+            let old = inner.items.borrow().clone();
+            let selected = ids_at(&old, inner.selected_indices.borrow().iter().copied());
+            let focused = ids_at(&old, inner.focused_index.get());
+            let anchor = ids_at(&old, inner.anchor_index.get());
+
+            *inner.selected_indices.borrow_mut() = indices_of(&items, &selected).into_iter().collect();
+            inner.focused_index.set(indices_of(&items, &focused).first().copied());
+            inner.anchor_index.set(indices_of(&items, &anchor).first().copied());
         } else {
-            self.inner.selected_indices.borrow_mut().retain(|&idx| idx < len);
-            if let Some(idx) = self.inner.focused_index.get() {
-                if idx >= len {
-                    self.inner.focused_index.set(None);
-                }
-            }
-            if let Some(idx) = self.inner.anchor_index.get() {
-                if idx >= len {
-                    self.inner.anchor_index.set(None);
-                }
-            }
+            inner.focused_index.set(None);
+            inner.anchor_index.set(None);
+            inner.selected_indices.borrow_mut().clear();
         }
-        let adj = self.inner.scrolled.vadjustment();
+        *inner.items.borrow_mut() = items;
+        inner.by_day.set(by_day);
+
+        let adj = inner.scrolled.vadjustment();
         let value = if keep_scroll { adj.value() } else { 0.0 };
-        self.inner.relayout();
-        restore_scroll(&adj, value);
-        Inner::update_tile_styles(&self.inner);
+        inner.relayout();
+        inner.restore_scroll(value);
+        Inner::update_tile_styles(inner);
     }
 
     pub fn set_row_height(&self, height: i32) {
-        if self.inner.row_height.replace(height) != height {
-            let adj = self.inner.scrolled.vadjustment();
-            let fraction = scroll_fraction(&adj);
+        let clamped = height.clamp(110, 500);
+        if self.inner.row_height.replace(clamped) != clamped {
+            let fraction = scroll_fraction(&self.inner.scrolled.vadjustment());
             self.inner.relayout();
-            restore_scroll_fraction(&adj, fraction);
+            self.inner.restore_scroll_fraction(fraction);
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn row_height(&self) -> i32 {
+        self.inner.row_height.get()
+    }
+
+    pub fn set_db(&self, db: Database) {
+        *self.inner.db.borrow_mut() = Some(db);
+    }
+
+    pub fn cull_rating_selected(&self, rating: i32) {
+        Inner::cull_rating(&self.inner, rating);
+    }
+
+    pub fn cull_flag_selected(&self, flag: i32) {
+        Inner::cull_flag(&self.inner, flag);
     }
 }
 
@@ -608,10 +797,9 @@ impl Inner {
                 return;
             }
             inner.width.set(width);
-            let adj = inner.scrolled.vadjustment();
-            let fraction = scroll_fraction(&adj);
+            let fraction = scroll_fraction(&inner.scrolled.vadjustment());
             inner.relayout();
-            restore_scroll_fraction(&adj, fraction);
+            inner.restore_scroll_fraction(fraction);
         };
         if first_layout {
             apply();
@@ -626,28 +814,25 @@ impl Inner {
             return; // laid out on first resize
         }
         let rows = layout(&self.items.borrow(), width, self.row_height.get(), self.by_day.get());
-
-        let mut y = 0;
-        let mut offsets = Vec::with_capacity(rows.len());
-        for row in &rows {
-            offsets.push(y);
-            let row_h = match row {
-                Row::Header(_) => 48,
-                Row::Photos(tiles) => tiles.first().map(|t| t.height).unwrap_or(0) + GAP,
-            };
-            y += row_h;
-        }
-        *self.row_y_offsets.borrow_mut() = offsets;
+        *self.header_of_row.borrow_mut() = header_of_rows(&rows);
+        let (tops, height) = row_tops(&rows);
+        *self.row_tops.borrow_mut() = tops;
+        self.content_height.set(height);
+        // Every row is rebound after the splice; stale tile refs would point
+        // at old positions.
+        self.visible_tiles.borrow_mut().clear();
 
         let objects: Vec<glib::BoxedAnyObject> =
             rows.iter().cloned().map(glib::BoxedAnyObject::new).collect();
         *self.rows.borrow_mut() = rows;
         self.store.splice(0, self.store.n_items(), &objects);
+        self.place_rail_marks();
     }
 
     fn update_tile_styles(this: &Rc<Self>) {
         let focus = this.focused_index.get();
         let selected = this.selected_indices.borrow();
+        let items = this.items.borrow();
         let mut visible = this.visible_tiles.borrow_mut();
         visible.retain(|&idx, weak_box| {
             if let Some(frame) = weak_box.upgrade() {
@@ -662,6 +847,25 @@ impl Inner {
                 } else {
                     frame.remove_css_class("photon-tile-focused");
                 }
+
+                if let Some(item) = items.get(idx) {
+                    if item.flagged == -1 {
+                        frame.add_css_class("photon-tile-rejected");
+                        frame.remove_css_class("photon-tile-pick");
+                    } else if item.flagged == 1 {
+                        frame.add_css_class("photon-tile-pick");
+                        frame.remove_css_class("photon-tile-rejected");
+                    } else {
+                        frame.remove_css_class("photon-tile-rejected");
+                        frame.remove_css_class("photon-tile-pick");
+                    }
+
+                    if let Some(overlay) = frame.first_child().and_downcast::<Overlay>() {
+                        if let Some(badges_box) = overlay.last_child().and_downcast::<GtkBox>() {
+                            rebuild_tile_badges(&badges_box, item.rating, item.flagged);
+                        }
+                    }
+                }
                 true
             } else {
                 false
@@ -672,29 +876,327 @@ impl Inner {
         }
     }
 
-    fn scroll_to_item(this: &Rc<Self>, item_index: usize) {
-        let rows = this.rows.borrow();
-        let offsets = this.row_y_offsets.borrow();
-        for (r_idx, row) in rows.iter().enumerate() {
-            if let Row::Photos(tiles) = row {
-                if tiles.iter().any(|t| t.index == item_index) {
-                    let y = offsets.get(r_idx).copied().unwrap_or(0);
-                    let h = tiles.first().map(|t| t.height).unwrap_or(0) + GAP;
-                    let adj = this.scrolled.vadjustment();
-                    let current_val = adj.value();
-                    let page_size = adj.page_size();
-                    let target_top = y as f64;
-                    let target_bottom = (y + h) as f64;
+    fn advance_focus(this: &Rc<Self>) {
+        let n_items = this.items.borrow().len();
+        if let Some(focus) = this.focused_index.get() {
+            let next_idx = (focus + 1).min(n_items.saturating_sub(1));
+            Self::move_focus(this, next_idx, false, false);
+        }
+    }
 
-                    if target_top < current_val {
-                        adj.set_value(target_top.max(0.0));
-                    } else if target_bottom > current_val + page_size {
-                        adj.set_value((target_bottom - page_size).max(0.0));
-                    }
-                    break;
+    fn cull_rating(this: &Rc<Self>, rating: i32) {
+        let selected: Vec<usize> = {
+            let sel = this.selected_indices.borrow();
+            if sel.is_empty() {
+                if let Some(focus) = this.focused_index.get() {
+                    vec![focus]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                sel.iter().copied().collect()
+            }
+        };
+        if selected.is_empty() {
+            return;
+        }
+
+        let mut ids = Vec::new();
+        {
+            let mut items_clone = (**this.items.borrow()).clone();
+            for &idx in &selected {
+                if let Some(item) = items_clone.get_mut(idx) {
+                    item.rating = rating;
+                    ids.push(item.id);
+                }
+            }
+            *this.items.borrow_mut() = Rc::new(items_clone);
+        }
+
+        Self::update_tile_styles(this);
+
+        if let Some(db) = this.db.borrow().as_ref() {
+            let db = db.clone();
+            thread::spawn(move || {
+                if let Ok(mut conn) = db.conn() {
+                    let _ = queries::batch_set_rating(&mut conn, &ids, rating);
+                }
+            });
+        }
+    }
+
+    fn cull_flag(this: &Rc<Self>, flag: i32) {
+        let selected: Vec<usize> = {
+            let sel = this.selected_indices.borrow();
+            if sel.is_empty() {
+                if let Some(focus) = this.focused_index.get() {
+                    vec![focus]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                sel.iter().copied().collect()
+            }
+        };
+        if selected.is_empty() {
+            return;
+        }
+
+        let mut ids = Vec::new();
+        {
+            let mut items_clone = (**this.items.borrow()).clone();
+            for &idx in &selected {
+                if let Some(item) = items_clone.get_mut(idx) {
+                    item.flagged = flag;
+                    ids.push(item.id);
+                }
+            }
+            *this.items.borrow_mut() = Rc::new(items_clone);
+        }
+
+        Self::update_tile_styles(this);
+
+        if let Some(db) = this.db.borrow().as_ref() {
+            let db = db.clone();
+            thread::spawn(move || {
+                if let Ok(mut conn) = db.conn() {
+                    let _ = queries::batch_set_flag(&mut conn, &ids, flag);
+                }
+            });
+        }
+    }
+
+    /// Bring the row holding photo `item_index` into view. `ListView::scroll_to`
+    /// works on exact row positions, unlike pixel offsets, which GTK only
+    /// estimates for rows it hasn't measured yet.
+    fn scroll_to_item(this: &Rc<Self>, item_index: usize) {
+        let position = this.rows.borrow().iter().position(|row| {
+            matches!(row, Row::Photos(tiles) if tiles.iter().any(|t| t.index == item_index))
+        });
+        if let Some(position) = position {
+            this.list.scroll_to(position as u32, ListScrollFlags::NONE, None);
+        }
+    }
+
+    /// The row at the top of the viewport, found among the bound row widgets.
+    fn top_row(&self) -> Option<usize> {
+        let mut best: Option<(f32, u32)> = None;
+        for weak in self.list_items.borrow().iter() {
+            let Some(item) = weak.upgrade() else { continue };
+            let (Some(_), Some(child)) = (item.item(), item.child()) else { continue };
+            let Some(point) = child.compute_point(&self.scrolled, &graphene::Point::new(0.0, 0.0)) else {
+                continue;
+            };
+            let bottom = point.y() + child.height() as f32;
+            // The row that straddles (or starts at) the top edge.
+            if point.y() <= 1.0 && bottom > 1.0 && best.is_none_or(|(y, _)| point.y() > y) {
+                best = Some((point.y(), item.position()));
+            }
+        }
+        best.map(|(_, position)| position as usize)
+    }
+
+    /// After a scroll settles into a layout: move the rail thumb, and unless
+    /// the scroll was programmatic, show the date and the rail marks.
+    fn on_scrolled(this: &Rc<Self>) {
+        let Some(row) = this.top_row() else { return };
+        this.move_rail_thumb(row);
+        if this.quiet_until.get().is_some_and(|until| Instant::now() < until) {
+            return;
+        }
+        Self::activate_rail(this);
+        if let Some(date) = this.date_of_row(row) {
+            Self::show_date_badge(this, &date);
+        }
+    }
+
+    /// The date (without the photo count) of the section `row` belongs to.
+    fn date_of_row(&self, row: usize) -> Option<String> {
+        let header = self.header_of_row.borrow().get(row).copied().flatten()?;
+        match self.rows.borrow().get(header)? {
+            Row::Header(title) => Some(title.split("  ·  ").next().unwrap_or(title).to_string()),
+            Row::Photos(_) => None,
+        }
+    }
+
+    fn show_date_badge(this: &Rc<Self>, date: &str) {
+        this.date_label.set_text(date);
+        this.date_badge.set_reveal_child(true);
+
+        if let Some(timer) = this.hide_badge_timer.borrow_mut().take() {
+            timer.remove();
+        }
+        let weak = Rc::downgrade(this);
+        let id = glib::timeout_add_local_once(Duration::from_millis(900), move || {
+            if let Some(inner) = weak.upgrade() {
+                inner.hide_badge_timer.borrow_mut().take();
+                if !inner.rail_dragging.get() {
+                    inner.date_badge.set_reveal_child(false);
+                }
+            }
+        });
+        *this.hide_badge_timer.borrow_mut() = Some(id);
+    }
+
+    // ── Scrubber rail ───────────────────────────────────
+
+    /// Rail y (in view coordinates) ↔ content y, over the inset range.
+    fn rail_span(&self) -> Option<f64> {
+        let span = self.view_height.get() as f64 - 2.0 * RAIL_INSET;
+        (span > 0.0 && self.content_height.get() > 0.0).then_some(span)
+    }
+
+    fn rail_y_of_row(&self, row: usize) -> Option<f64> {
+        let span = self.rail_span()?;
+        let top = *self.row_tops.borrow().get(row)?;
+        Some(RAIL_INSET + top / self.content_height.get() * span)
+    }
+
+    fn row_at_rail_y(&self, y: f64) -> Option<usize> {
+        let span = self.rail_span()?;
+        let fraction = ((y - RAIL_INSET) / span).clamp(0.0, 1.0);
+        let target = fraction * self.content_height.get();
+        let tops = self.row_tops.borrow();
+        let row = tops.partition_point(|&t| t <= target).saturating_sub(1);
+        (row < tops.len()).then_some(row)
+    }
+
+    /// Rebuild the year marks for the current layout and view height. At
+    /// most a few dozen labels, so rebuilding is cheap.
+    fn place_rail_marks(&self) {
+        let mut child = self.rail_marks.first_child();
+        while let Some(c) = child {
+            child = c.next_sibling();
+            if c != *self.rail_thumb.upcast_ref::<gtk4::Widget>() {
+                self.rail_marks.remove(&c);
+            }
+        }
+
+        // One candidate per year: where its first section starts on the rail.
+        let rows = self.rows.borrow();
+        let items = self.items.borrow();
+        let mut marks: Vec<(i32, f64)> = Vec::new();
+        for (i, row) in rows.iter().enumerate() {
+            if !matches!(row, Row::Header(_)) {
+                continue;
+            }
+            let year = match rows.get(i + 1) {
+                Some(Row::Photos(tiles)) => tiles
+                    .first()
+                    .and_then(|t| items.get(t.index)?.created_at)
+                    .and_then(|ts| DateTime::from_timestamp(ts, 0))
+                    .map(|dt| dt.year()),
+                _ => None,
+            };
+            if let (Some(year), Some(y)) = (year, self.rail_y_of_row(i)) {
+                if marks.last().map(|&(y0, _)| y0) != Some(year) {
+                    marks.push((year, y));
                 }
             }
         }
+        let end = self.rail_span().map_or(0.0, |span| RAIL_INSET + span);
+
+        for (year, y) in pick_rail_marks(&marks, end, 18.0) {
+            let label = Label::new(Some(&year.to_string()));
+            label.add_css_class("photon-scrubber-year");
+            let (_, natural, _, _) = label.measure(Orientation::Horizontal, -1);
+            let x = (MARKS_WIDTH - RAIL_WIDTH - natural - 4) as f64;
+            self.rail_marks.put(&label, x, (y - 9.0).max(0.0));
+        }
+    }
+
+    fn move_rail_thumb(&self, row: usize) {
+        if let Some(y) = self.rail_y_of_row(row) {
+            self.rail_marks.move_(&self.rail_thumb, thumb_x(), y - 2.0);
+        }
+    }
+
+    /// Show the rail marks now; hide them after a pause, unless the pointer
+    /// is on the rail or dragging it.
+    fn activate_rail(this: &Rc<Self>) {
+        this.rail_marks.add_css_class("active");
+        if let Some(timer) = this.rail_hide_timer.borrow_mut().take() {
+            timer.remove();
+        }
+        let weak = Rc::downgrade(this);
+        let id = glib::timeout_add_local_once(RAIL_LINGER, move || {
+            if let Some(inner) = weak.upgrade() {
+                inner.rail_hide_timer.borrow_mut().take();
+                if !inner.rail_hovered.get() && !inner.rail_dragging.get() {
+                    inner.rail_marks.remove_css_class("active");
+                }
+            }
+        });
+        *this.rail_hide_timer.borrow_mut() = Some(id);
+    }
+
+    /// Pointer at rail `y`: preview the date there and jump the view to it.
+    fn scrub_to(this: &Rc<Self>, y: f64) {
+        let Some(row) = this.row_at_rail_y(y) else { return };
+        Self::activate_rail(this);
+        this.move_rail_thumb(row);
+        if let Some(date) = this.date_of_row(row) {
+            Self::show_date_badge(this, &date);
+        }
+        Self::jump_to_row(this, row);
+    }
+
+    /// Put `row` at the top of the view. Coalesced: during a drag only the
+    /// latest target is applied, once per main-loop turn.
+    fn jump_to_row(this: &Rc<Self>, row: usize) {
+        if this.jump_target.replace(Some(row)).is_some() {
+            return; // a jump is already scheduled; it will use the new target
+        }
+        let weak = Rc::downgrade(this);
+        glib::idle_add_local_once(move || {
+            let Some(inner) = weak.upgrade() else { return };
+            let Some(row) = inner.jump_target.take() else { return };
+            // Bring the row into view (exact, even for unmeasured rows) …
+            inner.list.scroll_to(row as u32, ListScrollFlags::NONE, None);
+            // … then, once it is laid out, align it to the top.
+            let weak = Rc::downgrade(&inner);
+            glib::idle_add_local_once(move || {
+                let Some(inner) = weak.upgrade() else { return };
+                if let Some(y) = inner.row_offset_in_view(row) {
+                    let adj = inner.scrolled.vadjustment();
+                    adj.set_value(adj.value() + y);
+                }
+            });
+        });
+    }
+
+    /// Where bound row `row` currently sits relative to the top of the view.
+    fn row_offset_in_view(&self, row: usize) -> Option<f64> {
+        self.list_items.borrow().iter().find_map(|weak| {
+            let item = weak.upgrade()?;
+            item.item()?;
+            if item.position() as usize != row {
+                return None;
+            }
+            let point = item.child()?.compute_point(&self.scrolled, &graphene::Point::new(0.0, 0.0))?;
+            Some(point.y() as f64)
+        })
+    }
+
+    /// Programmatic scrolls for the next moment shouldn't show the date label.
+    fn quiet_scroll(&self) {
+        self.quiet_until.set(Some(Instant::now() + Duration::from_millis(400)));
+    }
+
+    /// Restore after the list has re-measured (its size estimate settles on idle).
+    fn restore_scroll(&self, value: f64) {
+        self.quiet_scroll();
+        let adj = self.scrolled.vadjustment();
+        adj.set_value(value);
+        glib::idle_add_local_once(move || adj.set_value(value));
+    }
+
+    fn restore_scroll_fraction(&self, fraction: f64) {
+        self.quiet_scroll();
+        let adj = self.scrolled.vadjustment();
+        glib::idle_add_local_once(move || {
+            adj.set_value(fraction * (adj.upper() - adj.page_size()).max(0.0));
+        });
     }
 
     fn move_focus(this: &Rc<Self>, target_idx: usize, is_shift: bool, is_ctrl: bool) {
@@ -736,7 +1238,119 @@ impl Inner {
         let is_ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
         let current_focus = this.focused_index.get();
 
+        if is_ctrl {
+            match keyval {
+                gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => {
+                    let old_h = this.row_height.get();
+                    let new_h = (old_h + 30).clamp(110, 500);
+                    if new_h != old_h {
+                        this.row_height.set(new_h);
+                        let fraction = scroll_fraction(&this.scrolled.vadjustment());
+                        this.relayout();
+                        this.restore_scroll_fraction(fraction);
+                    }
+                    return glib::Propagation::Stop;
+                }
+                gdk::Key::minus | gdk::Key::KP_Subtract => {
+                    let old_h = this.row_height.get();
+                    let new_h = (old_h - 30).clamp(110, 500);
+                    if new_h != old_h {
+                        this.row_height.set(new_h);
+                        let fraction = scroll_fraction(&this.scrolled.vadjustment());
+                        this.relayout();
+                        this.restore_scroll_fraction(fraction);
+                    }
+                    return glib::Propagation::Stop;
+                }
+                gdk::Key::_0 | gdk::Key::KP_0 => {
+                    let old_h = this.row_height.get();
+                    let new_h = 200;
+                    if new_h != old_h {
+                        this.row_height.set(new_h);
+                        let fraction = scroll_fraction(&this.scrolled.vadjustment());
+                        this.relayout();
+                        this.restore_scroll_fraction(fraction);
+                    }
+                    return glib::Propagation::Stop;
+                }
+                gdk::Key::a | gdk::Key::A => {
+                    let mut sel = this.selected_indices.borrow_mut();
+                    sel.clear();
+                    for i in 0..n_items {
+                        sel.insert(i);
+                    }
+                    drop(sel);
+                    Self::update_tile_styles(this);
+                    return glib::Propagation::Stop;
+                }
+                _ => {}
+            }
+        }
+
         match keyval {
+            gdk::Key::_1 | gdk::Key::KP_1 | gdk::Key::exclam => {
+                Self::cull_rating(this, 1);
+                if is_shift {
+                    Self::advance_focus(this);
+                }
+                glib::Propagation::Stop
+            }
+            gdk::Key::_2 | gdk::Key::KP_2 | gdk::Key::at => {
+                Self::cull_rating(this, 2);
+                if is_shift {
+                    Self::advance_focus(this);
+                }
+                glib::Propagation::Stop
+            }
+            gdk::Key::_3 | gdk::Key::KP_3 | gdk::Key::numbersign => {
+                Self::cull_rating(this, 3);
+                if is_shift {
+                    Self::advance_focus(this);
+                }
+                glib::Propagation::Stop
+            }
+            gdk::Key::_4 | gdk::Key::KP_4 | gdk::Key::dollar => {
+                Self::cull_rating(this, 4);
+                if is_shift {
+                    Self::advance_focus(this);
+                }
+                glib::Propagation::Stop
+            }
+            gdk::Key::_5 | gdk::Key::KP_5 | gdk::Key::percent => {
+                Self::cull_rating(this, 5);
+                if is_shift {
+                    Self::advance_focus(this);
+                }
+                glib::Propagation::Stop
+            }
+            gdk::Key::_0 | gdk::Key::KP_0 | gdk::Key::parenright | gdk::Key::grave | gdk::Key::asciitilde => {
+                Self::cull_rating(this, 0);
+                if is_shift {
+                    Self::advance_focus(this);
+                }
+                glib::Propagation::Stop
+            }
+            gdk::Key::p | gdk::Key::P => {
+                Self::cull_flag(this, 1);
+                if is_shift {
+                    Self::advance_focus(this);
+                }
+                glib::Propagation::Stop
+            }
+            gdk::Key::x | gdk::Key::X => {
+                Self::cull_flag(this, -1);
+                if is_shift {
+                    Self::advance_focus(this);
+                }
+                glib::Propagation::Stop
+            }
+            gdk::Key::u | gdk::Key::U => {
+                Self::cull_flag(this, 0);
+                if is_shift {
+                    Self::advance_focus(this);
+                }
+                glib::Propagation::Stop
+            }
             gdk::Key::Left | gdk::Key::KP_Left => {
                 let next_idx = match current_focus {
                     Some(idx) => idx.saturating_sub(1),
@@ -809,16 +1423,6 @@ impl Inner {
                 Self::update_tile_styles(this);
                 glib::Propagation::Stop
             }
-            gdk::Key::a | gdk::Key::A if is_ctrl => {
-                let mut sel = this.selected_indices.borrow_mut();
-                sel.clear();
-                for i in 0..n_items {
-                    sel.insert(i);
-                }
-                drop(sel);
-                Self::update_tile_styles(this);
-                glib::Propagation::Stop
-            }
             _ => glib::Propagation::Proceed,
         }
     }
@@ -829,14 +1433,16 @@ impl Inner {
             Row::Header(title) => {
                 let label = Label::new(Some(title));
                 label.set_halign(Align::Start);
+                label.set_valign(Align::End);
                 label.add_css_class("photon-section-header");
-                label.set_margin_top(18);
                 label.set_margin_bottom(8);
                 row_box.set_margin_bottom(0);
+                row_box.set_size_request(-1, HEADER_HEIGHT);
                 row_box.append(&label);
             }
             Row::Photos(tiles) => {
                 row_box.set_margin_bottom(GAP);
+                row_box.set_size_request(-1, -1);
                 let items = this.items.borrow().clone();
                 for tile in tiles {
                     let Some(item) = items.get(tile.index) else { continue };
@@ -859,6 +1465,11 @@ impl Inner {
         if this.focused_index.get() == Some(tile.index) {
             frame.add_css_class("photon-tile-focused");
         }
+        if item.flagged == -1 {
+            frame.add_css_class("photon-tile-rejected");
+        } else if item.flagged == 1 {
+            frame.add_css_class("photon-tile-pick");
+        }
 
         this.visible_tiles.borrow_mut().insert(tile.index, frame.downgrade());
 
@@ -866,7 +1477,23 @@ impl Inner {
         picture.set_content_fit(gtk4::ContentFit::Cover);
         picture.set_can_shrink(true);
         picture.set_vexpand(true);
-        frame.append(&picture);
+        picture.set_hexpand(true);
+
+        let overlay = Overlay::new();
+        overlay.set_can_target(false);
+        overlay.set_vexpand(true);
+        overlay.set_hexpand(true);
+        overlay.set_child(Some(&picture));
+
+        let badges_box = GtkBox::new(Orientation::Horizontal, 4);
+        badges_box.add_css_class("photon-tile-badges");
+        badges_box.set_valign(Align::End);
+        badges_box.set_halign(Align::Start);
+        badges_box.set_can_target(false);
+        rebuild_tile_badges(&badges_box, item.rating, item.flagged);
+        overlay.add_overlay(&badges_box);
+
+        frame.append(&overlay);
 
         if let Some(texture) = this.textures.borrow_mut().get(&item.hash) {
             picture.set_paintable(Some(&texture));
@@ -961,6 +1588,27 @@ fn clear_children(container: &GtkBox) {
     }
 }
 
+fn rebuild_tile_badges(badges_box: &GtkBox, rating: i32, flagged: i32) {
+    clear_children(badges_box);
+    if rating > 0 {
+        let star_label = Label::new(Some(&format!("★ {}", rating)));
+        star_label.add_css_class("photon-tile-badge");
+        star_label.add_css_class("photon-tile-star-badge");
+        badges_box.append(&star_label);
+    }
+    if flagged == 1 {
+        let pick_label = Label::new(Some("✓"));
+        pick_label.add_css_class("photon-tile-badge");
+        pick_label.add_css_class("photon-tile-pick-badge");
+        badges_box.append(&pick_label);
+    } else if flagged == -1 {
+        let reject_label = Label::new(Some("✕"));
+        reject_label.add_css_class("photon-tile-badge");
+        reject_label.add_css_class("photon-tile-reject-badge");
+        badges_box.append(&reject_label);
+    }
+}
+
 fn scroll_fraction(adj: &gtk4::Adjustment) -> f64 {
     let range = adj.upper() - adj.page_size();
     if range > 0.0 {
@@ -968,37 +1616,6 @@ fn scroll_fraction(adj: &gtk4::Adjustment) -> f64 {
     } else {
         0.0
     }
-}
-
-/// Restore after the list has re-measured (its size estimate settles on idle).
-fn restore_scroll(adj: &gtk4::Adjustment, value: f64) {
-    adj.set_value(value);
-    let adj = adj.clone();
-    glib::idle_add_local_once(move || adj.set_value(value));
-}
-
-fn restore_scroll_fraction(adj: &gtk4::Adjustment, fraction: f64) {
-    let adj = adj.clone();
-    glib::idle_add_local_once(move || {
-        adj.set_value(fraction * (adj.upper() - adj.page_size()).max(0.0));
-    });
-}
-
-fn install_css() {
-    thread_local! {
-        static INSTALLED: Cell<bool> = const { Cell::new(false) };
-    }
-    if INSTALLED.with(|i| i.replace(true)) {
-        return;
-    }
-    let Some(display) = gdk::Display::default() else { return };
-    let provider = gtk4::CssProvider::new();
-    provider.load_from_string(CSS);
-    gtk4::style_context_add_provider_for_display(
-        &display,
-        &provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
 }
 
 fn decode_thumbhash_texture(th: &[u8]) -> Option<gdk::Texture> {
@@ -1035,6 +1652,8 @@ mod tests {
             height: Some(h),
             orientation: None,
             thumbhash: None,
+            rating: 0,
+            flagged: 0,
         }
     }
 
@@ -1106,6 +1725,60 @@ mod tests {
         let rows = layout(&items, 1400, 220, true);
         assert!(rows.len() > 10_000);
         assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
+    }
+
+    #[test]
+    fn selection_follows_photo_ids_when_items_shift() {
+        let with_ids = |ids: &[i64]| -> Vec<TimelineItem> {
+            ids.iter()
+                .map(|&id| TimelineItem { id, ..item(0, 3, 2) })
+                .collect()
+        };
+        let before = with_ids(&[10, 20, 30]);
+        // An import inserted photo 15 between 10 and 20, and 30 was removed.
+        let after = with_ids(&[10, 15, 20]);
+
+        let selected = ids_at(&before, [1, 2]); // photos 20 and 30
+        assert_eq!(selected, vec![20, 30]);
+        assert_eq!(indices_of(&after, &selected), vec![2]); // 20 moved to index 2
+    }
+
+    #[test]
+    fn crowded_rail_marks_keep_the_bigger_years() {
+        // 2025 has 3 photos right above a huge 2024: 2024 must be labelled.
+        let marks = [(2026, 16.0), (2025, 260.0), (2024, 266.0), (2023, 690.0), (2022, 705.0)];
+        let years: Vec<i32> = pick_rail_marks(&marks, 710.0, 18.0).iter().map(|m| m.0).collect();
+        assert_eq!(years, [2026, 2024, 2023]); // 2023 (15 px) outweighs 2022 (5 px)
+        assert!(pick_rail_marks(&[], 100.0, 18.0).is_empty());
+    }
+
+    #[test]
+    fn row_tops_are_cumulative_exact_heights() {
+        let tile = |height| Tile { index: 0, width: 10, height };
+        let rows = vec![
+            Row::Header("a".into()),
+            Row::Photos(vec![tile(200)]),
+            Row::Photos(vec![tile(180)]),
+        ];
+        let (tops, height) = row_tops(&rows);
+        let h = HEADER_HEIGHT as f64;
+        let g = GAP as f64;
+        assert_eq!(tops, vec![0.0, h, h + 200.0 + g]);
+        assert_eq!(height, h + 200.0 + g + 180.0 + g);
+    }
+
+    #[test]
+    fn every_row_knows_its_section_header() {
+        let tile = |index| Tile { index, width: 10, height: 10 };
+        let rows = vec![
+            Row::Header("a".into()),
+            Row::Photos(vec![tile(0)]),
+            Row::Photos(vec![tile(1)]),
+            Row::Header("b".into()),
+            Row::Photos(vec![tile(2)]),
+        ];
+        assert_eq!(header_of_rows(&rows), vec![Some(0), Some(0), Some(0), Some(3), Some(3)]);
+        assert_eq!(header_of_rows(&[Row::Photos(vec![tile(0)])]), vec![None]);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 pub mod detail;
 pub mod preferences;
+pub mod selection_bar;
 pub mod sidebar;
 pub mod timeline;
 pub mod widgets;

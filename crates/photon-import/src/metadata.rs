@@ -1,13 +1,25 @@
 //! EXIF metadata extraction.
 //!
 //! Strategy, cheapest first:
-//!   1. kamadak-exif over the first [`HEADER_BYTES`] of the file. EXIF lives in
-//!      the header for essentially every camera format, so this avoids reading
-//!      whole RAW files. If the IFDs turn out to lie beyond the header, the
-//!      read is retried on the full file.
-//!   2. `exiftool -json` (if installed) for anything kamadak can't parse
-//!      (CR3, RAF, RW2, exotic containers). This spawns a process, so it only
-//!      runs when the fast path found no capture date.
+//!   1. kamadak-exif over the first 96 KB of the file. JPEG/PNG EXIF always
+//!      fits (a JPEG APP1 segment is at most 64 KB). TIFF-based files (RAW,
+//!      TIFF) are zero-padded to their real length before parsing: their maker
+//!      notes and image data point far past the header, which kamadak rejects
+//!      as truncated even though the dates are in the first few KB. (Measured:
+//!      0/305 ORFs parsed from a plain 512 KB read; 305/305 from a padded 16 KB
+//!      read.) Larger reads happen only when a sub-IFD or a date value really
+//!      lies beyond what was read, or for WebP/HEIF.
+//!   2. XMP dates (`exif:DateTimeOriginal`, `photoshop:DateCreated`,
+//!      `xmp:CreateDate`) from the same header bytes. darktable, Lightroom
+//!      and GIMP exports often carry the capture date *only* in XMP, while
+//!      their EXIF `DateTime` is the export time.
+//!   3. `exiftool -json` (if installed) for RAW/HEIF files kamadak can't
+//!      parse (CR3, RAF, exotic containers). This spawns a process (~0.1 s),
+//!      so it only runs for those formats and only when no capture date was
+//!      found. A JPEG/PNG without EXIF (screenshots, exports) simply has no
+//!      date; exiftool would not find one either.
+//!
+//!   4. EXIF `DateTime` (IFD0 modify date) as a last resort.
 //!
 //! The file-mtime fallback for missing dates lives in the import engine.
 
@@ -20,7 +32,8 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 use std::process::Command;
 
-/// How much of the file to read for the first EXIF attempt.
+/// Read sizes for EXIF attempts, smallest first.
+const FIRST_READ: u64 = 96 * 1024;
 const HEADER_BYTES: u64 = 512 * 1024;
 
 #[derive(Debug, Default)]
@@ -59,16 +72,28 @@ impl ImageMetadata {
 
 pub fn extract(path: &Path) -> Result<ImageMetadata> {
     let mut meta = ImageMetadata::default();
-    let is_raw = format_of(path).is_raw();
+    let format = format_of(path);
+    let is_raw = format.is_raw();
 
+    let mut modify_date = None;
     if let Ok(exif) = read_exif(path) {
         read_fields(&exif, &mut meta);
+        modify_date = ascii(&exif, Tag::DateTime).and_then(|s| parse_exif_date(&s));
     }
 
     if meta.capture_date.is_none() {
+        meta.capture_date = read_xmp_capture_date(path);
+    }
+
+    if meta.capture_date.is_none() && may_need_exiftool(format) {
         if let Some(fallback) = exiftool(path) {
             meta.merge(fallback);
         }
+    }
+
+    // Least trustworthy: exports stamp DateTime with the export time.
+    if meta.capture_date.is_none() {
+        meta.capture_date = modify_date;
     }
 
     // The image crate can't open RAW files, but can read plain-file dimensions cheaply.
@@ -89,6 +114,23 @@ pub fn detect_mime(path: &Path) -> Option<String> {
         .map(|t| t.mime_type().to_string())
 }
 
+/// Formats where kamadak may miss metadata that exiftool can read.
+fn may_need_exiftool(format: ImageFormat) -> bool {
+    format.is_raw() || matches!(format, ImageFormat::Heif | ImageFormat::Avif)
+}
+
+/// Formats whose EXIF block can sit beyond the first [`HEADER_BYTES`]:
+/// TIFF-based RAW (IFDs anywhere), WebP (EXIF chunk after the image data),
+/// HEIF/AVIF (the `meta` box may follow `mdat`). JPEG keeps EXIF in APP1 at
+/// the start, and PNG writers put `eXIf` before the image data.
+fn exif_may_be_beyond_header(format: ImageFormat) -> bool {
+    format.is_raw()
+        || matches!(
+            format,
+            ImageFormat::Tiff | ImageFormat::Webp | ImageFormat::Heif | ImageFormat::Avif
+        )
+}
+
 pub(crate) fn format_of(path: &Path) -> ImageFormat {
     path.extension()
         .and_then(|e| e.to_str())
@@ -102,23 +144,119 @@ pub(crate) fn format_of(path: &Path) -> ImageFormat {
 
 /// Parse the EXIF block of any file kamadak can handle, including TIFF-based
 /// RAW files with non-standard headers (Olympus ORF, Panasonic RW2).
+///
+/// Offsets in the result are relative to the start of the file for
+/// TIFF-family formats (see [`is_tiff_family`]); only the bytes actually read
+/// are real, the rest of `Exif::buf()` is zero padding.
 pub(crate) fn read_exif(path: &Path) -> Result<Exif> {
     let file_len = std::fs::metadata(path)?.len();
-    let mut last_err = None;
+    let format = format_of(path);
+    let tiff_family = is_tiff_family(format);
 
-    for limit in [HEADER_BYTES, file_len] {
-        let mut buf = Vec::with_capacity(limit.min(file_len) as usize);
-        File::open(path)?.take(limit).read_to_end(&mut buf)?;
+    // Growing reads, each smaller than the file; the whole file only where
+    // EXIF can legitimately sit anywhere.
+    let first = FIRST_READ.min(file_len);
+    let mut limits = vec![first];
+    if exif_may_be_beyond_header(format) {
+        limits.extend([HEADER_BYTES, file_len].into_iter().filter(|&l| l > first));
+        limits.dedup();
+    }
 
-        match parse_exif_bytes(buf) {
-            Ok(exif) => return Ok(exif),
-            Err(e) => last_err = Some(e),
-        }
-        if file_len <= HEADER_BYTES {
-            break; // the retry would read the same bytes
+    let mut last: Option<Result<Exif>> = None;
+    for (i, &limit) in limits.iter().enumerate() {
+        let buf = read_prefix(path, limit)?;
+        let bytes_read = buf.len() as u64;
+        let buf = if tiff_family { pad_to(buf, file_len) } else { buf };
+
+        let parsed = parse_exif_bytes(buf);
+        let is_last = i + 1 == limits.len();
+        match &parsed {
+            Ok(exif) if is_last || !tiff_family || is_complete(exif, bytes_read) => return parsed,
+            _ => last = Some(parsed),
         }
     }
-    Err(last_err.expect("loop runs at least once"))
+    last.unwrap_or_else(|| Err(anyhow::anyhow!("empty file")))
+}
+
+fn read_prefix(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(limit as usize);
+    File::open(path)?.take(limit).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// Extend `buf` with zeros to `len` bytes. Large zeroed allocations are
+/// lazily mapped by the OS, so this costs address space, not memory or I/O.
+fn pad_to(buf: Vec<u8>, len: u64) -> Vec<u8> {
+    if buf.len() as u64 >= len {
+        return buf;
+    }
+    let mut padded = vec![0u8; len as usize];
+    padded[..buf.len()].copy_from_slice(&buf);
+    padded
+}
+
+/// Whether a parse of a padded partial read saw everything we need: no
+/// sub-IFD starts beyond the read, and every date tag has a real value (a
+/// value stored beyond the read shows up as zeros).
+fn is_complete(exif: &Exif, bytes_read: u64) -> bool {
+    let pointers_ok = [Tag::ExifIFDPointer, Tag::GPSInfoIFDPointer]
+        .into_iter()
+        .filter_map(|tag| exif.get_field(tag, In::PRIMARY)?.value.get_uint(0))
+        .all(|offset| (offset as u64) < bytes_read);
+    let dates_ok = [Tag::DateTimeOriginal, Tag::DateTimeDigitized, Tag::DateTime]
+        .into_iter()
+        .filter(|&tag| exif.get_field(tag, In::PRIMARY).is_some())
+        .all(|tag| ascii(exif, tag).and_then(|s| parse_exif_date(&s)).is_some());
+    pointers_ok && dates_ok
+}
+
+// ═══════════════════════════════════════════════════════════
+// XMP
+// ═══════════════════════════════════════════════════════════
+
+/// How far into a file to look for an XMP packet. In JPEG it is the APP1
+/// segment after EXIF (each at most 64 KB); editors put it near the start of
+/// PNG/TIFF too (darktable: within the first 28 KB).
+const XMP_SCAN_BYTES: u64 = 192 * 1024;
+
+/// Capture date from an XMP packet in the file header, if any.
+fn read_xmp_capture_date(path: &Path) -> Option<i64> {
+    let buf = read_prefix(path, XMP_SCAN_BYTES).ok()?;
+    xmp_capture_date(&buf)
+}
+
+fn xmp_capture_date(buf: &[u8]) -> Option<i64> {
+    let start = find_bytes(buf, b"<x:xmpmeta")?;
+    let end = find_bytes(&buf[start..], b"</x:xmpmeta>").map_or(buf.len(), |e| start + e);
+    let xmp = String::from_utf8_lossy(&buf[start..end]);
+    ["exif:DateTimeOriginal", "photoshop:DateCreated", "xmp:CreateDate"]
+        .into_iter()
+        .find_map(|name| xmp_value(&xmp, name).and_then(|v| parse_exif_date(&v)))
+}
+
+/// Value of an XMP property in either attribute (`name="v"`) or element
+/// (`<name>v</name>`) form.
+fn xmp_value(xmp: &str, name: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        let key = format!("{name}={quote}");
+        if let Some(i) = xmp.find(&key) {
+            let rest = &xmp[i + key.len()..];
+            return rest.find(quote).map(|j| rest[..j].to_string());
+        }
+    }
+    let open = format!("<{name}>");
+    let i = xmp.find(&open)? + open.len();
+    let j = xmp[i..].find('<')?;
+    Some(xmp[i..i + j].trim().to_string())
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// TIFF-structured formats, whose IFD offsets are relative to the file start.
+pub(crate) fn is_tiff_family(format: ImageFormat) -> bool {
+    format.is_raw() || format == ImageFormat::Tiff
 }
 
 fn parse_exif_bytes(mut buf: Vec<u8>) -> Result<Exif> {
@@ -157,8 +295,8 @@ fn patch_raw_tiff_magic(buf: &mut [u8]) -> bool {
 }
 
 fn read_fields(exif: &Exif, meta: &mut ImageMetadata) {
-    // Dates, in order of preference: original > digitized > file-modified.
-    meta.capture_date = [Tag::DateTimeOriginal, Tag::DateTimeDigitized, Tag::DateTime]
+    // Capture dates only; the IFD0 modify date is a separate, last fallback.
+    meta.capture_date = [Tag::DateTimeOriginal, Tag::DateTimeDigitized]
         .into_iter()
         .find_map(|tag| ascii(exif, tag).and_then(|s| parse_exif_date(&s)));
 
@@ -317,7 +455,18 @@ fn parse_exif_date(raw: &str) -> Option<i64> {
         return Some(ts.and_utc().timestamp());
     }
 
-    // Date only, or a date followed by something unparseable (zone suffix etc.).
+    // Date and time followed by something else (XMP zone suffix "+05:30"):
+    // keep the wall-clock time, like EXIF.
+    if let Some(prefix) = s.get(..19) {
+        if let Some(ts) = ["%Y-%m-%dT%H:%M:%S", "%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"]
+            .iter()
+            .find_map(|fmt| NaiveDateTime::parse_from_str(prefix, fmt).ok())
+        {
+            return Some(ts.and_utc().timestamp());
+        }
+    }
+
+    // Date only, or a date followed by something unparseable.
     let date = s.get(..10)?.replace(':', "-");
     let day = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok()?;
     Some(day.and_hms_opt(0, 0, 0)?.and_utc().timestamp())
@@ -347,6 +496,61 @@ mod tests {
         assert_eq!(parse_exif_date("2024:01:01 15:13:32\0"), Some(expect));
         assert!(parse_exif_date("0000:00:00 00:00:00").is_none());
         assert!(parse_exif_date("garbage").is_none());
+    }
+
+    #[test]
+    fn slow_fallbacks_only_apply_where_they_can_help() {
+        for f in [ImageFormat::Jpeg, ImageFormat::Png, ImageFormat::Gif, ImageFormat::Unknown] {
+            assert!(!may_need_exiftool(f), "{f:?}");
+            assert!(!exif_may_be_beyond_header(f), "{f:?}");
+        }
+        for f in [ImageFormat::RawOrf, ImageFormat::RawCr3, ImageFormat::Heif] {
+            assert!(may_need_exiftool(f), "{f:?}");
+            assert!(exif_may_be_beyond_header(f), "{f:?}");
+        }
+        assert!(exif_may_be_beyond_header(ImageFormat::Webp));
+        assert!(!may_need_exiftool(ImageFormat::Webp));
+    }
+
+    #[test]
+    fn reads_xmp_dates_in_attribute_and_element_form() {
+        let at = |s: &str| {
+            let dt = chrono::DateTime::from_timestamp(parse_exif_date(s).unwrap(), 0).unwrap();
+            dt.format("%Y-%m-%d %H:%M:%S").to_string()
+        };
+        let fmt = |ts: i64| {
+            let dt = chrono::DateTime::from_timestamp(ts, 0).unwrap();
+            dt.format("%Y-%m-%d %H:%M:%S").to_string()
+        };
+        // exif:DateTimeOriginal wins over xmp:CreateDate.
+        let attr = br#"junk<x:xmpmeta><rdf:Description exif:DateTimeOriginal="2023:04:08 19:45:41.000" xmp:CreateDate="2020-01-01T00:00:00"/></x:xmpmeta>"#;
+        assert_eq!(fmt(xmp_capture_date(attr).unwrap()), "2023-04-08 19:45:41");
+
+        let elem = b"<x:xmpmeta><xmp:CreateDate>2021-05-06T07:08:09+05:30</xmp:CreateDate></x:xmpmeta>";
+        assert_eq!(fmt(xmp_capture_date(elem).unwrap()), "2021-05-06 07:08:09");
+
+        assert!(xmp_capture_date(b"no xmp here").is_none());
+        assert_eq!(at("2021-05-06T07:08:09+05:30"), "2021-05-06 07:08:09");
+    }
+
+    #[test]
+    fn xmp_date_beats_exif_modify_date() {
+        // An export: EXIF has only DateTime (export time); XMP has the capture date.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("export.jpg");
+        testutil::write_jpeg(&path, &testutil::Spec { exif: false, ..Default::default() });
+        let jpeg = std::fs::read(&path).unwrap();
+        let xmp = b"http://ns.adobe.com/xap/1.0/\0<x:xmpmeta><rdf:Description exif:DateTimeOriginal=\"2019:02:03 04:05:06\"/></x:xmpmeta>";
+        let mut out = jpeg[..2].to_vec();
+        out.extend([0xFF, 0xE1]);
+        out.extend(((xmp.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(xmp);
+        out.extend_from_slice(&jpeg[2..]);
+        std::fs::write(&path, out).unwrap();
+
+        let meta = extract(&path).unwrap();
+        let date = chrono::DateTime::from_timestamp(meta.capture_date.unwrap(), 0).unwrap();
+        assert_eq!(date.format("%Y-%m-%d %H:%M:%S").to_string(), "2019-02-03 04:05:06");
     }
 
     #[test]

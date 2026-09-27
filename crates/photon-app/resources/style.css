@@ -104,15 +104,86 @@ button.destructive-action {
     border-color: alpha(currentColor, 0.16);
 }
 
+/* Timeline list: rows are layout only, no list-row chrome */
+.photon-timeline, .photon-timeline > row, .photon-timeline > row:hover,
+.photon-timeline > row:selected {
+    background: none;
+    padding: 0;
+}
+
 /* Photo tiles in timeline: 8px radius with smooth transitions */
 .photon-tile {
     border-radius: 8px;
     background-color: alpha(currentColor, 0.06);
-    transition: opacity 150ms ease;
+    transition: opacity 150ms ease, outline-color 150ms ease, box-shadow 150ms ease;
+    outline: 3px solid transparent;
+    outline-offset: -3px;
 }
 
-.photon-tile:hover {
-    opacity: 0.90;
+.photon-tile:hover picture {
+    opacity: 0.88;
+}
+
+.photon-tile.photon-tile-selected {
+    outline: 3px solid @accent_bg_color;
+    box-shadow: 0 0 0 2px alpha(@accent_bg_color, 0.4);
+}
+
+.photon-tile.photon-tile-focused {
+    outline: 3px solid @accent_color;
+}
+
+.photon-tile.photon-tile-selected.photon-tile-focused {
+    outline: 3px solid @accent_bg_color;
+    box-shadow: 0 0 0 3px alpha(@accent_bg_color, 0.6);
+}
+
+/* Rejected tiles dimming & pick styling */
+.photon-tile.photon-tile-rejected {
+    opacity: 0.42;
+    filter: grayscale(80%);
+}
+
+.photon-tile.photon-tile-pick {
+    /* Picked photos retain full clarity */
+}
+
+/* Tile rating & flag badges */
+.photon-tile-badges {
+    margin: 6px;
+}
+
+.photon-tile-badge {
+    border-radius: 9999px;
+    padding: 2px 7px;
+    font-size: 0.75em;
+    font-weight: 700;
+    line-height: 1.2;
+    background-color: alpha(@window_bg_color, 0.85);
+    color: @window_fg_color;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+}
+
+.photon-tile-star-badge {
+    color: #f6d32d;
+    background-color: rgba(30, 30, 30, 0.75);
+}
+
+.photon-tile-pick-badge {
+    color: #33d17a;
+    background-color: rgba(30, 30, 30, 0.75);
+}
+
+.photon-tile-reject-badge {
+    color: #e01b24;
+    background-color: rgba(30, 30, 30, 0.75);
+}
+
+/* Day headers in the timeline */
+.photon-section-header {
+    font-weight: 700;
+    font-size: 1.15em;
+    letter-spacing: -0.2px;
 }
 
 /* ==========================================================================
@@ -198,6 +269,12 @@ button.destructive-action {
     box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.08);
 }
 
+/* Viewer info side panel */
+.info-panel {
+    background-color: @card_bg_color;
+    border-left: 1px solid alpha(currentColor, 0.08);
+}
+
 /* Status floating card */
 .status-card {
     border-radius: 12px;
@@ -215,4 +292,46 @@ progressbar trough {
 progressbar progress {
     border-radius: 9999px;
     background-color: @accent_bg_color;
+}
+
+/* ==========================================================================
+   TIMELINE SCRUBBER & SELECTION BAR
+   ========================================================================== */
+
+/* Year marks appear while scrolling or hovering the rail */
+.photon-scrubber-marks .photon-scrubber-year {
+    opacity: 0;
+    transition: opacity 200ms ease;
+    font-size: 0.8em;
+    font-weight: 700;
+    padding: 1px 7px;
+    border-radius: 9999px;
+    background-color: alpha(@window_bg_color, 0.88);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+}
+
+.photon-scrubber-marks.active .photon-scrubber-year {
+    opacity: 1;
+}
+
+/* Position indicator on the rail (replaces the native scrollbar) */
+.photon-scrubber-thumb {
+    min-height: 4px;
+    border-radius: 2px;
+    background-color: alpha(currentColor, 0.35);
+    transition: background-color 200ms ease;
+}
+
+.photon-scrubber-marks.active .photon-scrubber-thumb {
+    background-color: @accent_bg_color;
+}
+
+/* Floating selection action bar */
+.photon-selection-bar {
+    padding: 6px;
+    border-radius: 9999px;
+    background-color: @popover_bg_color;
+    color: @popover_fg_color;
+    border: 1px solid alpha(currentColor, 0.1);
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25), 0 2px 6px rgba(0, 0, 0, 0.12);
 }

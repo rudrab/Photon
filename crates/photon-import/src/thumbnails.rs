@@ -19,8 +19,10 @@ use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, ImageBuffer, RgbImage};
 use photon_core::models::{Image, ImageFormat};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Cursor, Read};
+use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom};
+use rayon::prelude::*;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The sizes kept in the cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,7 +295,12 @@ fn load_raw_preview(path: &Path, long_edge: u32) -> Result<DynamicImage> {
 /// This works across vendors without parsing each maker-note format: Olympus,
 /// Canon, Nikon, Sony, Fuji and Panasonic all embed a baseline JPEG preview.
 fn largest_embedded_jpeg(data: &[u8]) -> Option<(usize, u32, u32)> {
-    let mut best: Option<(usize, u32, u32)> = None;
+    embedded_jpegs(data).into_iter().max_by_key(|&(_, w, h)| w as u64 * h as u64)
+}
+
+/// Every embedded JPEG in `data`: offset and dimensions.
+fn embedded_jpegs(data: &[u8]) -> Vec<(usize, u32, u32)> {
+    let mut found = Vec::new();
     let mut pos = 0;
     while let Some(off) = find_soi(&data[pos..]) {
         let start = pos + off;
@@ -303,13 +310,11 @@ fn largest_embedded_jpeg(data: &[u8]) -> Option<(usize, u32, u32)> {
         if decoder.read_info().is_err() {
             continue;
         }
-        let Some(info) = decoder.info() else { continue };
-        let (w, h) = (info.width as u32, info.height as u32);
-        if best.is_none_or(|(_, bw, bh)| w * h > bw * bh) {
-            best = Some((start, w, h));
+        if let Some(info) = decoder.info() {
+            found.push((start, info.width as u32, info.height as u32));
         }
     }
-    best
+    found
 }
 
 /// Offset of the next `FF D8 FF` (JPEG SOI + start of the first marker).
@@ -320,21 +325,121 @@ fn find_soi(data: &[u8]) -> Option<usize> {
 /// Last resort: the small EXIF (IFD1) thumbnail.
 fn exif_thumbnail(path: &Path, data: &[u8], long_edge: u32) -> Result<DynamicImage> {
     let exif = metadata::read_exif(path)?;
+    let (offset, length) = exif_thumbnail_range(&exif).context("No embedded preview found")?;
+    let bytes = data
+        .get(offset..offset.saturating_add(length))
+        .context("EXIF thumbnail out of bounds")?;
+    decode_jpeg_scaled(Cursor::new(bytes), long_edge)
+}
+
+/// Offset and length of the EXIF (IFD1) JPEG thumbnail.
+fn exif_thumbnail_range(exif: &exif::Exif) -> Option<(usize, usize)> {
     let field = |tag| {
         exif.get_field(tag, In::THUMBNAIL)
             .or_else(|| exif.get_field(tag, In::PRIMARY))
             .and_then(|f| f.value.get_uint(0))
     };
-    let (Some(offset), Some(length)) = (
-        field(Tag::JPEGInterchangeFormat),
-        field(Tag::JPEGInterchangeFormatLength),
-    ) else {
-        anyhow::bail!("No embedded preview found");
+    let offset = field(Tag::JPEGInterchangeFormat)? as usize;
+    let length = field(Tag::JPEGInterchangeFormatLength)? as usize;
+    (length > 0).then_some((offset, length))
+}
+
+/// Files up to this size may be decoded for a quick preview when they carry
+/// no EXIF thumbnail (screenshots, exports). Bigger ones get none.
+const QUICK_DECODE_MAX_BYTES: u64 = 12 * 1024 * 1024;
+/// How much of a RAW file to search for a small embedded JPEG.
+const RAW_PREVIEW_SCAN_BYTES: u64 = 128 * 1024;
+
+/// Raw RGB8 pixels of a quick preview.
+pub struct Preview {
+    pub width: u32,
+    pub height: u32,
+    /// Tightly packed RGB, `width * 3` bytes per row.
+    pub rgb: Vec<u8>,
+}
+
+/// [`quick_preview`] for many files, a few at a time (the same bounded I/O
+/// parallelism as imports, which suits card readers). `on_preview(index, …)`
+/// is called from worker threads as each finishes; files without a preview
+/// are skipped. Stops early once `cancelled` is set.
+pub fn quick_previews(
+    paths: &[PathBuf],
+    long_edge: u32,
+    cancelled: &AtomicBool,
+    on_preview: impl Fn(usize, Preview) + Sync,
+) -> Result<()> {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(crate::ImportConfig::default().io_threads)
+        .thread_name(|i| format!("photon-preview-{i}"))
+        .build()?;
+    pool.install(|| {
+        paths.par_iter().enumerate().for_each(|(i, path)| {
+            if cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+            if let Ok(img) = quick_preview(path, long_edge) {
+                let (width, height) = img.dimensions();
+                on_preview(i, Preview { width, height, rgb: img.into_raw() });
+            }
+        })
+    });
+    Ok(())
+}
+
+/// A small, upright preview for the pre-import review, reading as little of
+/// the file as possible: the EXIF thumbnail sits in the header (a few KB, even
+/// for 50 MB RAW files). Files without one are decoded only if small.
+pub fn quick_preview(path: &Path, long_edge: u32) -> Result<RgbImage> {
+    let format = metadata::format_of(path);
+    let exif = metadata::read_exif(path).ok();
+    let orientation = exif
+        .as_ref()
+        .and_then(|e| e.get_field(Tag::Orientation, In::PRIMARY)?.value.get_uint(0))
+        .filter(|o| (1..=8).contains(o))
+        .unwrap_or(1) as u16;
+
+    let embedded = exif.as_ref().and_then(|exif| {
+        let (offset, length) = exif_thumbnail_range(exif)?;
+        let bytes = if metadata::is_tiff_family(format) {
+            // Offsets are file-relative, and the parse buffer beyond the
+            // header read is zero padding: fetch just this range.
+            let mut file = File::open(path).ok()?;
+            file.seek(SeekFrom::Start(offset as u64)).ok()?;
+            let mut buf = vec![0u8; length];
+            file.read_exact(&mut buf).ok()?;
+            buf
+        } else {
+            exif.buf().get(offset..offset.checked_add(length)?)?.to_vec()
+        };
+        decode_jpeg_scaled(Cursor::new(bytes), long_edge).ok()
+    });
+
+    // RAW without an IFD1 thumbnail (e.g. Olympus keeps it in the maker
+    // note): the largest JPEG that is complete within the first bytes.
+    let embedded = embedded.or_else(|| {
+        if !format.is_raw() {
+            return None;
+        }
+        let mut prefix = Vec::new();
+        File::open(path).ok()?.take(RAW_PREVIEW_SCAN_BYTES).read_to_end(&mut prefix).ok()?;
+        // Smallest candidate that is big enough first (cheapest to decode),
+        // then larger ones, then any. A preview that runs past the prefix
+        // fails to decode and is skipped.
+        let mut candidates = embedded_jpegs(&prefix);
+        candidates.sort_by_key(|&(_, w, h)| (w.max(h) < long_edge, w as u64 * h as u64));
+        candidates
+            .into_iter()
+            .find_map(|(start, _, _)| decode_jpeg_scaled(Cursor::new(&prefix[start..]), long_edge).ok())
+    });
+
+    let image = match embedded {
+        Some(img) => img,
+        None if !format.is_raw() && fs::metadata(path)?.len() <= QUICK_DECODE_MAX_BYTES => {
+            load_smart(path, long_edge)?
+        }
+        None => anyhow::bail!("no quick preview available"),
     };
-    let bytes = data
-        .get(offset as usize..(offset as usize).saturating_add(length as usize))
-        .context("EXIF thumbnail out of bounds")?;
-    decode_jpeg_scaled(Cursor::new(bytes), long_edge)
+    Ok(apply_orientation(resize(image.into_rgb8(), long_edge)?, orientation))
 }
 
 /// Decode a JPEG at the smallest IDCT scale that still covers `long_edge`.
@@ -442,6 +547,16 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn quick_preview_is_small_and_upright() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("big.jpg");
+        // EXIF orientation 6, no EXIF thumbnail: falls back to a scaled decode.
+        write_jpeg(&src, &Spec { width: 1200, height: 600, ..Default::default() });
+        let preview = quick_preview(&src, 160).unwrap();
+        assert_eq!(preview.dimensions(), (80, 160));
     }
 
     #[test]

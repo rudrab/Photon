@@ -54,7 +54,7 @@ pub fn insert_image(tx: &Transaction, img: &Image) -> Result<Option<i64>, Photon
             img.longitude,
             img.location_name,
             img.rating,
-            img.flagged as i32,
+            img.flagged,
             img.hidden as i32,
             img.title,
             img.description,
@@ -192,7 +192,7 @@ fn row_to_image(row: &rusqlite::Row) -> rusqlite::Result<Image> {
         longitude: row.get(21)?,
         location_name: row.get(22)?,
         rating: row.get::<_, i32>(23).unwrap_or(0),
-        flagged: row.get::<_, i32>(24).unwrap_or(0) != 0,
+        flagged: row.get::<_, i32>(24).unwrap_or(0),
         hidden: row.get::<_, i32>(25).unwrap_or(0) != 0,
         title: row.get(26)?,
         description: row.get(27)?,
@@ -270,6 +270,22 @@ pub fn get_images_by_day(
     Ok(collect_images(rows))
 }
 
+/// Remove images from the library (the files are not touched). Tags and
+/// edit history go with them (ON DELETE CASCADE); the FTS index is kept in
+/// sync by its trigger. Returns how many rows were removed.
+pub fn delete_images(conn: &mut Connection, ids: &[i64]) -> Result<usize, PhotonError> {
+    let tx = conn.transaction()?;
+    let mut removed = 0;
+    {
+        let mut stmt = tx.prepare_cached("DELETE FROM images WHERE id = ?1")?;
+        for id in ids {
+            removed += stmt.execute(params![id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(removed)
+}
+
 /// A single image by id.
 pub fn get_image(conn: &Connection, id: i64) -> Result<Option<Image>, PhotonError> {
     let sql = format!("{} WHERE id = ?1", IMAGE_SELECT);
@@ -289,7 +305,17 @@ pub fn timeline_items(
     conn: &Connection,
     filter: &TimelineFilter,
 ) -> Result<Vec<TimelineItem>, PhotonError> {
-    const COLS: &str = "SELECT id, hash, created_at, width, height, orientation, thumbhash FROM images";
+    timeline_items_with_cull(conn, filter, None, None)
+}
+
+/// Timeline tiles for `filter`, with optional min_rating (e.g. >= 3) and flag (-1 reject, 0 unflagged, 1 pick).
+pub fn timeline_items_with_cull(
+    conn: &Connection,
+    filter: &TimelineFilter,
+    min_rating: Option<i32>,
+    flag: Option<i32>,
+) -> Result<Vec<TimelineItem>, PhotonError> {
+    const COLS: &str = "SELECT id, hash, created_at, width, height, orientation, thumbhash, rating, flagged FROM images";
     const ORDER: &str = "ORDER BY COALESCE(created_at, imported_at) DESC, id DESC";
 
     let map = |r: &rusqlite::Row| -> rusqlite::Result<TimelineItem> {
@@ -301,31 +327,108 @@ pub fn timeline_items(
             height: r.get(4)?,
             orientation: r.get(5)?,
             thumbhash: r.get(6)?,
+            rating: r.get::<_, i32>(7).unwrap_or(0),
+            flagged: r.get::<_, i32>(8).unwrap_or(0),
         })
     };
 
+    let mut extra = String::new();
+    let mut extra_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    if let Some(r) = min_rating {
+        extra.push_str(" AND rating >= ?");
+        extra_params.push(Box::new(r));
+    }
+    if let Some(f) = flag {
+        extra.push_str(" AND flagged = ?");
+        extra_params.push(Box::new(f));
+    }
+
     let items = match filter {
         TimelineFilter::All => {
-            let mut stmt = conn.prepare(&format!("{COLS} WHERE hidden = 0 {ORDER}"))?;
-            let rows = stmt.query_map([], map)?;
+            let sql = format!("{COLS} WHERE hidden = 0 {extra} {ORDER}");
+            let mut stmt = conn.prepare(&sql)?;
+            let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                extra_params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.query_map(params_refs.as_slice(), map)?;
             rows.collect::<Result<Vec<_>, _>>()?
         }
         TimelineFilter::Day(y, m, d) => {
-            let mut stmt = conn.prepare(&format!(
-                "{COLS} WHERE hidden = 0 AND year = ?1 AND month = ?2 AND day = ?3 {ORDER}"
-            ))?;
-            let rows = stmt.query_map(params![y, *m as i32, *d as i32], map)?;
+            let sql = format!(
+                "{COLS} WHERE hidden = 0 AND year = ?1 AND month = ?2 AND day = ?3 {extra} {ORDER}"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+                Box::new(*y),
+                Box::new(*m as i32),
+                Box::new(*d as i32),
+            ];
+            all_params.extend(extra_params);
+            let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                all_params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.query_map(params_refs.as_slice(), map)?;
             rows.collect::<Result<Vec<_>, _>>()?
         }
         TimelineFilter::Search(text) => {
-            let mut stmt = conn.prepare(&format!(
-                "{COLS} WHERE hidden = 0 AND id IN (SELECT rowid FROM images_fts WHERE images_fts MATCH ?1) {ORDER}"
-            ))?;
-            let rows = stmt.query_map(params![fts_query(text)], map)?;
+            let fts = fts_query(text);
+            let sql = format!(
+                "{COLS} WHERE hidden = 0 AND id IN (SELECT rowid FROM images_fts WHERE images_fts MATCH ?1) {extra} {ORDER}"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(fts)];
+            all_params.extend(extra_params);
+            let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                all_params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.query_map(params_refs.as_slice(), map)?;
             rows.collect::<Result<Vec<_>, _>>()?
         }
     };
     Ok(items)
+}
+
+/// Update rating (0..=5) of an image.
+pub fn set_rating(conn: &Connection, id: i64, rating: i32) -> Result<(), PhotonError> {
+    conn.execute(
+        "UPDATE images SET rating = ?1 WHERE id = ?2",
+        params![rating.clamp(0, 5), id],
+    )?;
+    Ok(())
+}
+
+/// Update flag (-1 = rejected, 0 = unflagged, 1 = pick) of an image.
+pub fn set_flag(conn: &Connection, id: i64, flag: i32) -> Result<(), PhotonError> {
+    conn.execute(
+        "UPDATE images SET flagged = ?1 WHERE id = ?2",
+        params![flag.clamp(-1, 1), id],
+    )?;
+    Ok(())
+}
+
+/// Batch update rating for multiple photos in a single transaction.
+pub fn batch_set_rating(conn: &mut Connection, ids: &[i64], rating: i32) -> Result<(), PhotonError> {
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare_cached("UPDATE images SET rating = ?1 WHERE id = ?2")?;
+        let r = rating.clamp(0, 5);
+        for id in ids {
+            stmt.execute(params![r, id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Batch update flag for multiple photos in a single transaction.
+pub fn batch_set_flag(conn: &mut Connection, ids: &[i64], flag: i32) -> Result<(), PhotonError> {
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare_cached("UPDATE images SET flagged = ?1 WHERE id = ?2")?;
+        let f = flag.clamp(-1, 1);
+        for id in ids {
+            stmt.execute(params![f, id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// Save a computed thumbhash for an image.
@@ -334,6 +437,19 @@ pub fn save_thumbhash(conn: &Connection, id: i64, thumbhash: &[u8]) -> Result<()
         "UPDATE images SET thumbhash = ?1 WHERE id = ?2",
         params![thumbhash, id],
     )?;
+    Ok(())
+}
+
+/// Save many thumbhashes in one transaction (one fsync instead of thousands).
+pub fn save_thumbhashes(conn: &mut Connection, hashes: &[(i64, Vec<u8>)]) -> Result<(), PhotonError> {
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare_cached("UPDATE images SET thumbhash = ?1 WHERE id = ?2")?;
+        for (id, thumbhash) in hashes {
+            stmt.execute(params![thumbhash, id])?;
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -808,6 +924,27 @@ mod tests {
     }
 
     #[test]
+    fn delete_images_removes_rows_tags_and_search_entries() {
+        let db = Database::open_in_memory().unwrap();
+        let mut conn = db.conn().unwrap();
+        insert(&mut conn, "keep.jpg", 1_600_000_000, (3, 2), 1);
+        insert(&mut conn, "gone.jpg", 1_600_000_100, (3, 2), 1);
+        let all = timeline_items(&conn, &TimelineFilter::All).unwrap();
+        let gone = all.iter().find(|i| i.hash == "gone.jpg").unwrap().id;
+        let tag = create_tag(&conn, "trip", None).unwrap();
+        tag_image(&conn, gone, tag).unwrap();
+
+        assert_eq!(delete_images(&mut conn, &[gone, 999]).unwrap(), 1);
+        assert!(get_image(&conn, gone).unwrap().is_none());
+        assert_eq!(timeline_items(&conn, &TimelineFilter::All).unwrap().len(), 1);
+        assert!(timeline_items(&conn, &TimelineFilter::Search("gone".into())).unwrap().is_empty());
+        let tagged: i64 = conn
+            .query_row("SELECT COUNT(*) FROM image_tags", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tagged, 0);
+    }
+
+    #[test]
     fn date_tree_counts_per_day_newest_first() {
         let db = Database::open_in_memory().unwrap();
         let mut conn = db.conn().unwrap();
@@ -833,5 +970,49 @@ mod tests {
         let keys = duplicate_keys(&conn).unwrap();
         assert!(keys.contains(&DuplicateKey::new("img_1.jpg", 42, Some(7))));
         assert!(!keys.contains(&DuplicateKey::new("img_1.jpg", 43, Some(7))));
+    }
+
+    #[test]
+    fn culling_rating_and_flags_filter_and_update() {
+        let db = Database::open_in_memory().unwrap();
+        let mut conn = db.conn().unwrap();
+        insert(&mut conn, "img1.jpg", 1_700_000_000, (3, 2), 1);
+        insert(&mut conn, "img2.jpg", 1_700_000_100, (3, 2), 1);
+        insert(&mut conn, "img3.jpg", 1_700_000_200, (3, 2), 1);
+
+        let all = timeline_items(&conn, &TimelineFilter::All).unwrap();
+        let id1 = all.iter().find(|i| i.hash == "img1.jpg").unwrap().id;
+        let id2 = all.iter().find(|i| i.hash == "img2.jpg").unwrap().id;
+        let id3 = all.iter().find(|i| i.hash == "img3.jpg").unwrap().id;
+
+        set_rating(&conn, id1, 4).unwrap();
+        set_flag(&conn, id1, 1).unwrap(); // Pick
+
+        set_rating(&conn, id2, 2).unwrap();
+        set_flag(&conn, id2, -1).unwrap(); // Rejected
+
+        // Filter by min_rating >= 3
+        let rated = timeline_items_with_cull(&conn, &TimelineFilter::All, Some(3), None).unwrap();
+        assert_eq!(rated.len(), 1);
+        assert_eq!(rated[0].id, id1);
+        assert_eq!(rated[0].rating, 4);
+        assert_eq!(rated[0].flagged, 1);
+
+        // Filter by Pick flag (1)
+        let picks = timeline_items_with_cull(&conn, &TimelineFilter::All, None, Some(1)).unwrap();
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].id, id1);
+
+        // Filter by Reject flag (-1)
+        let rejects = timeline_items_with_cull(&conn, &TimelineFilter::All, None, Some(-1)).unwrap();
+        assert_eq!(rejects.len(), 1);
+        assert_eq!(rejects[0].id, id2);
+
+        // Batch update
+        batch_set_rating(&mut conn, &[id2, id3], 5).unwrap();
+        batch_set_flag(&mut conn, &[id2, id3], 1).unwrap();
+
+        let top = timeline_items_with_cull(&conn, &TimelineFilter::All, Some(5), Some(1)).unwrap();
+        assert_eq!(top.len(), 2);
     }
 }

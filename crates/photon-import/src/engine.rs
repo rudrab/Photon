@@ -345,57 +345,61 @@ impl ImportEngine {
         let Some(thumb_gen) = &self.thumbnail_gen else {
             return Ok(0);
         };
-        let conn = self.db.conn()?;
-        let images = queries::get_all_images(&conn, i32::MAX, 0)?;
+        // Release the connection before the parallel part.
+        let images = queries::get_all_images(&*self.db.conn()?, i32::MAX, 0)?;
         let missing: Vec<&Image> = images
             .iter()
             .filter(|img| !thumb_gen.exists(img, ThumbSize::Grid))
             .collect();
-        let missing_hashes = queries::get_images_missing_thumbhash(&conn).unwrap_or_default();
 
         let total = missing.len().max(1);
         let done = AtomicUsize::new(0);
-        let generated = AtomicUsize::new(0);
         let offline = AtomicUsize::new(0);
 
-        missing.par_iter().for_each(|img| {
-            // Files on an unplugged drive: try again next time, quietly.
-            if !img.path.exists() {
-                offline.fetch_add(1, Ordering::Relaxed);
-                on_progress(done.fetch_add(1, Ordering::Relaxed) + 1, total);
-                return;
-            }
-            match thumb_gen.ensure_grid(img) {
-                Ok((_, Some(th))) => {
-                    if let Some(id) = img.id {
-                        if let Ok(c) = self.db.conn() {
-                            let _ = queries::save_thumbhash(&c, id, &th);
+        // 1. Thumbnails; each also yields its ThumbHash in the same pass.
+        let results: Vec<Option<(i64, Option<Vec<u8>>)>> = missing
+            .par_iter()
+            .map(|img| {
+                let result = if !img.path.exists() {
+                    // Files on an unplugged drive: try again next time, quietly.
+                    offline.fetch_add(1, Ordering::Relaxed);
+                    None
+                } else {
+                    match thumb_gen.ensure_grid(img) {
+                        Ok((_, thumbhash)) => img.id.map(|id| (id, thumbhash)),
+                        Err(e) => {
+                            log::warn!("Thumbnail failed for {}: {e:#}", img.path.display());
+                            None
                         }
                     }
-                    generated.fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(_) => {
-                    generated.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => log::warn!("Thumbnail failed for {}: {e:#}", img.path.display()),
-            }
-            on_progress(done.fetch_add(1, Ordering::Relaxed) + 1, total);
-        });
+                };
+                on_progress(done.fetch_add(1, Ordering::Relaxed) + 1, total);
+                result
+            })
+            .collect();
+        let generated = results.iter().flatten().count();
+        let mut thumbhashes: Vec<(i64, Vec<u8>)> = results
+            .into_iter()
+            .flatten()
+            .filter_map(|(id, th)| Some((id, th?)))
+            .collect();
+        queries::save_thumbhashes(&mut *self.db.conn()?, &thumbhashes)?;
 
-        // Backfill thumbhash for existing thumbnails that were generated without it
-        missing_hashes.par_iter().for_each(|(id, hash)| {
-            if let Some(th) = thumb_gen.thumbhash_from_disk(hash) {
-                if let Ok(c) = self.db.conn() {
-                    let _ = queries::save_thumbhash(&c, *id, &th);
-                }
-            }
-        });
+        // 2. ThumbHashes for photos whose thumbnail already existed (older
+        //    versions didn't compute them). Queried *after* step 1, so the
+        //    photos just handled aren't decoded a second time.
+        let still_missing = queries::get_images_missing_thumbhash(&*self.db.conn()?)?;
+        thumbhashes = still_missing
+            .par_iter()
+            .filter_map(|(id, hash)| Some((*id, thumb_gen.thumbhash_from_disk(hash)?)))
+            .collect();
+        queries::save_thumbhashes(&mut *self.db.conn()?, &thumbhashes)?;
 
         let offline = offline.into_inner();
         if offline > 0 {
             log::info!("{offline} photos are offline (file not found); thumbnails deferred");
         }
-        Ok(generated.into_inner())
+        Ok(generated)
     }
 
     /// Fast pre-scan that inspects file headers to classify candidates into
@@ -414,41 +418,52 @@ impl ImportEngine {
         };
         drop(conn);
 
+        // Same bounded parallelism as the import's I/O stage: a few streams
+        // keep a card reader busy without making it seek.
+        let io_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(ImportConfig::default().io_threads)
+            .thread_name(|i| format!("photon-prescan-{i}"))
+            .build()?;
+        let classified: Vec<Option<(bool, PreImportItem)>> = io_pool.install(|| {
+            files
+                .par_iter()
+                .map(|src| {
+                    let fs_meta = fs::metadata(src).ok()?;
+                    let filename = file_name(src);
+                    let size_bytes = fs_meta.len() as i64;
+
+                    if known.contains(src.to_string_lossy().as_ref()) {
+                        let item = PreImportItem {
+                            path: src.clone(),
+                            filename,
+                            size_bytes,
+                            created_at: None,
+                        };
+                        return Some((true, item));
+                    }
+
+                    // EXIF header only: never reads whole files.
+                    let meta = metadata::extract(src).unwrap_or_default();
+                    let created_at = meta.capture_date.or_else(|| {
+                        let mtime = fs_meta.modified().or_else(|_| fs_meta.created()).ok()?;
+                        Some(chrono::DateTime::<chrono::Utc>::from(mtime).timestamp())
+                    });
+                    let duplicate =
+                        suspected.contains(&DuplicateKey::new(&filename, size_bytes, created_at));
+                    let item = PreImportItem {
+                        path: src.clone(),
+                        filename,
+                        size_bytes,
+                        created_at,
+                    };
+                    Some((duplicate, item))
+                })
+                .collect()
+        });
+
         let mut report = PreImportReport::default();
-
-        for src in files {
-            let path_str = src.to_string_lossy();
-            if known.contains(path_str.as_ref()) {
-                let size = fs::metadata(src).map(|m| m.len() as i64).unwrap_or(0);
-                report.duplicates.push(PreImportItem {
-                    path: src.clone(),
-                    filename: file_name(src),
-                    size_bytes: size,
-                    created_at: None,
-                });
-                continue;
-            }
-
-            let fs_meta = match fs::metadata(src) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            let original_name = file_name(src);
-            let meta = metadata::extract(src).unwrap_or_default();
-            let created_at = meta.capture_date.or_else(|| {
-                let mtime = fs_meta.modified().or_else(|_| fs_meta.created()).ok()?;
-                Some(chrono::DateTime::<chrono::Utc>::from(mtime).timestamp())
-            });
-
-            let key = DuplicateKey::new(&original_name, fs_meta.len() as i64, created_at);
-            let item = PreImportItem {
-                path: src.clone(),
-                filename: original_name,
-                size_bytes: fs_meta.len() as i64,
-                created_at,
-            };
-
-            if suspected.contains(&key) {
+        for (duplicate, item) in classified.into_iter().flatten() {
+            if duplicate {
                 report.duplicates.push(item);
             } else {
                 report.new_files.push(item);
@@ -795,6 +810,53 @@ mod tests {
         assert!(rx
             .try_iter()
             .any(|p| matches!(p, ImportProgress::Completed { cancelled: true, .. })));
+    }
+
+    #[test]
+    fn pre_scan_classifies_without_importing() {
+        let card = tempfile::tempdir().unwrap();
+        let lib = tempfile::tempdir().unwrap();
+        write_jpeg(&card.path().join("old.jpg"), &Spec { seed: 1, ..Default::default() });
+
+        let engine = engine();
+        let cfg = config(FolderImportMode::Copy, lib.path());
+        let source = DiskSource::new(card.path().to_path_buf(), true);
+        engine.import(&source, &cfg, None).unwrap();
+
+        write_jpeg(&card.path().join("new.jpg"), &Spec { seed: 2, ..Default::default() });
+        let files = source.scan().unwrap();
+        let report = engine.pre_scan(&files, FolderImportMode::Copy).unwrap();
+
+        let names = |items: &[PreImportItem]| -> Vec<String> {
+            items.iter().map(|i| i.filename.clone()).collect()
+        };
+        assert_eq!(names(&report.new_files), ["new.jpg"]);
+        assert_eq!(names(&report.duplicates), ["old.jpg"]);
+        assert_eq!(photos(&engine).len(), 1, "pre-scan must not import");
+    }
+
+    #[test]
+    fn backfill_generates_thumbnails_and_thumbhashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        write_jpeg(&dir.path().join("a.jpg"), &Spec { width: 64, height: 32, ..Default::default() });
+
+        // Import without thumbnails, as older versions effectively did.
+        let engine = ImportEngine::new(
+            Database::open_in_memory().unwrap(),
+            Some(ThumbnailGenerator::new(cache.path().to_path_buf())),
+        );
+        let source = DiskSource::new(dir.path().to_path_buf(), true);
+        engine.import(&source, &config(FolderImportMode::InPlace, dir.path()), None).unwrap();
+        assert!(photos(&engine)[0].thumbhash.is_none());
+
+        assert_eq!(engine.generate_missing_thumbnails(|_, _| {}).unwrap(), 1);
+        let img = &photos(&engine)[0];
+        assert!(engine.thumbnails().unwrap().exists(img, ThumbSize::Grid));
+        assert!(img.thumbhash.as_ref().is_some_and(|th| !th.is_empty()));
+
+        // Second run: nothing left to do.
+        assert_eq!(engine.generate_missing_thumbnails(|_, _| {}).unwrap(), 0);
     }
 
     #[test]

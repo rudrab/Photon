@@ -46,7 +46,7 @@ pub struct Image {
 
     // Organization
     pub rating: i32,
-    pub flagged: bool,
+    pub flagged: i32, // -1 = rejected, 0 = unflagged, 1 = pick
     pub hidden: bool,
     pub title: Option<String>,
     pub description: Option<String>,
@@ -299,6 +299,8 @@ pub struct TimelineItem {
     pub height: Option<u32>,
     pub orientation: Option<u16>,
     pub thumbhash: Option<Vec<u8>>,
+    pub rating: i32,
+    pub flagged: i32,
 }
 
 impl TimelineItem {

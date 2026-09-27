@@ -12,6 +12,7 @@ use crate::handlers::import_handler;
 use crate::menu;
 use crate::ui::detail;
 use crate::ui::preferences;
+use crate::ui::selection_bar;
 use crate::ui::sidebar;
 use crate::ui::timeline::Timeline;
 use crate::ui::widgets::EventCard;
@@ -57,6 +58,8 @@ pub struct MainWindow {
     /// What the timeline currently shows, and whether the library changed since.
     timeline_filter: Rc<RefCell<Option<TimelineFilter>>>,
     timeline_stale: Rc<Cell<bool>>,
+    pub cull_min_rating: Rc<Cell<i32>>,
+    pub cull_flag: Rc<Cell<Option<i32>>>,
     pub sidebar: sidebar::Sidebar,
 }
 
@@ -102,7 +105,14 @@ impl MainWindow {
         let window_title = adw::WindowTitle::new("Photon", "All Photos");
         header_bar.set_title_widget(Some(&window_title));
 
-        // End: Primary MenuButton (Hamburger)
+        // End: Filter Button + Primary MenuButton (Hamburger)
+        let filter_btn = MenuButton::builder()
+            .icon_name("view-filter-symbolic")
+            .tooltip_text("Filter & Grid Options")
+            .build();
+        filter_btn.add_css_class("flat");
+        header_bar.pack_end(&filter_btn);
+
         let primary_menu = menu::build_primary_menu();
         let menu_btn = MenuButton::builder()
             .icon_name("open-menu-symbolic")
@@ -148,10 +158,102 @@ impl MainWindow {
         };
 
         let timeline = Timeline::new(cache_dir.clone(), prefs.thumbnail_size as i32);
+        timeline.set_db(db.clone());
         let tx = nav_tx.clone();
         timeline.connect_activate(move |index| {
             let _ = tx.send_blocking(UIAction::ViewPhoto(index));
         });
+
+        // ── Filter Popover ──────────────────────────────
+        let cull_min_rating = Rc::new(Cell::new(0));
+        let cull_flag = Rc::new(Cell::new(None));
+
+        let popover = gtk4::Popover::new();
+        let pop_box = GtkBox::new(Orientation::Vertical, 8);
+        pop_box.set_margin_top(12);
+        pop_box.set_margin_bottom(12);
+        pop_box.set_margin_start(12);
+        pop_box.set_margin_end(12);
+
+        let rating_lbl = Label::new(Some("Rating Filter"));
+        rating_lbl.add_css_class("caption-heading");
+        rating_lbl.set_halign(Align::Start);
+        pop_box.append(&rating_lbl);
+
+        let rating_box = GtkBox::new(Orientation::Horizontal, 0);
+        rating_box.add_css_class("linked");
+        let ratings = [
+            ("Any", 0),
+            ("★ 1+", 1),
+            ("★ 2+", 2),
+            ("★ 3+", 3),
+            ("★ 4+", 4),
+            ("★ 5", 5),
+        ];
+        let mut rating_btns = Vec::new();
+        for (label, val) in ratings {
+            let b = Button::with_label(label);
+            b.add_css_class("flat");
+            if val == 0 {
+                b.add_css_class("suggested-action");
+            }
+            rating_box.append(&b);
+            rating_btns.push((b, val));
+        }
+        pop_box.append(&rating_box);
+
+        let status_lbl = Label::new(Some("Status Filter"));
+        status_lbl.add_css_class("caption-heading");
+        status_lbl.set_halign(Align::Start);
+        pop_box.append(&status_lbl);
+
+        let status_box = GtkBox::new(Orientation::Horizontal, 0);
+        status_box.add_css_class("linked");
+        let flags: [(&str, Option<i32>); 4] = [
+            ("All", None),
+            ("Picks", Some(1)),
+            ("Unflagged", Some(0)),
+            ("Rejects", Some(-1)),
+        ];
+        let mut flag_btns = Vec::new();
+        for (label, val) in flags {
+            let b = Button::with_label(label);
+            b.add_css_class("flat");
+            if val.is_none() {
+                b.add_css_class("suggested-action");
+            }
+            status_box.append(&b);
+            flag_btns.push((b, val));
+        }
+        pop_box.append(&status_box);
+
+        let zoom_lbl = Label::new(Some("Grid Density"));
+        zoom_lbl.add_css_class("caption-heading");
+        zoom_lbl.set_halign(Align::Start);
+        pop_box.append(&zoom_lbl);
+
+        let zoom_box = GtkBox::new(Orientation::Horizontal, 0);
+        zoom_box.add_css_class("linked");
+        let zooms = [
+            ("Small", 140),
+            ("Medium", 220),
+            ("Large", 320),
+            ("Huge", 440),
+        ];
+        let mut zoom_btns = Vec::new();
+        for (label, val) in zooms {
+            let b = Button::with_label(label);
+            b.add_css_class("flat");
+            if val == prefs.thumbnail_size as i32 {
+                b.add_css_class("suggested-action");
+            }
+            zoom_box.append(&b);
+            zoom_btns.push((b, val));
+        }
+        pop_box.append(&zoom_box);
+
+        popover.set_child(Some(&pop_box));
+        filter_btn.set_popover(Some(&popover));
 
         let stack = Stack::new();
         stack.set_vexpand(true);
@@ -211,8 +313,59 @@ impl MainWindow {
             timeline,
             timeline_filter: Rc::new(RefCell::new(None)),
             timeline_stale: Rc::new(Cell::new(true)),
+            cull_min_rating,
+            cull_flag,
             sidebar: sidebar_handle,
         };
+
+        let mw_f = mw.clone();
+        for (b, val) in &rating_btns {
+            let b_clone = b.clone();
+            let all_b: Vec<_> = rating_btns.iter().map(|(btn, _)| btn.clone()).collect();
+            let mw_f = mw_f.clone();
+            let val = *val;
+            b.connect_clicked(move |_| {
+                for other in &all_b {
+                    other.remove_css_class("suggested-action");
+                }
+                b_clone.add_css_class("suggested-action");
+                mw_f.cull_min_rating.set(val);
+                mw_f.timeline_stale.set(true);
+                mw_f.refresh();
+            });
+        }
+
+        let mw_f = mw.clone();
+        for (b, val) in &flag_btns {
+            let b_clone = b.clone();
+            let all_b: Vec<_> = flag_btns.iter().map(|(btn, _)| btn.clone()).collect();
+            let mw_f = mw_f.clone();
+            let val = *val;
+            b.connect_clicked(move |_| {
+                for other in &all_b {
+                    other.remove_css_class("suggested-action");
+                }
+                b_clone.add_css_class("suggested-action");
+                mw_f.cull_flag.set(val);
+                mw_f.timeline_stale.set(true);
+                mw_f.refresh();
+            });
+        }
+
+        let mw_f = mw.clone();
+        for (b, val) in &zoom_btns {
+            let b_clone = b.clone();
+            let all_b: Vec<_> = zoom_btns.iter().map(|(btn, _)| btn.clone()).collect();
+            let mw_f = mw_f.clone();
+            let val = *val;
+            b.connect_clicked(move |_| {
+                for other in &all_b {
+                    other.remove_css_class("suggested-action");
+                }
+                b_clone.add_css_class("suggested-action");
+                mw_f.timeline.set_row_height(val);
+            });
+        }
 
         // ── Navigation handler ──────────────────────────
         let mw_nav = mw.clone();
@@ -277,6 +430,17 @@ impl MainWindow {
             about.present();
         });
         mw.window.add_action(&act_about);
+
+        let mw_changed = mw.clone();
+        selection_bar::attach(
+            &mw.timeline,
+            selection_bar::Context {
+                window: mw.window.clone().upcast(),
+                db: mw.db.clone(),
+                prefs: mw.prefs.clone(),
+                on_library_changed: Rc::new(move || mw_changed.refresh()),
+            },
+        );
 
         mw.navigate(&UIAction::ShowAll);
         mw
@@ -350,10 +514,18 @@ impl MainWindow {
         if !same || self.timeline_stale.get() {
             let started = std::time::Instant::now();
             let items = match self.db.conn() {
-                Ok(conn) => queries::timeline_items(&conn, &filter).unwrap_or_else(|e| {
-                    log::error!("Timeline query failed: {e}");
-                    Vec::new()
-                }),
+                Ok(conn) => {
+                    let min_r = self.cull_min_rating.get();
+                    queries::timeline_items_with_cull(
+                        &conn,
+                        &filter,
+                        if min_r > 0 { Some(min_r) } else { None },
+                        self.cull_flag.get(),
+                    ).unwrap_or_else(|e| {
+                        log::error!("Timeline query failed: {e}");
+                        Vec::new()
+                    })
+                }
                 Err(e) => return self.show_error(&e.to_string()),
             };
             let items = Rc::new(items);
@@ -367,7 +539,9 @@ impl MainWindow {
 
         let count = self.current_photos.borrow().len();
         let count_str = if count == 1 { "1 photo" } else { &format!("{count} photos") };
-        let subtitle = format!("{title} · {count_str}");
+        let is_filtered = self.cull_min_rating.get() > 0 || self.cull_flag.get().is_some();
+        let filter_tag = if is_filtered { " · Filtered" } else { "" };
+        let subtitle = format!("{title} · {count_str}{filter_tag}");
         self.window_title.set_subtitle(&subtitle);
         self.status_label.set_text(&subtitle);
 

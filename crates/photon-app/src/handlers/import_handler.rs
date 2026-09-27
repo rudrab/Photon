@@ -18,6 +18,8 @@ use photon_import::sources::disk::DiskSource;
 use photon_import::sources::shotwell::ShotwellSource;
 use photon_import::sources::ImportSource;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -49,8 +51,8 @@ fn show_import_options_dialog(mw: &MainWindow, source_path: PathBuf, from_device
         .transient_for(&mw.window)
         .modal(true)
         .title("Review Import")
-        .default_width(580)
-        .default_height(460)
+        .default_width(760)
+        .default_height(600)
         .build();
 
     let vbox = GtkBox::new(Orientation::Vertical, 12);
@@ -81,20 +83,20 @@ fn show_import_options_dialog(mw: &MainWindow, source_path: PathBuf, from_device
 
     let mw_clone = mw.clone();
     let src = source_path.clone();
-    let (tx_scan, rx_scan) = crossbeam_channel::bounded::<(Vec<PathBuf>, photon_import::engine::PreImportReport)>(1);
+    let (tx_scan, rx_scan) =
+        crossbeam_channel::bounded::<Result<photon_import::engine::PreImportReport, String>>(1);
 
     thread::spawn(move || {
-        let disk_source = DiskSource::new(src, true);
-        if let Ok(files) = disk_source.scan() {
-            let mode = if from_device {
-                FolderImportMode::Copy
-            } else {
-                FolderImportMode::InPlace
-            };
-            if let Ok(report) = mw_clone.engine.pre_scan(&files, mode) {
-                let _ = tx_scan.send((files, report));
-            }
-        }
+        let mode = if from_device {
+            FolderImportMode::Copy
+        } else {
+            FolderImportMode::InPlace
+        };
+        let result = DiskSource::new(src, true)
+            .scan()
+            .and_then(|files| mw_clone.engine.pre_scan(&files, mode))
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx_scan.send(result);
     });
 
     let d_window = dialog.clone();
@@ -102,14 +104,27 @@ fn show_import_options_dialog(mw: &MainWindow, source_path: PathBuf, from_device
     let src_path = source_path.clone();
 
     glib::timeout_add_local(Duration::from_millis(50), move || {
-        let Ok((_files, report)) = rx_scan.try_recv() else {
-            return glib::ControlFlow::Continue;
+        let result = match rx_scan.try_recv() {
+            Ok(result) => result,
+            Err(crossbeam_channel::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            // The scan thread died without reporting (panic).
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                Err("The scan stopped unexpectedly.".to_string())
+            }
         };
 
         // Clear loading state
         while let Some(c) = vbox.first_child() {
             vbox.remove(&c);
         }
+
+        let report = match result {
+            Ok(report) => report,
+            Err(message) => {
+                show_scan_error(&vbox, &d_window, &message);
+                return glib::ControlFlow::Break;
+            }
+        };
 
         // ── Summary Header ──────────────────────────────
         let header_box = GtkBox::new(Orientation::Vertical, 4);
@@ -172,35 +187,21 @@ fn show_import_options_dialog(mw: &MainWindow, source_path: PathBuf, from_device
 
         let list_box = GtkBox::new(Orientation::Vertical, 8);
 
-        // New photos preview
+        // New photos: a grid of previews taken from the files' embedded
+        // thumbnails (a few KB each, even for RAW), filled in as they load.
         if !report.new_files.is_empty() {
             let new_expander = gtk4::Expander::builder()
                 .label(format!("New Photos to Import ({})", report.new_files.len()))
                 .expanded(true)
                 .build();
-            let new_box = GtkBox::new(Orientation::Vertical, 4);
-            new_box.set_margin_start(8);
-            new_box.set_margin_top(4);
-
-            for item in report.new_files.iter().take(50) {
-                let row = GtkBox::new(Orientation::Horizontal, 8);
-                let icon = gtk4::Image::from_icon_name("camera-photo-symbolic");
-                let name = Label::new(Some(&item.filename));
-                name.set_halign(Align::Start);
-                name.set_hexpand(true);
-                name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-
-                let size_str = format_bytes(item.size_bytes);
-                let size_lbl = Label::new(Some(&size_str));
-                size_lbl.set_css_classes(&["caption", "dim-label"]);
-
-                row.append(&icon);
-                row.append(&name);
-                row.append(&size_lbl);
-                new_box.append(&row);
-            }
-            if report.new_files.len() > 50 {
-                let more_lbl = Label::new(Some(&format!("… and {} more files", report.new_files.len() - 50)));
+            let new_box = GtkBox::new(Orientation::Vertical, 6);
+            new_box.set_margin_top(6);
+            new_box.append(&review_preview_grid(&report.new_files, &d_window));
+            if report.new_files.len() > REVIEW_PREVIEWS {
+                let more_lbl = Label::new(Some(&format!(
+                    "… and {} more",
+                    report.new_files.len() - REVIEW_PREVIEWS
+                )));
                 more_lbl.set_css_classes(&["caption", "dim-label"]);
                 more_lbl.set_halign(Align::Start);
                 new_box.append(&more_lbl);
@@ -291,6 +292,100 @@ fn show_import_options_dialog(mw: &MainWindow, source_path: PathBuf, from_device
 
         glib::ControlFlow::Break
     });
+}
+
+/// How many previews the review dialog shows, and their size.
+const REVIEW_PREVIEWS: usize = 120;
+const REVIEW_PREVIEW_PX: u32 = 120;
+
+/// A grid of placeholder tiles for `items` whose previews load on worker
+/// threads. Loading stops when `dialog` closes.
+fn review_preview_grid(
+    items: &[photon_import::engine::PreImportItem],
+    dialog: &Window,
+) -> gtk4::FlowBox {
+    let flow = gtk4::FlowBox::builder()
+        .selection_mode(gtk4::SelectionMode::None)
+        .homogeneous(true)
+        .max_children_per_line(12)
+        .row_spacing(6)
+        .column_spacing(6)
+        .build();
+
+    let size = REVIEW_PREVIEW_PX as i32;
+    let mut pictures = Vec::new();
+    for item in items.iter().take(REVIEW_PREVIEWS) {
+        let frame = GtkBox::new(Orientation::Vertical, 0);
+        frame.set_size_request(size, size * 3 / 4);
+        frame.set_overflow(gtk4::Overflow::Hidden);
+        frame.add_css_class("photon-tile");
+        frame.set_tooltip_text(Some(&format!("{}  ·  {}", item.filename, format_bytes(item.size_bytes))));
+        let picture = gtk4::Picture::new();
+        picture.set_content_fit(gtk4::ContentFit::Cover);
+        picture.set_can_shrink(true);
+        picture.set_vexpand(true);
+        frame.append(&picture);
+        flow.insert(&frame, -1);
+        pictures.push(picture.downgrade());
+    }
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let flag = cancelled.clone();
+    dialog.connect_destroy(move |_| flag.store(true, Ordering::Relaxed));
+
+    let (tx, rx) = async_channel::bounded::<(usize, photon_import::thumbnails::Preview)>(16);
+    let paths: Vec<PathBuf> = items.iter().take(REVIEW_PREVIEWS).map(|i| i.path.clone()).collect();
+    thread::spawn(move || {
+        let result = photon_import::thumbnails::quick_previews(
+            &paths,
+            REVIEW_PREVIEW_PX,
+            &cancelled,
+            |i, preview| {
+                let _ = tx.send_blocking((i, preview));
+            },
+        );
+        if let Err(e) = result {
+            log::warn!("Review previews failed: {e:#}");
+        }
+    });
+
+    glib::spawn_future_local(async move {
+        while let Ok((i, preview)) = rx.recv().await {
+            let Some(picture) = pictures.get(i).and_then(|p| p.upgrade()) else { continue };
+            let texture = gtk4::gdk::MemoryTexture::new(
+                preview.width as i32,
+                preview.height as i32,
+                gtk4::gdk::MemoryFormat::R8g8b8,
+                &glib::Bytes::from_owned(preview.rgb),
+                preview.width as usize * 3,
+            );
+            picture.set_paintable(Some(&texture));
+        }
+    });
+    flow
+}
+
+/// Replace the review dialog's content with an error and a Close button.
+fn show_scan_error(vbox: &GtkBox, dialog: &Window, message: &str) {
+    let title = Label::new(Some("Couldn't read this folder"));
+    title.set_css_classes(&["title-3"]);
+    title.set_halign(Align::Start);
+
+    let detail = Label::new(Some(message));
+    detail.set_wrap(true);
+    detail.set_halign(Align::Start);
+    detail.set_vexpand(true);
+    detail.set_valign(Align::Start);
+    detail.set_css_classes(&["dim-label"]);
+
+    let close = Button::with_label("Close");
+    close.set_halign(Align::End);
+    let d = dialog.clone();
+    close.connect_clicked(move |_| d.close());
+
+    vbox.append(&title);
+    vbox.append(&detail);
+    vbox.append(&close);
 }
 
 fn format_bytes(bytes: i64) -> String {

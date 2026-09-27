@@ -1,27 +1,25 @@
 //! Inline photo viewer: image-dominant with compact controls.
 //!
 //! Layout:
-//!   ┌──────────────────────────────────────────────┐
-//!   │ [←] [◂] [▸]  filename.jpg   3/42   [ℹ] [⚙] │  ← compact toolbar
-//!   ├──────────────────────────────────────────────┤
-//!   │                                              │
-//!   │              (large image)                   │
-//!   │                                              │
-//!   ├──────────────────────────────────────────────┤
-//!   │  Info panel (revealed on ℹ click)            │  ← slides up from bottom
-//!   └──────────────────────────────────────────────┘
+//!   ┌──────────────────────────────────────────────────────┐
+//!   │ [<][>]      filename.jpg          3/42   [ℹ] [✎]    │  ← compact toolbar
+//!   ├───────────────────────────────────────┬──────────────┤
+//!   │                                       │ Details      │
+//!   │            (large image)              │ Open With    │  ← info side panel
+//!   │                                       │ Sidecars     │    (toggled by ℹ / I)
+//!   │                                       │ Edit History │
+//!   └───────────────────────────────────────┴──────────────┘
 //!
-//! Keyboard: Left=prev, Right=next, Escape=back, i=toggle info
+//! Keyboard: Left=previous, Right=next, Escape=back to the grid, I=toggle info
 
 use async_channel::Sender;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box as GtkBox, Button, EventControllerKey, Label, Orientation, Picture, Revealer,
-    ScrolledWindow,
+    gio, glib, Align, Box as GtkBox, Button, EventControllerKey, GestureClick, Label, Orientation,
+    Picture, Revealer, ScrolledWindow, ToggleButton,
 };
 use photon_core::db::queries;
 use photon_core::db::Database;
-use gtk4::{gio, glib};
 use photon_core::models::{Image, Preferences, TimelineItem, UIAction};
 use photon_import::thumbnails::{thumb_path, ThumbSize, ThumbnailGenerator};
 use crate::ui::widgets::load_texture_async;
@@ -29,6 +27,10 @@ use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::process::Command;
 use std::rc::Rc;
+use std::thread;
+
+/// Width of the info side panel.
+const INFO_PANEL_WIDTH: i32 = 300;
 
 /// Build the inline viewer for `photos[index]`. Full image rows are loaded
 /// one at a time as the user steps through, so the list can be huge.
@@ -54,23 +56,58 @@ pub fn build_viewer(
     toolbar.set_margin_top(8);
     toolbar.set_margin_bottom(8);
 
-    let back_btn = Button::from_icon_name("go-previous-symbolic");
-    back_btn.add_css_class("flat");
-    back_btn.set_tooltip_text(Some("Back (Esc)"));
-
     let nav_group = GtkBox::new(Orientation::Horizontal, 0);
     nav_group.add_css_class("linked");
 
-    let prev_btn = Button::from_icon_name("go-up-symbolic");
+    let prev_btn = Button::from_icon_name("go-previous-symbolic");
     prev_btn.add_css_class("flat");
     prev_btn.set_tooltip_text(Some("Previous (←)"));
 
-    let next_btn = Button::from_icon_name("go-down-symbolic");
+    let next_btn = Button::from_icon_name("go-next-symbolic");
     next_btn.add_css_class("flat");
     next_btn.set_tooltip_text(Some("Next (→)"));
 
     nav_group.append(&prev_btn);
     nav_group.append(&next_btn);
+
+    // Culling button group
+    let cull_group = GtkBox::new(Orientation::Horizontal, 0);
+    cull_group.add_css_class("linked");
+
+    let pick_btn = Button::from_icon_name("emblem-ok-symbolic");
+    pick_btn.add_css_class("flat");
+    pick_btn.set_tooltip_text(Some("Pick (P)"));
+
+    let reject_btn = Button::from_icon_name("process-stop-symbolic");
+    reject_btn.add_css_class("flat");
+    reject_btn.set_tooltip_text(Some("Reject (X)"));
+
+    let unflag_btn = Button::from_icon_name("view-refresh-symbolic");
+    unflag_btn.add_css_class("flat");
+    unflag_btn.set_tooltip_text(Some("Unflag (U)"));
+
+    cull_group.append(&pick_btn);
+    cull_group.append(&reject_btn);
+    cull_group.append(&unflag_btn);
+
+    // Star rating pill
+    let rating_btn = Button::with_label("★ 0");
+    rating_btn.add_css_class("flat");
+    rating_btn.set_tooltip_text(Some("Rating (1-5, 0 to clear)"));
+
+    // Zoom 1:1 button
+    let zoom_btn = ToggleButton::builder()
+        .icon_name("zoom-original-symbolic")
+        .tooltip_text("1:1 Pixel Zoom (Z)")
+        .build();
+    zoom_btn.add_css_class("flat");
+
+    // Compare button
+    let compare_btn = ToggleButton::builder()
+        .icon_name("view-dual-symbolic")
+        .tooltip_text("Side-by-side Compare (C)")
+        .build();
+    compare_btn.add_css_class("flat");
 
     let filename_label = Label::new(None);
     filename_label.set_hexpand(true);
@@ -82,56 +119,78 @@ pub fn build_viewer(
     counter_label.set_css_classes(&["photon-badge"]);
     counter_label.set_margin_end(8);
 
-    let info_btn = Button::from_icon_name("dialog-information-symbolic");
+    let info_btn = ToggleButton::builder()
+        .icon_name("dialog-information-symbolic")
+        .tooltip_text("Show details (I)")
+        .active(true)
+        .build();
     info_btn.add_css_class("flat");
-    info_btn.set_tooltip_text(Some("Toggle info (I)"));
 
     let open_btn = Button::from_icon_name("document-edit-symbolic");
     open_btn.add_css_class("flat");
     open_btn.set_tooltip_text(Some("Open in editor"));
 
-    toolbar.append(&back_btn);
     toolbar.append(&nav_group);
+    toolbar.append(&cull_group);
+    toolbar.append(&rating_btn);
+    toolbar.append(&zoom_btn);
+    toolbar.append(&compare_btn);
     toolbar.append(&filename_label);
     toolbar.append(&counter_label);
     toolbar.append(&info_btn);
     toolbar.append(&open_btn);
     root.append(&toolbar);
 
-    // ── Image area (takes all remaining space) ──────────
+    // ── Body: image | info side panel ───────────────────
+    let body = GtkBox::new(Orientation::Horizontal, 0);
+    body.set_vexpand(true);
+    root.append(&body);
+
     let image_box = GtkBox::new(Orientation::Vertical, 0);
     image_box.set_vexpand(true);
     image_box.set_hexpand(true);
-    root.append(&image_box);
+    body.append(&image_box);
 
-    // ── Info panel (revealed from bottom) ───────────────
     let info_revealer = Revealer::new();
-    info_revealer.set_transition_type(gtk4::RevealerTransitionType::SlideUp);
-    info_revealer.set_reveal_child(false);
+    info_revealer.set_transition_type(gtk4::RevealerTransitionType::SlideLeft);
+    info_revealer.set_reveal_child(true);
 
     let info_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(gtk4::PolicyType::Never)
-        .max_content_height(260)
-        .min_content_height(150)
+        .min_content_width(INFO_PANEL_WIDTH)
+        .vexpand(true)
         .build();
+    info_scroll.add_css_class("info-panel");
     let info_box = GtkBox::new(Orientation::Vertical, 6);
-    info_box.set_margin_top(12);
-    info_box.set_margin_bottom(12);
+    info_box.set_margin_top(16);
+    info_box.set_margin_bottom(16);
     info_box.set_margin_start(16);
     info_box.set_margin_end(16);
-    info_box.add_css_class("card");
-    info_box.add_css_class("info-sheet");
     info_scroll.set_child(Some(&info_box));
     info_revealer.set_child(Some(&info_scroll));
-    root.append(&info_revealer);
+    body.append(&info_revealer);
 
     // ── Showing a photo ─────────────────────────────────
-    // Closures hold widgets weakly: the buttons own these closures, so strong
-    // references would form cycles and leak every viewer ever opened.
     let current_idx = Rc::new(Cell::new(index));
     let current_image: Rc<RefCell<Option<Image>>> = Rc::new(RefCell::new(None));
+    let is_zoomed = Rc::new(Cell::new(false));
+    let is_comparing = Rc::new(Cell::new(false));
     let cache = cache_dir.to_path_buf();
     let prefs = Rc::new(prefs.clone());
+
+    let toggle_zoom: Rc<dyn Fn()> = {
+        let zoom_btn = zoom_btn.clone();
+        Rc::new(move || {
+            zoom_btn.set_active(!zoom_btn.is_active());
+        })
+    };
+
+    let toggle_compare: Rc<dyn Fn()> = {
+        let compare_btn = compare_btn.clone();
+        Rc::new(move || {
+            compare_btn.set_active(!compare_btn.is_active());
+        })
+    };
 
     let show: Rc<dyn Fn(usize)> = Rc::new(glib::clone!(
         #[weak] image_box,
@@ -140,9 +199,15 @@ pub fn build_viewer(
         #[weak] counter_label,
         #[weak] prev_btn,
         #[weak] next_btn,
+        #[weak] rating_btn,
+        #[weak] pick_btn,
+        #[weak] reject_btn,
         #[strong] photos,
         #[strong] current_idx,
         #[strong] current_image,
+        #[strong] is_zoomed,
+        #[strong] is_comparing,
+        #[strong] toggle_zoom,
         #[strong] prefs,
         #[strong] db,
         move |i: usize| {
@@ -158,8 +223,39 @@ pub fn build_viewer(
                 .and_then(|c| queries::get_image(&c, item.id).ok().flatten());
             match &image {
                 Some(img) => {
-                    filename_label.set_text(&img.filename);
-                    render_photo(&image_box, &info_box, img, &cache, &prefs, &db);
+                    rating_btn.set_label(&format!("★ {}", img.rating));
+                    if img.flagged == 1 {
+                        pick_btn.add_css_class("suggested-action");
+                        reject_btn.remove_css_class("destructive-action");
+                    } else if img.flagged == -1 {
+                        pick_btn.remove_css_class("suggested-action");
+                        reject_btn.add_css_class("destructive-action");
+                    } else {
+                        pick_btn.remove_css_class("suggested-action");
+                        reject_btn.remove_css_class("destructive-action");
+                    }
+
+                    if is_comparing.get() {
+                        let next_idx = if i + 1 < photos.len() { i + 1 } else { i.saturating_sub(1) };
+                        let image_b = if next_idx != i {
+                            db.conn()
+                                .ok()
+                                .and_then(|c| queries::get_image(&c, photos[next_idx].id).ok().flatten())
+                        } else {
+                            None
+                        };
+
+                        if let Some(img_b) = image_b {
+                            filename_label.set_text(&format!("{}  vs  {}", img.filename, img_b.filename));
+                            render_compare(&image_box, &info_box, img, &img_b, &cache, &prefs, &db);
+                        } else {
+                            filename_label.set_text(&img.filename);
+                            render_photo(&image_box, &info_box, img, &cache, &prefs, &db, is_zoomed.get(), toggle_zoom.clone());
+                        }
+                    } else {
+                        filename_label.set_text(&img.filename);
+                        render_photo(&image_box, &info_box, img, &cache, &prefs, &db, is_zoomed.get(), toggle_zoom.clone());
+                    }
                 }
                 None => {
                     filename_label.set_text("Photo no longer in library");
@@ -184,17 +280,77 @@ pub fn build_viewer(
         })
     };
 
+    let update_cull = {
+        let db = db.clone();
+        let photos = photos.clone();
+        let current_idx = current_idx.clone();
+        let current_image = current_image.clone();
+        let show = show.clone();
+        Rc::new(move |new_rating: Option<i32>, new_flag: Option<i32>| {
+            let idx = current_idx.get();
+            let Some(item) = photos.get(idx) else { return };
+            let img_id = item.id;
+
+            if let Some(img) = current_image.borrow_mut().as_mut() {
+                if let Some(r) = new_rating {
+                    img.rating = r;
+                }
+                if let Some(f) = new_flag {
+                    img.flagged = f;
+                }
+            }
+
+            let db = db.clone();
+            thread::spawn(move || {
+                if let Ok(mut conn) = db.conn() {
+                    if let Some(r) = new_rating {
+                        let _ = queries::set_rating(&mut conn, img_id, r);
+                    }
+                    if let Some(f) = new_flag {
+                        let _ = queries::set_flag(&mut conn, img_id, f);
+                    }
+                }
+            });
+
+            show(idx);
+        })
+    };
+
     // ── Buttons ─────────────────────────────────────────
-    let tx_back = nav_tx.clone();
-    let back = back_action.clone();
-    back_btn.connect_clicked(move |_| {
-        let _ = tx_back.send_blocking(back.clone());
+    info_btn.connect_toggled(glib::clone!(
+        #[weak] info_revealer,
+        move |btn| info_revealer.set_reveal_child(btn.is_active())
+    ));
+
+    let uc = update_cull.clone();
+    pick_btn.connect_clicked(move |_| uc(None, Some(1)));
+    let uc = update_cull.clone();
+    reject_btn.connect_clicked(move |_| uc(None, Some(-1)));
+    let uc = update_cull.clone();
+    unflag_btn.connect_clicked(move |_| uc(None, Some(0)));
+
+    let uc = update_cull.clone();
+    let img_c = current_image.clone();
+    rating_btn.connect_clicked(move |_| {
+        let cur = img_c.borrow().as_ref().map(|i| i.rating).unwrap_or(0);
+        uc(Some((cur + 1) % 6), None);
     });
 
-    info_btn.connect_clicked(glib::clone!(
-        #[weak] info_revealer,
-        move |_| info_revealer.set_reveal_child(!info_revealer.reveals_child())
-    ));
+    let s = show.clone();
+    let ci = current_idx.clone();
+    let iz = is_zoomed.clone();
+    zoom_btn.connect_toggled(move |btn| {
+        iz.set(btn.is_active());
+        s(ci.get());
+    });
+
+    let s = show.clone();
+    let ci = current_idx.clone();
+    let ic = is_comparing.clone();
+    compare_btn.connect_toggled(move |btn| {
+        ic.set(btn.is_active());
+        s(ci.get());
+    });
 
     let db_open = db.clone();
     let prefs_open = prefs.clone();
@@ -214,9 +370,14 @@ pub fn build_viewer(
     let key_ctrl = EventControllerKey::new();
     let tx_esc = nav_tx.clone();
     key_ctrl.connect_key_pressed(glib::clone!(
-        #[weak] info_revealer,
+        #[weak] info_btn,
+        #[strong] toggle_zoom,
+        #[strong] toggle_compare,
+        #[strong] update_cull,
+        #[strong] step,
         #[upgrade_or] glib::Propagation::Proceed,
-        move |_, key, _, _| {
+        move |_, key, _, state| {
+            let is_shift = state.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
             match key {
                 gtk4::gdk::Key::Escape => {
                     let _ = tx_esc.send_blocking(back_action.clone());
@@ -224,7 +385,67 @@ pub fn build_viewer(
                 gtk4::gdk::Key::Left => step(-1),
                 gtk4::gdk::Key::Right => step(1),
                 gtk4::gdk::Key::i | gtk4::gdk::Key::I => {
-                    info_revealer.set_reveal_child(!info_revealer.reveals_child());
+                    info_btn.set_active(!info_btn.is_active());
+                }
+                gtk4::gdk::Key::z | gtk4::gdk::Key::Z => {
+                    toggle_zoom();
+                }
+                gtk4::gdk::Key::c | gtk4::gdk::Key::C => {
+                    toggle_compare();
+                }
+                gtk4::gdk::Key::_1 | gtk4::gdk::Key::KP_1 | gtk4::gdk::Key::exclam => {
+                    update_cull(Some(1), None);
+                    if is_shift {
+                        step(1);
+                    }
+                }
+                gtk4::gdk::Key::_2 | gtk4::gdk::Key::KP_2 | gtk4::gdk::Key::at => {
+                    update_cull(Some(2), None);
+                    if is_shift {
+                        step(1);
+                    }
+                }
+                gtk4::gdk::Key::_3 | gtk4::gdk::Key::KP_3 | gtk4::gdk::Key::numbersign => {
+                    update_cull(Some(3), None);
+                    if is_shift {
+                        step(1);
+                    }
+                }
+                gtk4::gdk::Key::_4 | gtk4::gdk::Key::KP_4 | gtk4::gdk::Key::dollar => {
+                    update_cull(Some(4), None);
+                    if is_shift {
+                        step(1);
+                    }
+                }
+                gtk4::gdk::Key::_5 | gtk4::gdk::Key::KP_5 | gtk4::gdk::Key::percent => {
+                    update_cull(Some(5), None);
+                    if is_shift {
+                        step(1);
+                    }
+                }
+                gtk4::gdk::Key::_0 | gtk4::gdk::Key::KP_0 | gtk4::gdk::Key::parenright | gtk4::gdk::Key::grave | gtk4::gdk::Key::asciitilde => {
+                    update_cull(Some(0), None);
+                    if is_shift {
+                        step(1);
+                    }
+                }
+                gtk4::gdk::Key::p | gtk4::gdk::Key::P => {
+                    update_cull(None, Some(1));
+                    if is_shift {
+                        step(1);
+                    }
+                }
+                gtk4::gdk::Key::x | gtk4::gdk::Key::X => {
+                    update_cull(None, Some(-1));
+                    if is_shift {
+                        step(1);
+                    }
+                }
+                gtk4::gdk::Key::u | gtk4::gdk::Key::U => {
+                    update_cull(None, Some(0));
+                    if is_shift {
+                        step(1);
+                    }
                 }
                 _ => return glib::Propagation::Proceed,
             }
@@ -254,13 +475,13 @@ fn render_photo(
     cache_dir: &Path,
     prefs: &Preferences,
     db: &Database,
+    is_zoomed: bool,
+    on_toggle_zoom: Rc<dyn Fn()>,
 ) {
     clear(image_box);
     clear(info_box);
 
     // ── Large image ─────────────────────────────────────
-    // Show the cached large preview if there is one; otherwise show the grid
-    // thumbnail now and swap in the large preview once it's generated.
     let large = thumb_path(cache_dir, ThumbSize::Large, &image.hash);
     let grid = thumb_path(cache_dir, ThumbSize::Grid, &image.hash);
     let picture = Picture::new();
@@ -268,18 +489,45 @@ fn render_photo(
         load_texture_async(&picture, &large);
     } else {
         if grid.exists() {
-            picture.set_filename(Some(&grid)); // small: fine to decode inline
+            picture.set_filename(Some(&grid));
         }
         load_large_preview(&picture, image, cache_dir);
     }
-    picture.set_content_fit(gtk4::ContentFit::Contain);
-    picture.set_can_shrink(true);
-    picture.set_hexpand(true);
-    picture.set_vexpand(true);
-    image_box.append(&picture);
 
-    // ── Info panel content (horizontal: metadata | open-with | group/history) ─
-    let columns = GtkBox::new(Orientation::Horizontal, 24);
+    let scrolled = ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .hscrollbar_policy(if is_zoomed { gtk4::PolicyType::Automatic } else { gtk4::PolicyType::Never })
+        .vscrollbar_policy(if is_zoomed { gtk4::PolicyType::Automatic } else { gtk4::PolicyType::Never })
+        .build();
+
+    if is_zoomed {
+        let w = image.width.unwrap_or(2000) as i32;
+        let h = image.height.unwrap_or(1500) as i32;
+        picture.set_size_request(w, h);
+        picture.set_content_fit(gtk4::ContentFit::Fill);
+    } else {
+        picture.set_size_request(-1, -1);
+        picture.set_content_fit(gtk4::ContentFit::Contain);
+        picture.set_can_shrink(true);
+        picture.set_hexpand(true);
+        picture.set_vexpand(true);
+    }
+
+    let click = GestureClick::new();
+    let otz = on_toggle_zoom.clone();
+    click.connect_released(move |_, n_press, _, _| {
+        if n_press == 2 {
+            otz();
+        }
+    });
+    scrolled.add_controller(click);
+
+    scrolled.set_child(Some(&picture));
+    image_box.append(&scrolled);
+
+    // ── Info panel content: sections stacked vertically ─
+    let columns = GtkBox::new(Orientation::Vertical, 20);
 
     // Column 1: Metadata
     let meta_col = GtkBox::new(Orientation::Vertical, 3);
@@ -526,17 +774,23 @@ fn open_in_editor(image: &Image, prefs: &Preferences, db: &Database) {
 // ── Helpers ──────────────────────────────────────────────
 
 fn add_row(container: &GtkBox, label: &str, value: &str) {
-    let row = GtkBox::new(Orientation::Horizontal, 6);
+    let row = GtkBox::new(Orientation::Horizontal, 8);
     let lbl = Label::new(Some(label));
     lbl.set_css_classes(&["dim-label"]);
-    lbl.set_halign(Align::Start);
+    lbl.set_valign(Align::Start);
     lbl.set_width_chars(7);
     lbl.set_xalign(0.0);
+    // Narrow panel: wrap long values (paths) anywhere instead of cutting them.
     let val = Label::new(Some(value));
-    val.set_halign(Align::Start);
-    val.set_wrap(true);
+    val.set_hexpand(true);
     val.set_xalign(0.0);
-    val.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+    val.set_wrap(true);
+    val.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+    // A wrapping label's natural width is its unwrapped text; cap it so long
+    // values wrap inside the panel instead of widening it.
+    val.set_max_width_chars(24);
+    val.set_selectable(true);
+    val.set_can_focus(false);
     row.append(&lbl);
     row.append(&val);
     container.append(&row);
@@ -568,4 +822,76 @@ fn format_size(bytes: i64) -> String {
     } else {
         format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
     }
+}
+
+fn render_compare(
+    image_box: &GtkBox,
+    info_box: &GtkBox,
+    img_a: &Image,
+    img_b: &Image,
+    cache_dir: &Path,
+    _prefs: &Preferences,
+    _db: &Database,
+) {
+    clear(image_box);
+    clear(info_box);
+
+    let split_box = GtkBox::new(Orientation::Horizontal, 12);
+    split_box.set_hexpand(true);
+    split_box.set_vexpand(true);
+    split_box.set_homogeneous(true);
+
+    // Left pane (Image A)
+    let left_box = GtkBox::new(Orientation::Vertical, 6);
+    let pic_a = Picture::new();
+    let large_a = thumb_path(cache_dir, ThumbSize::Large, &img_a.hash);
+    if large_a.exists() {
+        load_texture_async(&pic_a, &large_a);
+    } else {
+        load_large_preview(&pic_a, img_a, cache_dir);
+    }
+    pic_a.set_content_fit(gtk4::ContentFit::Contain);
+    pic_a.set_can_shrink(true);
+    pic_a.set_hexpand(true);
+    pic_a.set_vexpand(true);
+
+    let flag_str_a = match img_a.flagged {
+        1 => " [Pick ✓]",
+        -1 => " [Reject ✕]",
+        _ => "",
+    };
+    let lbl_a = Label::new(Some(&format!("A: {} (★ {}){}", img_a.filename, img_a.rating, flag_str_a)));
+    lbl_a.add_css_class("heading");
+    lbl_a.set_halign(Align::Center);
+    left_box.append(&lbl_a);
+    left_box.append(&pic_a);
+    split_box.append(&left_box);
+
+    // Right pane (Image B)
+    let right_box = GtkBox::new(Orientation::Vertical, 6);
+    let pic_b = Picture::new();
+    let large_b = thumb_path(cache_dir, ThumbSize::Large, &img_b.hash);
+    if large_b.exists() {
+        load_texture_async(&pic_b, &large_b);
+    } else {
+        load_large_preview(&pic_b, img_b, cache_dir);
+    }
+    pic_b.set_content_fit(gtk4::ContentFit::Contain);
+    pic_b.set_can_shrink(true);
+    pic_b.set_hexpand(true);
+    pic_b.set_vexpand(true);
+
+    let flag_str_b = match img_b.flagged {
+        1 => " [Pick ✓]",
+        -1 => " [Reject ✕]",
+        _ => "",
+    };
+    let lbl_b = Label::new(Some(&format!("B: {} (★ {}){}", img_b.filename, img_b.rating, flag_str_b)));
+    lbl_b.add_css_class("heading");
+    lbl_b.set_halign(Align::Center);
+    right_box.append(&lbl_b);
+    right_box.append(&pic_b);
+    split_box.append(&right_box);
+
+    image_box.append(&split_box);
 }
