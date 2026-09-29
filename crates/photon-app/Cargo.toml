@@ -2,10 +2,23 @@
 name = "photon-app"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "Fast, modern photo management application for GNOME"
 
 [[bin]]
 name = "photon"
 path = "src/main.rs"
+
+[package.metadata.generate-rpm]
+name = "photon"
+summary = "Fast, modern photo management application for GNOME"
+license = "GPL-3.0-or-later"
+assets = [
+    { source = "target/release/photon", dest = "/usr/bin/photon", mode = "755" },
+    { source = "assets/org.mavensgroup.photon.desktop", dest = "/usr/share/applications/org.mavensgroup.photon.desktop", mode = "644" },
+    { source = "assets/org.mavensgroup.photon.svg", dest = "/usr/share/icons/hicolor/scalable/apps/org.mavensgroup.photon.svg", mode = "644" }
+]
+auto-req = "yes"
 
 [dependencies]
 photon-core = { path = "../photon-core" }

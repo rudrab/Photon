@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg
+   width="256"
+   height="256"
+   viewBox="0 0 256 256"
+   version="1.1"
+   id="svg_photon"
+   xmlns="http://www.w3.org/2000/svg">
+  <defs id="defs1">
+    <!-- Aperture Iris Mask with transparent mechanical blade gaps -->
+    <mask id="iris_mask">
+      <rect x="0" y="0" width="256" height="256" fill="#ffffff" />
+      <!-- Central Hexagonal Aperture Cutout -->
+      <path d="M 162.64,128.00 L 145.32,158.00 L 110.68,158.00 L 93.36,128.00 L 110.68,98.00 L 145.32,98.00 Z" fill="#000000" />
+      <!-- Tangential Slit Cuts (3.6px matching Mavens suite signature stroke) -->
+      <g stroke="#000000" stroke-width="3.6" stroke-linecap="round">
+        <line x1="162.64" y1="128.00" x2="113.68" y2="212.80" />
+        <line x1="145.32" y1="158.00" x2="47.40" y2="158.00" />
+        <line x1="110.68" y1="158.00" x2="61.72" y2="73.20" />
+        <line x1="93.36" y1="128.00" x2="142.32" y2="43.20" />
+        <line x1="110.68" y1="98.00" x2="208.60" y2="98.00" />
+        <line x1="145.32" y1="98.00" x2="194.28" y2="182.80" />
+      </g>
+    </mask>
+  </defs>
+
+  <!-- Material 3 / GNOME HIG duo-tone solar/amber circular base -->
+  <path
+     id="bg_top"
+     style="fill:#e65100;fill-opacity:1;stroke:none;stroke-width:8.40421;stroke-linejoin:round"
+     d="M 256,-128 A 128,128 0 0 1 192,-17.148747 128,128 0 0 1 63.999997,-17.14875 128,128 0 0 1 0,-128 h 128 z"
+     transform="scale(1,-1)" />
+  <path
+     id="bg_bottom"
+     style="fill:#fb8c00;fill-opacity:1;stroke:none;stroke-width:8.40421;stroke-linejoin:round"
+     d="m 256,128 a 128,128 0 0 1 -64,110.85125 128,128 0 0 1 -128.000003,0 A 128,128 0 0 1 0,128 h 128 z" />
+
+  <!-- Outer Lens Barrel Rings (3.6px / 1.5px matching suite weight) -->
+  <circle cx="128" cy="128" r="96" style="stroke:#ffffff;stroke-width:3.6;stroke-linecap:round;stroke-linejoin:round;fill:none;opacity:0.95" />
+  <circle cx="128" cy="128" r="90" style="stroke:#ffffff;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;fill:none;opacity:0.5" />
+
+  <!-- Lens Index & Calibration Markings (Focal alignment ticks) -->
+  <g id="index_marks" style="stroke:#ffffff;stroke-width:2.4;stroke-linecap:round;opacity:0.85">
+    <line x1="128" y1="20" x2="128" y2="28" />
+    <line x1="128" y1="228" x2="128" y2="236" />
+    <line x1="20" y1="128" x2="28" y2="128" />
+    <line x1="228" y1="128" x2="236" y2="128" />
+    <!-- Diagonal 45-degree ticks -->
+    <line x1="51.8" y1="51.8" x2="57.4" y2="57.4" />
+    <line x1="204.2" y1="51.8" x2="198.6" y2="57.4" />
+    <line x1="51.8" y1="204.2" x2="57.4" y2="198.6" />
+    <line x1="204.2" y1="204.2" x2="198.6" y2="198.6" />
+  </g>
+
+  <!-- Masked Pure White Aperture Iris Assembly (#ffffff) -->
+  <circle cx="128" cy="128" r="86" fill="#ffffff" mask="url(#iris_mask)" />
+
+  <!-- Central Radiant Photon Light Emitter / Optical Spark -->
+  <g id="photon_core" style="fill:#ffffff;">
+    <!-- 4-point primary photon ray starburst -->
+    <path d="M 128,111 Q 128,128 111,128 Q 128,128 128,145 Q 128,128 145,128 Q 128,128 128,111 Z" />
+    <!-- Secondary diagonal photon flare (smaller 4-point star) -->
+    <path d="M 128,119 Q 128,128 119,128 Q 128,128 128,137 Q 128,128 137,128 Q 128,128 128,119 Z" transform="rotate(45 128 128)" opacity="0.85" />
+    <!-- Center focal node -->
+    <circle cx="128" cy="128" r="2.8" />
+  </g>
+
+  <!-- Optical Lens Coating Reflection Arc (3.6px stroke) -->
+  <path d="M 68,72 A 78 78 0 0 1 156,52" style="stroke:#ffffff;stroke-width:3.6;stroke-linecap:round;fill:none;opacity:0.85" />
+  <circle cx="168" cy="168" r="3.2" style="fill:#ffffff;opacity:0.85" />
+</svg>
