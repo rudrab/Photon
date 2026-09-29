@@ -13,7 +13,10 @@ use crate::menu;
 use crate::ui::detail;
 use crate::ui::preferences;
 use crate::ui::selection_bar;
+use crate::ui::share;
+use crate::ui::shortcuts;
 use crate::ui::sidebar;
+use crate::ui::slideshow;
 use crate::ui::timeline::Timeline;
 use crate::ui::widgets::EventCard;
 use async_channel;
@@ -21,12 +24,12 @@ use chrono::Datelike;
 use gtk4::prelude::*;
 use gtk4::{gio, glib};
 use gtk4::{
-    Align, Box as GtkBox, Button, Label, MenuButton, Orientation, Paned,
-    ProgressBar, Revealer, ScrolledWindow, Stack, ToggleButton,
+    Align, Box as GtkBox, Button, FileChooserAction, FileChooserNative, Label, MenuButton,
+    Orientation, Paned, ProgressBar, ResponseType, Revealer, ScrolledWindow, Stack, ToggleButton,
 };
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use photon_core::db::queries::{self, TimelineFilter};
+use photon_core::db::queries::{self, RatingFilter, TimelineFilter};
 use photon_core::db::Database;
 use photon_core::models::{Image, Preferences, TimelineItem, UIAction};
 use photon_import::ImportEngine;
@@ -59,10 +62,23 @@ pub struct MainWindow {
     /// What the timeline currently shows, and whether the library changed since.
     timeline_filter: Rc<RefCell<Option<TimelineFilter>>>,
     timeline_stale: Rc<Cell<bool>>,
-    pub cull_min_rating: Rc<Cell<i32>>,
+    pub rating_filter: Rc<Cell<RatingFilter>>,
     pub cull_flag: Rc<Cell<Option<i32>>>,
+    /// Names the active rating/flag filter on the header bar's filter button.
+    filter_label: Label,
     pub sidebar: sidebar::Sidebar,
+    toasts: adw::ToastOverlay,
+    pub undo_manager: Rc<RefCell<crate::ui::undo::UndoManager>>,
+    pub current_album_id: Rc<RefCell<Option<i64>>>,
+    pub bottom_bar: Rc<RefCell<Option<selection_bar::BottomBarHandle>>>,
+    /// When the last library check (missing files, changed sidecars) started,
+    /// and whether one is running.
+    library_check: Rc<Cell<(Option<std::time::Instant>, bool)>>,
 }
+
+/// Coming back to Photon from darktable re-reads changed sidecars, at most
+/// this often.
+const LIBRARY_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl MainWindow {
     pub fn new(
@@ -79,7 +95,9 @@ impl MainWindow {
             .build();
 
         let root_box = GtkBox::new(Orientation::Vertical, 0);
-        window.set_content(Some(&root_box));
+        let toasts = adw::ToastOverlay::new();
+        toasts.set_child(Some(&root_box));
+        window.set_content(Some(&toasts));
 
         // ── Header Bar (GNOME HIG) ──────────────────────────
         let header_bar = adw::HeaderBar::new();
@@ -117,12 +135,25 @@ impl MainWindow {
         menu_btn.add_css_class("flat");
         header_bar.pack_end(&menu_btn);
 
+        // Star icon + a label naming the active filter, so a filtered
+        // timeline is never mistaken for the whole library.
+        let filter_label = Label::new(Some("All"));
+        let filter_content = GtkBox::new(Orientation::Horizontal, 6);
+        filter_content.append(&gtk4::Image::from_icon_name("starred-symbolic"));
+        filter_content.append(&filter_label);
         let filter_btn = MenuButton::builder()
-            .icon_name("view-filter-symbolic")
-            .tooltip_text("Filter & Grid Options")
+            .child(&filter_content)
+            .tooltip_text("Filter by Rating & Flag, Grid Density")
             .build();
         filter_btn.add_css_class("flat");
         header_bar.pack_end(&filter_btn);
+
+        let select_btn = ToggleButton::builder()
+            .icon_name("selection-mode-symbolic")
+            .tooltip_text("Select Photos")
+            .build();
+        select_btn.add_css_class("flat");
+        header_bar.pack_end(&select_btn);
 
         let search_btn = ToggleButton::builder()
             .icon_name("system-search-symbolic")
@@ -173,7 +204,7 @@ impl MainWindow {
         });
 
         // ── Filter Popover ──────────────────────────────
-        let cull_min_rating = Rc::new(Cell::new(0));
+        let rating_filter = Rc::new(Cell::new(RatingFilter::Any));
         let cull_flag = Rc::new(Cell::new(None));
 
         let popover = gtk4::Popover::new();
@@ -191,19 +222,20 @@ impl MainWindow {
         let rating_box = GtkBox::new(Orientation::Horizontal, 0);
         rating_box.add_css_class("linked");
         let ratings = [
-            ("Any", 0),
-            ("★ 1+", 1),
-            ("★ 2+", 2),
-            ("★ 3+", 3),
-            ("★ 4+", 4),
-            ("★ 5", 5),
+            ("Any", RatingFilter::Any),
+            ("Unrated", RatingFilter::Unrated),
+            ("★ 1+", RatingFilter::AtLeast(1)),
+            ("★ 2+", RatingFilter::AtLeast(2)),
+            ("★ 3+", RatingFilter::AtLeast(3)),
+            ("★ 4+", RatingFilter::AtLeast(4)),
+            ("★ 5", RatingFilter::AtLeast(5)),
         ];
-        let mut rating_btns = Vec::new();
+        let mut rating_btns: Vec<(ToggleButton, RatingFilter)> = Vec::new();
         for (label, val) in ratings {
-            let b = Button::with_label(label);
-            b.add_css_class("flat");
-            if val == 0 {
-                b.add_css_class("suggested-action");
+            let b = ToggleButton::with_label(label);
+            b.set_active(val == RatingFilter::Any);
+            if let Some((first, _)) = rating_btns.first() {
+                b.set_group(Some(first));
             }
             rating_box.append(&b);
             rating_btns.push((b, val));
@@ -223,12 +255,12 @@ impl MainWindow {
             ("Unflagged", Some(0)),
             ("Rejects", Some(-1)),
         ];
-        let mut flag_btns = Vec::new();
+        let mut flag_btns: Vec<(ToggleButton, Option<i32>)> = Vec::new();
         for (label, val) in flags {
-            let b = Button::with_label(label);
-            b.add_css_class("flat");
-            if val.is_none() {
-                b.add_css_class("suggested-action");
+            let b = ToggleButton::with_label(label);
+            b.set_active(val.is_none());
+            if let Some((first, _)) = flag_btns.first() {
+                b.set_group(Some(first));
             }
             status_box.append(&b);
             flag_btns.push((b, val));
@@ -351,42 +383,40 @@ impl MainWindow {
             timeline,
             timeline_filter: Rc::new(RefCell::new(None)),
             timeline_stale: Rc::new(Cell::new(true)),
-            cull_min_rating,
+            library_check: Rc::new(Cell::new((None, false))),
+            rating_filter,
             cull_flag,
+            filter_label,
             sidebar: sidebar_handle,
+            toasts,
+            undo_manager: Rc::new(RefCell::new(crate::ui::undo::UndoManager::new())),
+            current_album_id: Rc::new(RefCell::new(None)),
+            bottom_bar: Rc::new(RefCell::new(None)),
         };
 
-        let mw_f = mw.clone();
-        for (b, val) in &rating_btns {
-            let b_clone = b.clone();
-            let all_b: Vec<_> = rating_btns.iter().map(|(btn, _)| btn.clone()).collect();
-            let mw_f = mw_f.clone();
-            let val = *val;
-            b.connect_clicked(move |_| {
-                for other in &all_b {
-                    other.remove_css_class("suggested-action");
+        let mw_t_ref = mw.clone();
+        mw.timeline.connect_refresh(move || mw_t_ref.refresh());
+        let mw_t_ss = mw.clone();
+        mw.timeline.connect_start_slideshow(move || mw_t_ss.start_slideshow());
+        mw.timeline.set_undo_manager(mw.undo_manager.clone());
+
+        for (b, val) in rating_btns {
+            let mw_f = mw.clone();
+            b.connect_toggled(move |b| {
+                if b.is_active() {
+                    mw_f.rating_filter.set(val);
+                    mw_f.filters_changed();
                 }
-                b_clone.add_css_class("suggested-action");
-                mw_f.cull_min_rating.set(val);
-                mw_f.timeline_stale.set(true);
-                mw_f.refresh();
             });
         }
 
-        let mw_f = mw.clone();
-        for (b, val) in &flag_btns {
-            let b_clone = b.clone();
-            let all_b: Vec<_> = flag_btns.iter().map(|(btn, _)| btn.clone()).collect();
-            let mw_f = mw_f.clone();
-            let val = *val;
-            b.connect_clicked(move |_| {
-                for other in &all_b {
-                    other.remove_css_class("suggested-action");
+        for (b, val) in flag_btns {
+            let mw_f = mw.clone();
+            b.connect_toggled(move |b| {
+                if b.is_active() {
+                    mw_f.cull_flag.set(val);
+                    mw_f.filters_changed();
                 }
-                b_clone.add_css_class("suggested-action");
-                mw_f.cull_flag.set(val);
-                mw_f.timeline_stale.set(true);
-                mw_f.refresh();
             });
         }
 
@@ -402,6 +432,7 @@ impl MainWindow {
                 }
                 b_clone.add_css_class("suggested-action");
                 mw_f.timeline.set_row_height(val);
+                mw_f.set_bottom_bar_zoom(val);
             });
         }
 
@@ -419,6 +450,21 @@ impl MainWindow {
         act_refresh.connect_activate(move |_, _| mw_r.refresh());
         mw.window.add_action(&act_refresh);
 
+        let mw_u = mw.clone();
+        let act_undo = gio::SimpleAction::new("undo", None);
+        act_undo.connect_activate(move |_, _| mw_u.undo());
+        mw.window.add_action(&act_undo);
+
+        let mw_redo = mw.clone();
+        let act_redo = gio::SimpleAction::new("redo", None);
+        act_redo.connect_activate(move |_, _| mw_redo.redo());
+        mw.window.add_action(&act_redo);
+
+        let mw_ss = mw.clone();
+        let act_slideshow = gio::SimpleAction::new("slideshow", None);
+        act_slideshow.connect_activate(move |_, _| mw_ss.start_slideshow());
+        mw.window.add_action(&act_slideshow);
+
         let mw_i = mw.clone();
         let act_import = gio::SimpleAction::new("import_folder", None);
         act_import.connect_activate(move |_, _| import_handler::show_folder_import_dialog(&mw_i));
@@ -435,6 +481,21 @@ impl MainWindow {
         act_camera
             .connect_activate(move |_, _| import_handler::show_camera_import_dialog(&mw_cam));
         mw.window.add_action(&act_camera);
+
+        let mw_dk = mw.clone();
+        let act_digikam = gio::SimpleAction::new("import_digikam", None);
+        act_digikam.connect_activate(move |_, _| import_handler::show_digikam_import_dialog(&mw_dk));
+        mw.window.add_action(&act_digikam);
+
+        let win_keys = mw.window.clone();
+        let act_shortcuts = gio::SimpleAction::new("shortcuts", None);
+        act_shortcuts.connect_activate(move |_, _| shortcuts::show(&win_keys));
+        mw.window.add_action(&act_shortcuts);
+
+        let mw_loc = mw.clone();
+        let act_locate = gio::SimpleAction::new("locate_folder", None);
+        act_locate.connect_activate(move |_, _| mw_loc.locate_missing_folder());
+        mw.window.add_action(&act_locate);
 
         // ── Preferences ─────────────────────────────────
         let mw_p = mw.clone();
@@ -457,7 +518,7 @@ impl MainWindow {
                 .transient_for(&win_about)
                 .modal(true)
                 .application_name("Photon")
-                .application_icon("camera-photo-symbolic")
+                .application_icon("org.mavensgroup.photon")
                 .developer_name("Photon Team")
                 .version(env!("CARGO_PKG_VERSION"))
                 .comments("Fast photo manager for Linux following GNOME HIG and Material 3 design")
@@ -467,6 +528,7 @@ impl MainWindow {
                 .build();
             about.present();
         });
+        mw.window.add_action(&act_about);
         // ── Search Action ──────────────────────────────
         let sbtn_act = search_btn.clone();
         let act_search = gio::SimpleAction::new("search", None);
@@ -475,9 +537,32 @@ impl MainWindow {
         });
         mw.window.add_action(&act_search);
 
+        // ── Selection mode ─────────────────────────────
+        let tl = mw.timeline.clone();
+        select_btn.connect_toggled(move |b| tl.set_selection_mode(b.is_active()));
+        let sb = select_btn.clone();
+        mw.timeline.connect_selection_mode_changed(move |on| sb.set_active(on));
+        // Selecting only makes sense on the timeline.
+        let sb = select_btn.clone();
+        let mw_vis = mw.clone();
+        mw.stack.connect_visible_child_name_notify(move |stack| {
+            let on_timeline = stack.visible_child_name().as_deref() == Some("timeline");
+            let is_viewer = stack.visible_child_name().as_deref() == Some("viewer");
+            if !on_timeline {
+                sb.set_active(false);
+            }
+            sb.set_sensitive(on_timeline);
+            mw_vis.set_bottom_bar_revealed(!is_viewer);
+        });
+
+        // Dragged-out photos follow the "Share Sends" preference too.
+        let share_ctx = mw.share_context();
+        mw.timeline.set_drag_filter(move |images| share::versions_to_share(&share_ctx, images));
+
         let mw_changed = mw.clone();
         let mw_export = mw.clone();
-        selection_bar::attach(
+        let mw_ss_sel = mw.clone();
+        let bottom_bar_handle = selection_bar::attach(
             &mw.timeline,
             selection_bar::Context {
                 window: mw.window.clone().upcast(),
@@ -485,8 +570,25 @@ impl MainWindow {
                 prefs: mw.prefs.clone(),
                 on_library_changed: Rc::new(move || mw_changed.refresh()),
                 on_export: Rc::new(move |images| mw_export.start_export(images)),
+                share: mw.share_context(),
+                undo_manager: mw.undo_manager.clone(),
+                current_album_id: mw.current_album_id.clone(),
+                on_start_slideshow: Some(Rc::new(move || mw_ss_sel.start_slideshow())),
             },
         );
+        content_box.append(&bottom_bar_handle.widget);
+        bottom_bar_handle.widget.set_revealed(true);
+        *mw.bottom_bar.borrow_mut() = Some(bottom_bar_handle);
+
+        // Missing files and sidecars changed in other tools: at startup, and
+        // whenever the window is focused again (e.g. after rating in darktable).
+        mw.check_library();
+        let mw_focus = mw.clone();
+        mw.window.connect_is_active_notify(move |w| {
+            if w.is_active() {
+                mw_focus.check_library();
+            }
+        });
 
         mw.navigate(&UIAction::ShowAll);
         mw
@@ -496,11 +598,76 @@ impl MainWindow {
         self.window.present();
     }
 
+    /// In the background: mark photos whose files are missing (or back), and
+    /// read sidecars changed since Photon last read or wrote them. Refreshes
+    /// the view if anything changed. Throttled; never two at once.
+    fn check_library(&self) {
+        let (last, running) = self.library_check.get();
+        if running || last.is_some_and(|t| t.elapsed() < LIBRARY_CHECK_INTERVAL) {
+            return;
+        }
+        self.library_check.set((Some(std::time::Instant::now()), true));
+
+        let db_bg = self.db.clone();
+        let (tx_bg, rx_bg) = async_channel::bounded::<bool>(1);
+        std::thread::spawn(move || {
+            let changed = (|| {
+                let mut conn = db_bg.conn().ok()?;
+                let images_to_check = queries::get_all_images_for_integrity_check(&conn).ok()?;
+
+                let mut to_mark_missing = Vec::new();
+                let mut to_mark_found = Vec::new();
+                let mut changed = false;
+
+                for (id, path, xmp_mtime, was_missing) in images_to_check {
+                    let exists = path.exists();
+                    if !exists && !was_missing {
+                        to_mark_missing.push(id);
+                    } else if exists && was_missing {
+                        to_mark_found.push(id);
+                    }
+
+                    if exists {
+                        match photon_import::read_image_xmp(&mut conn, id, &path, xmp_mtime) {
+                            Ok(applied) => changed |= applied,
+                            Err(e) => log::warn!("Reading XMP for {}: {e}", path.display()),
+                        }
+                    }
+                }
+
+                for (ids, missing) in [(&to_mark_missing, true), (&to_mark_found, false)] {
+                    if ids.is_empty() {
+                        continue;
+                    }
+                    match queries::mark_missing(&conn, ids, missing) {
+                        Ok(()) => changed = true,
+                        Err(e) => log::warn!("Marking {} photos missing={missing}: {e}", ids.len()),
+                    }
+                }
+                Some(changed)
+            })();
+            let _ = tx_bg.send_blocking(changed.unwrap_or(false));
+        });
+
+        let mw = self.clone();
+        gtk4::glib::MainContext::default().spawn_local(async move {
+            let changed = rx_bg.recv().await.unwrap_or(false);
+            let (started, _) = mw.library_check.get();
+            mw.library_check.set((started, false));
+            if changed {
+                mw.refresh();
+            }
+        });
+    }
+
     // ── Navigation ──────────────────────────────────────
 
     pub fn navigate(&self, action: &UIAction) {
         if !matches!(action, UIAction::ViewPhoto(_)) {
             *self.last_grid_action.borrow_mut() = action.clone();
+            if !matches!(action, UIAction::FilterByAlbum(_)) {
+                *self.current_album_id.borrow_mut() = None;
+            }
         }
         match action {
             UIAction::ShowAll => {
@@ -527,6 +694,34 @@ impl MainWindow {
             UIAction::FilterByTag(tag) => {
                 self.show_timeline(TimelineFilter::Tag(tag.clone()), format!("Tag: #{tag}"));
             }
+            UIAction::FilterByAlbum(album_id) => {
+                *self.current_album_id.borrow_mut() = Some(*album_id);
+                let album_name = if let Ok(conn) = self.db.conn() {
+                    queries::get_album(&conn, *album_id)
+                        .ok()
+                        .flatten()
+                        .map(|a| a.name)
+                        .unwrap_or_else(|| "Album".to_string())
+                } else {
+                    "Album".to_string()
+                };
+                self.show_timeline(TimelineFilter::Album(*album_id), format!("Album: {album_name}"));
+            }
+            UIAction::FilterByEvent(event_id) => {
+                let event_name = if let Ok(conn) = self.db.conn() {
+                    queries::get_event(&conn, *event_id)
+                        .ok()
+                        .flatten()
+                        .map(|e| e.name)
+                        .unwrap_or_else(|| "Event".to_string())
+                } else {
+                    "Event".to_string()
+                };
+                self.show_timeline(TimelineFilter::Event(*event_id), format!("Event: {event_name}"));
+            }
+            UIAction::FilterMissing => {
+                self.show_timeline(TimelineFilter::Missing, "Missing Photos".to_string());
+            }
         }
     }
 
@@ -537,6 +732,8 @@ impl MainWindow {
         self.timeline_stale.set(true);
         self.sidebar.refresh_events();
         self.sidebar.refresh_tags();
+        self.sidebar.refresh_albums();
+        self.sidebar.refresh_missing();
         let action = self.last_grid_action.borrow().clone();
         let showing_viewer = self.stack.visible_child_name().as_deref() == Some("viewer");
         if !showing_viewer {
@@ -544,10 +741,112 @@ impl MainWindow {
         }
     }
 
+    pub fn locate_missing_folder(&self) {
+        let parent_win = self.window.clone();
+        let db = self.db.clone();
+        let mw = self.clone();
+
+        let chooser = FileChooserNative::new(
+            Some("Locate Folder for Missing Photos"),
+            Some(&parent_win),
+            FileChooserAction::SelectFolder,
+            Some("Select Folder"),
+            Some("Cancel"),
+        );
+
+        chooser.connect_response(move |dialog, response| {
+            if response == ResponseType::Accept {
+                if let Some(file) = dialog.file() {
+                    if let Some(path) = file.path() {
+                        let db_c = db.clone();
+                        let mw_c = mw.clone();
+                        glib::spawn_future_local(async move {
+                            let relinked = gio::spawn_blocking(move || {
+                                if let Ok(conn) = db_c.conn() {
+                                    if let Ok(missing) = queries::get_missing_images(&conn) {
+                                        return photon_import::library::relink_missing_folder(&conn, &missing, &path).unwrap_or(0);
+                                    }
+                                }
+                                0
+                            }).await.unwrap_or(0);
+
+                            mw_c.refresh();
+                            let toast = adw::Toast::new(&format!("Successfully relinked {relinked} photos"));
+                            mw_c.toasts.add_toast(toast);
+                        });
+                    }
+                }
+            }
+        });
+
+        chooser.show();
+    }
+
+    /// For Share menus: the window, and in-app notifications.
+    pub fn share_context(&self) -> share::Context {
+        let toasts = self.toasts.clone();
+        share::Context {
+            window: self.window.clone().upcast(),
+            notify: Rc::new(move |text| toasts.add_toast(adw::Toast::new(text))),
+            db: self.db.clone(),
+            prefs: self.prefs.clone(),
+        }
+    }
+
+    pub fn update_bottom_bar_status(&self, text: &str) {
+        if let Some(ref handle) = *self.bottom_bar.borrow() {
+            (handle.set_status_text)(text);
+        }
+    }
+
+    pub fn set_bottom_bar_revealed(&self, revealed: bool) {
+        if let Some(ref handle) = *self.bottom_bar.borrow() {
+            handle.widget.set_revealed(revealed);
+        }
+    }
+
+    pub fn set_bottom_bar_zoom(&self, val: i32) {
+        if let Some(ref handle) = *self.bottom_bar.borrow() {
+            (handle.set_zoom_value)(val);
+        }
+    }
+
+    /// The rating or flag filter changed: relabel the filter button and
+    /// reload the timeline.
+    fn filters_changed(&self) {
+        let rating = match self.rating_filter.get() {
+            RatingFilter::Any => None,
+            RatingFilter::Unrated => Some("Unrated".to_string()),
+            RatingFilter::AtLeast(5) => Some("5".to_string()),
+            RatingFilter::AtLeast(n) => Some(format!("{n}+")),
+        };
+        let flag = match self.cull_flag.get() {
+            None => None,
+            Some(1) => Some("Picks"),
+            Some(-1) => Some("Rejects"),
+            Some(_) => Some("Unflagged"),
+        };
+        let text = match (rating, flag) {
+            (None, None) => "All".to_string(),
+            (Some(r), None) => r,
+            (None, Some(f)) => f.to_string(),
+            (Some(r), Some(f)) => format!("{r} · {f}"),
+        };
+        self.filter_label.set_text(&text);
+        if text == "All" {
+            self.filter_label.remove_css_class("accent");
+        } else {
+            self.filter_label.add_css_class("accent");
+        }
+        self.timeline_stale.set(true);
+        self.refresh();
+    }
+
     fn show_cards(&self) {
         self.clear_viewer();
         self.clear_timeline();
         self.stack.set_visible_child_name("cards");
+        self.set_bottom_bar_revealed(true);
     }
 
     /// Show `filter` in the virtualized timeline. Reuses the loaded timeline
@@ -558,11 +857,10 @@ impl MainWindow {
             let started = std::time::Instant::now();
             let items = match self.db.conn() {
                 Ok(conn) => {
-                    let min_r = self.cull_min_rating.get();
                     queries::timeline_items_with_cull(
                         &conn,
                         &filter,
-                        if min_r > 0 { Some(min_r) } else { None },
+                        self.rating_filter.get(),
                         self.cull_flag.get(),
                     ).unwrap_or_else(|e| {
                         log::error!("Timeline query failed: {e}");
@@ -582,11 +880,13 @@ impl MainWindow {
 
         let count = self.current_photos.borrow().len();
         let count_str = if count == 1 { "1 photo" } else { &format!("{count} photos") };
-        let is_filtered = self.cull_min_rating.get() > 0 || self.cull_flag.get().is_some();
+        let is_filtered = self.rating_filter.get() != RatingFilter::Any || self.cull_flag.get().is_some();
         let filter_tag = if is_filtered { " · Filtered" } else { "" };
         let subtitle = format!("{title} · {count_str}{filter_tag}");
         self.window_title.set_subtitle(&subtitle);
         self.status_label.set_text(&subtitle);
+        self.update_bottom_bar_status(&subtitle);
+        self.set_bottom_bar_revealed(true);
 
         if count == 0 {
             self.show_cards();
@@ -694,6 +994,8 @@ impl MainWindow {
         self.clear_viewer();
         let this = self.clone();
         let on_export = Some(Rc::new(move |images| this.start_export(images)) as Rc<dyn Fn(Vec<Image>)>);
+        let this_ss = self.clone();
+        let on_slideshow = Some(Rc::new(move || this_ss.start_slideshow()) as Rc<dyn Fn()>);
         let viewer = detail::build_viewer(
             photos,
             index,
@@ -703,9 +1005,14 @@ impl MainWindow {
             back_action,
             &self.db,
             on_export,
+            self.share_context(),
+            Some(self.undo_manager.clone()),
+            on_slideshow,
+            Some(self.window.clone().upcast()),
         );
         self.viewer_container.append(&viewer);
         self.stack.set_visible_child_name("viewer");
+        self.set_bottom_bar_revealed(false);
     }
 
     /// Batch export dialog and progress reporting for photos.
@@ -742,6 +1049,7 @@ impl MainWindow {
         let s3 = status.clone();
         let p3 = pbar.clone();
         let r3 = revealer.clone();
+        let win_alert = self.window.clone();
         let on_done = move |report: photon_import::export::ExportReport| {
             s3.set_text(&format!(
                 "Export complete: {} of {} exported ({} failed)",
@@ -755,10 +1063,28 @@ impl MainWindow {
             glib::timeout_add_local_once(std::time::Duration::from_secs(4), move || {
                 r.set_reveal_child(false);
             });
+
+            if report.failed > 0 || !report.errors.is_empty() {
+                let mut body = String::new();
+                for (file, err) in report.errors.iter().take(12) {
+                    body.push_str(&format!("• {file}: {err}\n"));
+                }
+                if report.errors.len() > 12 {
+                    body.push_str(&format!("... and {} more notices\n", report.errors.len() - 12));
+                }
+                let dialog = adw::MessageDialog::new(
+                    Some(&win_alert),
+                    Some("Export Notices / Errors"),
+                    Some(&body),
+                );
+                dialog.add_response("ok", "OK");
+                dialog.present();
+            }
         };
 
         crate::ui::export_dialog::show(
             &self.window,
+            self.db.clone(),
             images,
             on_start,
             on_progress,
@@ -851,6 +1177,65 @@ impl MainWindow {
         } else {
             row.append(&card);
         }
+    }
+
+    pub fn toast(&self, text: &str) {
+        self.toasts.add_toast(adw::Toast::new(text));
+    }
+
+    pub fn undo(&self) {
+        match self.undo_manager.borrow_mut().undo(&self.db, &self.cache_dir) {
+            Ok(Some(desc)) => {
+                self.toast(&desc);
+                self.refresh();
+            }
+            Ok(None) => {
+                self.toast("Nothing to undo");
+            }
+            Err(e) => {
+                log::error!("Undo failed: {e}");
+                self.toast(&format!("Undo failed: {e}"));
+                // A partial trash restore may already have changed the library.
+                self.refresh();
+            }
+        }
+    }
+
+    pub fn redo(&self) {
+        match self.undo_manager.borrow_mut().redo(&self.db, &self.cache_dir) {
+            Ok(Some(desc)) => {
+                self.toast(&desc);
+                self.refresh();
+            }
+            Ok(None) => {
+                self.toast("Nothing to redo");
+            }
+            Err(e) => {
+                log::error!("Redo failed: {e}");
+                self.toast(&format!("Redo failed: {e}"));
+                self.refresh();
+            }
+        }
+    }
+
+    pub fn start_slideshow(&self) {
+        let selected = self.timeline.selected_items();
+        let items = if !selected.is_empty() {
+            selected
+        } else {
+            (**self.current_photos.borrow()).clone()
+        };
+
+        if items.is_empty() {
+            self.toast("No photos to display in slideshow");
+            return;
+        }
+
+        slideshow::start(
+            &self.window,
+            items,
+            self.cache_dir.clone(),
+        );
     }
 }
 

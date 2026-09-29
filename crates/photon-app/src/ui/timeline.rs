@@ -13,6 +13,11 @@
 //!     is ready, and loads for rows scrolled past quickly are skipped.
 //!   * **Selection by photo id**: focus/selection survive live refreshes
 //!     (imports insert photos and shift every index after them).
+//!   * **Selection mode**: a check circle on each tile (on hover, or always
+//!     while selecting) and on each day header; in selection mode a click
+//!     toggles a photo instead of opening it. Ctrl/Shift-click work anytime.
+//!   * **Drag out**: dragging a tile drags its file (or the whole selection,
+//!     if the tile is selected) into Files, a browser, a chat or a mail.
 //!   * **Scrubber rail**: a right-edge strip with year marks; dragging jumps
 //!     anywhere in the library. Positions come from the exact row heights of
 //!     the layout, not from GTK's estimated scroll range.
@@ -23,11 +28,12 @@ use gtk4::{gdk, gio, glib};
 use gtk4::{
     graphene, Align, Box as GtkBox, DrawingArea, EventControllerKey, EventControllerMotion,
     EventControllerScroll, EventControllerScrollFlags, Fixed, GestureClick, GestureDrag, Label,
-    ListItem, ListScrollFlags, ListView, NoSelection, Orientation, Overlay, Picture,
+    Button, DragSource, ListItem, ListScrollFlags, ListView, NoSelection, Orientation, Overlay,
+    Picture,
     PropagationPhase, Revealer, ScrolledWindow, SignalListItemFactory,
 };
 use photon_core::db::{queries, Database};
-use photon_core::models::TimelineItem;
+use photon_core::models::{Image, TimelineItem};
 use photon_import::thumbnails::{thumb_path, ThumbSize};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -55,6 +61,8 @@ const RAIL_INSET: f64 = 16.0;
 const RAIL_THUMB_WIDTH: i32 = 20;
 /// How long the rail's year marks stay visible after the last activity.
 const RAIL_LINGER: Duration = Duration::from_millis(1200);
+/// Clicks within this many pixels of a tile's top-left corner hit its check circle.
+const CHECK_HIT: f64 = 44.0;
 
 // ---------------------------------------------------------------------------
 // Layout (pure: no GTK, unit-tested)
@@ -333,6 +341,10 @@ impl TextureCache {
             }
         }
     }
+
+    fn remove(&mut self, hash: &str) {
+        self.map.remove(hash);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +353,8 @@ impl TextureCache {
 
 type ActivateFn = Box<dyn Fn(usize)>;
 type SelectionFn = Box<dyn Fn(&HashSet<usize>)>;
+type ModeFn = Box<dyn Fn(bool)>;
+type DragFilterFn = Box<dyn Fn(Vec<Image>) -> Vec<Image>>;
 
 struct Inner {
     root: Overlay,
@@ -384,6 +398,14 @@ struct Inner {
     db: RefCell<Option<Database>>,
     on_activate: RefCell<Option<ActivateFn>>,
     on_selection_changed: RefCell<Option<SelectionFn>>,
+    /// Clicks toggle photos instead of opening them.
+    selection_mode: Cell<bool>,
+    on_selection_mode_changed: RefCell<Option<ModeFn>>,
+    /// Picks which files a drag carries for the dragged photos.
+    drag_filter: RefCell<Option<DragFilterFn>>,
+    undo_manager: RefCell<Option<Rc<RefCell<crate::ui::undo::UndoManager>>>>,
+    on_refresh: RefCell<Option<Rc<dyn Fn()>>>,
+    on_start_slideshow: RefCell<Option<Rc<dyn Fn()>>>,
 }
 
 /// The virtualized timeline widget. Cheap to clone (shared handle).
@@ -516,6 +538,12 @@ impl Timeline {
             db: RefCell::new(None),
             on_activate: RefCell::new(None),
             on_selection_changed: RefCell::new(None),
+            selection_mode: Cell::new(false),
+            on_selection_mode_changed: RefCell::new(None),
+            drag_filter: RefCell::new(None),
+            undo_manager: RefCell::new(None),
+            on_refresh: RefCell::new(None),
+            on_start_slideshow: RefCell::new(None),
         });
 
         // Key controller for 2D keyboard navigation and multi-selection
@@ -652,7 +680,7 @@ impl Timeline {
             ) else {
                 return;
             };
-            Inner::bind_row(&inner, &row_box, &data.borrow::<Row>());
+            Inner::bind_row(&inner, &row_box, &data.borrow::<Row>(), item.position() as usize);
         });
         factory.connect_unbind(|_, obj| {
             let item = obj.downcast_ref::<gtk4::ListItem>().expect("ListItem");
@@ -700,6 +728,26 @@ impl Timeline {
     pub fn clear_selection(&self) {
         self.inner.selected_indices.borrow_mut().clear();
         Inner::update_tile_styles(&self.inner);
+    }
+
+    /// Enter or leave selection mode. Leaving it clears the selection.
+    pub fn set_selection_mode(&self, on: bool) {
+        Inner::set_selection_mode(&self.inner, on);
+    }
+
+    pub fn selection_mode(&self) -> bool {
+        self.inner.selection_mode.get()
+    }
+
+    /// Decide which files a drag carries for the dragged photos (e.g. a
+    /// RAW+JPG shot's JPG only).
+    pub fn set_drag_filter(&self, f: impl Fn(Vec<Image>) -> Vec<Image> + 'static) {
+        *self.inner.drag_filter.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Called when selection mode is entered or left.
+    pub fn connect_selection_mode_changed(&self, f: impl Fn(bool) + 'static) {
+        *self.inner.on_selection_mode_changed.borrow_mut() = Some(Box::new(f));
     }
 
     /// Select all photos in the timeline.
@@ -778,9 +826,126 @@ impl Timeline {
     pub fn cull_flag_selected(&self, flag: i32) {
         Inner::cull_flag(&self.inner, flag);
     }
+
+    pub fn rotate_selected(&self, cw: bool) {
+        Inner::rotate_selected(&self.inner, cw);
+    }
+
+    pub fn selected_items(&self) -> Vec<TimelineItem> {
+        let items = self.inner.items.borrow();
+        let selected = self.inner.selected_indices.borrow();
+        let mut res = Vec::new();
+        for &idx in selected.iter() {
+            if let Some(item) = items.get(idx) {
+                res.push(item.clone());
+            }
+        }
+        res
+    }
+
+    pub fn set_undo_manager(&self, um: Rc<RefCell<crate::ui::undo::UndoManager>>) {
+        *self.inner.undo_manager.borrow_mut() = Some(um);
+    }
+
+    pub fn connect_refresh(&self, f: impl Fn() + 'static) {
+        *self.inner.on_refresh.borrow_mut() = Some(Rc::new(f));
+    }
+
+    pub fn connect_start_slideshow(&self, f: impl Fn() + 'static) {
+        *self.inner.on_start_slideshow.borrow_mut() = Some(Rc::new(f));
+    }
 }
 
 impl Inner {
+    fn set_selection_mode(this: &Rc<Self>, on: bool) {
+        if this.selection_mode.replace(on) == on {
+            return;
+        }
+        if on {
+            this.root.add_css_class("photon-selecting");
+        } else {
+            this.root.remove_css_class("photon-selecting");
+            this.selected_indices.borrow_mut().clear();
+        }
+        if let Some(cb) = this.on_selection_mode_changed.borrow().as_ref() {
+            cb(on);
+        }
+        Self::update_tile_styles(this);
+    }
+
+    /// Toggle photo `index` in the selection (entering selection mode).
+    fn toggle_selected(this: &Rc<Self>, index: usize) {
+        this.focused_index.set(Some(index));
+        this.anchor_index.set(Some(index));
+        {
+            let mut sel = this.selected_indices.borrow_mut();
+            if !sel.remove(&index) {
+                sel.insert(index);
+            }
+        }
+        Self::set_selection_mode(this, true);
+        Self::update_tile_styles(this);
+    }
+
+    /// Photo indices of the day section whose header is row `header`.
+    fn section_indices(&self, header: usize) -> Vec<usize> {
+        self.rows
+            .borrow()
+            .iter()
+            .skip(header + 1)
+            .take_while(|row| matches!(row, Row::Photos(_)))
+            .flat_map(|row| match row {
+                Row::Photos(tiles) => tiles.iter().map(|t| t.index).collect(),
+                Row::Header(_) => Vec::new(),
+            })
+            .collect()
+    }
+
+    /// Select every photo of a day, or deselect them if all already are.
+    fn toggle_section(this: &Rc<Self>, header: usize) {
+        let indices = this.section_indices(header);
+        {
+            let mut sel = this.selected_indices.borrow_mut();
+            if indices.iter().all(|i| sel.contains(i)) {
+                for i in &indices {
+                    sel.remove(i);
+                }
+            } else {
+                sel.extend(indices.iter().copied());
+            }
+        }
+        Self::set_selection_mode(this, true);
+        Self::update_tile_styles(this);
+    }
+
+    /// Files to drag when a drag starts on photo `index`: the whole
+    /// selection if the photo is part of it, else just that photo.
+    fn drag_files(&self, index: usize) -> Vec<gio::File> {
+        let ids = {
+            let items = self.items.borrow();
+            let selected = self.selected_indices.borrow();
+            if selected.contains(&index) {
+                let mut indices: Vec<usize> = selected.iter().copied().collect();
+                indices.sort_unstable();
+                ids_at(&items, indices)
+            } else {
+                ids_at(&items, [index])
+            }
+        };
+        let images: Vec<Image> = {
+            let db = self.db.borrow();
+            let Some(conn) = db.as_ref().and_then(|db| db.conn().ok()) else { return Vec::new() };
+            ids.into_iter()
+                .filter_map(|id| queries::get_image(&conn, id).ok().flatten())
+                .collect()
+        };
+        let images = match self.drag_filter.borrow().as_ref() {
+            Some(filter) => filter(images),
+            None => images,
+        };
+        images.into_iter().map(|img| gio::File::for_path(img.path)).collect()
+    }
+
     /// Debounce width changes: relayout once the window stops resizing.
     fn schedule_relayout(this: &Rc<Self>, width: i32) {
         if width <= 0 || width == this.width.get() {
@@ -862,7 +1027,7 @@ impl Inner {
 
                     if let Some(overlay) = frame.first_child().and_downcast::<Overlay>() {
                         if let Some(badges_box) = overlay.last_child().and_downcast::<GtkBox>() {
-                            rebuild_tile_badges(&badges_box, item.rating, item.flagged);
+                            rebuild_tile_badges(&badges_box, item.rating, item.flagged, item.is_video, item.duration.as_deref(), item.missing);
                         }
                     }
                 }
@@ -902,15 +1067,24 @@ impl Inner {
         }
 
         let mut ids = Vec::new();
+        let mut previous = Vec::new();
         {
             let mut items_clone = (**this.items.borrow()).clone();
             for &idx in &selected {
                 if let Some(item) = items_clone.get_mut(idx) {
+                    previous.push((item.id, item.rating));
                     item.rating = rating;
                     ids.push(item.id);
                 }
             }
             *this.items.borrow_mut() = Rc::new(items_clone);
+        }
+
+        if let Some(um) = this.undo_manager.borrow().as_ref() {
+            um.borrow_mut().push(crate::ui::undo::UndoAction::Rating {
+                previous,
+                new_rating: rating,
+            });
         }
 
         Self::update_tile_styles(this);
@@ -919,7 +1093,9 @@ impl Inner {
             let db = db.clone();
             thread::spawn(move || {
                 if let Ok(mut conn) = db.conn() {
-                    let _ = queries::batch_set_rating(&mut conn, &ids, rating);
+                    if queries::batch_set_rating(&mut conn, &ids, rating).is_ok() {
+                        sync_cull_to_xmp(&conn, &ids);
+                    }
                 }
             });
         }
@@ -943,15 +1119,24 @@ impl Inner {
         }
 
         let mut ids = Vec::new();
+        let mut previous = Vec::new();
         {
             let mut items_clone = (**this.items.borrow()).clone();
             for &idx in &selected {
                 if let Some(item) = items_clone.get_mut(idx) {
+                    previous.push((item.id, item.flagged));
                     item.flagged = flag;
                     ids.push(item.id);
                 }
             }
             *this.items.borrow_mut() = Rc::new(items_clone);
+        }
+
+        if let Some(um) = this.undo_manager.borrow().as_ref() {
+            um.borrow_mut().push(crate::ui::undo::UndoAction::Flag {
+                previous,
+                new_flag: flag,
+            });
         }
 
         Self::update_tile_styles(this);
@@ -960,7 +1145,100 @@ impl Inner {
             let db = db.clone();
             thread::spawn(move || {
                 if let Ok(mut conn) = db.conn() {
-                    let _ = queries::batch_set_flag(&mut conn, &ids, flag);
+                    if queries::batch_set_flag(&mut conn, &ids, flag).is_ok() {
+                        sync_cull_to_xmp(&conn, &ids);
+                    }
+                }
+            });
+        }
+    }
+
+    fn rotate_selected(this: &Rc<Self>, cw: bool) {
+        let selected: Vec<usize> = {
+            let sel = this.selected_indices.borrow();
+            if sel.is_empty() {
+                if let Some(focus) = this.focused_index.get() {
+                    vec![focus]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                sel.iter().copied().collect()
+            }
+        };
+        if selected.is_empty() {
+            return;
+        }
+
+        let mut updates: Vec<(i64, u16)> = Vec::new();
+        let mut affected: Vec<(i64, String, u16)> = Vec::new();
+        let mut previous = Vec::new();
+        {
+            let mut items_clone = (**this.items.borrow()).clone();
+            for &idx in &selected {
+                if let Some(item) = items_clone.get_mut(idx) {
+                    previous.push((item.id, item.orientation, item.hash.clone()));
+                    let next_orient = photon_core::models::rotate_orientation(item.orientation, cw);
+                    item.orientation = Some(next_orient);
+                    updates.push((item.id, next_orient));
+                    affected.push((item.id, item.hash.clone(), next_orient));
+                }
+            }
+            *this.items.borrow_mut() = Rc::new(items_clone);
+        }
+
+        if let Some(um) = this.undo_manager.borrow().as_ref() {
+            um.borrow_mut().push(crate::ui::undo::UndoAction::Orientation {
+                previous,
+                cw,
+            });
+        }
+
+        // Invalidate the grid textures, the disk thumbnails and the viewer's 1:1 renders
+        for (_, hash, _) in &affected {
+            this.textures.borrow_mut().remove(hash);
+            photon_import::thumbnails::invalidate_cache(&this.cache_dir, hash);
+            crate::ui::detail::invalidate_full_res(hash);
+        }
+
+        // Relayout immediately so tile aspect ratios update
+        this.relayout();
+
+        // Asynchronously update DB, sync XMP sidecars, and regenerate grid thumbnails
+        if let Some(db) = this.db.borrow().as_ref() {
+            let db = db.clone();
+            let cache_dir = this.cache_dir.clone();
+            let weak_inner = Rc::downgrade(this);
+            glib::spawn_future_local(async move {
+                gio::spawn_blocking(move || {
+                    match db.conn() {
+                        Ok(mut conn) => {
+                            if let Err(e) = queries::batch_set_orientation(&mut conn, &updates) {
+                                log::error!("Failed to save batch orientation: {e}");
+                            } else {
+                                sync_orientation_to_xmp(&conn, &updates);
+                            }
+
+                            // Regenerate grid thumbnails
+                            let thumb_gen = photon_import::thumbnails::ThumbnailGenerator::new(cache_dir);
+                            for &(id, _) in &updates {
+                                if let Ok(Some(image)) = queries::get_image(&conn, id) {
+                                    if let Err(e) = thumb_gen.ensure_grid(&image) {
+                                        log::warn!("Failed to regenerate thumbnail for photo {id}: {e}");
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Failed to acquire database connection for batch orientation: {e}");
+                        }
+                    }
+                })
+                .await
+                .ok();
+
+                if let Some(inner) = weak_inner.upgrade() {
+                    inner.relayout();
                 }
             });
         }
@@ -1283,6 +1561,10 @@ impl Inner {
                     Self::update_tile_styles(this);
                     return glib::Propagation::Stop;
                 }
+                gdk::Key::r | gdk::Key::R => {
+                    Self::rotate_selected(this, true);
+                    return glib::Propagation::Stop;
+                }
                 _ => {}
             }
         }
@@ -1418,27 +1700,138 @@ impl Inner {
                 }
                 glib::Propagation::Stop
             }
+            gdk::Key::bracketleft => {
+                Self::rotate_selected(this, false);
+                glib::Propagation::Stop
+            }
+            gdk::Key::bracketright => {
+                Self::rotate_selected(this, true);
+                glib::Propagation::Stop
+            }
+            gdk::Key::F5 => {
+                if let Some(ref cb) = *this.on_start_slideshow.borrow() {
+                    cb();
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            }
             gdk::Key::Escape => {
-                this.selected_indices.borrow_mut().clear();
-                Self::update_tile_styles(this);
+                if this.selection_mode.get() {
+                    Self::set_selection_mode(this, false);
+                } else {
+                    this.selected_indices.borrow_mut().clear();
+                    Self::update_tile_styles(this);
+                }
                 glib::Propagation::Stop
             }
             _ => glib::Propagation::Proceed,
         }
     }
 
-    fn bind_row(this: &Rc<Self>, row_box: &GtkBox, row: &Row) {
+    fn bind_row(this: &Rc<Self>, row_box: &GtkBox, row: &Row, position: usize) {
         clear_children(row_box);
         match row {
             Row::Header(title) => {
-                let label = Label::new(Some(title));
+                let check = Button::from_icon_name("object-select-symbolic");
+                check.add_css_class("circular");
+                check.add_css_class("photon-day-check");
+                check.set_valign(Align::End);
+                check.set_margin_bottom(6);
+                check.set_tooltip_text(Some("Select All Photos of This Day"));
+                let weak = Rc::downgrade(this);
+                check.connect_clicked(move |_| {
+                    if let Some(inner) = weak.upgrade() {
+                        Self::toggle_section(&inner, position);
+                    }
+                });
+
+                // Find date (year, month, day) from the next photos row
+                let mut day_date = None;
+                {
+                    let rows = this.rows.borrow();
+                    let items = this.items.borrow();
+                    let mut next_pos = position + 1;
+                    while next_pos < rows.len() {
+                        if let Row::Photos(tiles) = &rows[next_pos] {
+                            if let Some(tile) = tiles.first() {
+                                if let Some(item) = items.get(tile.index) {
+                                    if let Some(ts) = item.created_at {
+                                        if let Some(dt) = DateTime::from_timestamp(ts, 0) {
+                                            day_date = Some((dt.year(), dt.month(), dt.day()));
+                                        }
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                        next_pos += 1;
+                    }
+                }
+
+                let mut event_name: Option<String> = None;
+                if let Some((y, m, d)) = day_date {
+                    if let Some(db) = this.db.borrow().as_ref() {
+                        if let Ok(conn) = db.conn() {
+                            if let Ok(Some(ev)) = queries::get_event_for_day(&conn, y, m, d) {
+                                event_name = Some(ev.name);
+                            }
+                        }
+                    }
+                }
+
+                let display_title = if let Some(ref name) = event_name {
+                    format!("{name} — {title}")
+                } else {
+                    title.clone()
+                };
+
+                let label = Label::new(Some(&display_title));
                 label.set_halign(Align::Start);
                 label.set_valign(Align::End);
                 label.add_css_class("photon-section-header");
                 label.set_margin_bottom(8);
                 row_box.set_margin_bottom(0);
                 row_box.set_size_request(-1, HEADER_HEIGHT);
+                row_box.append(&check);
                 row_box.append(&label);
+
+                if let Some((y, m, d)) = day_date {
+                    let edit_btn = Button::from_icon_name("document-edit-symbolic");
+                    edit_btn.add_css_class("flat");
+                    edit_btn.add_css_class("photon-day-edit-btn");
+                    edit_btn.set_valign(Align::End);
+                    edit_btn.set_margin_bottom(6);
+                    edit_btn.set_margin_start(4);
+                    edit_btn.set_tooltip_text(Some("Name or edit event for this day"));
+
+                    let weak_inner = Rc::downgrade(this);
+                    let initial = event_name.unwrap_or_default();
+                    let date_str = title.split("  ·  ").next().unwrap_or(title).to_string();
+                    edit_btn.connect_clicked(move |_| {
+                        let weak_c = weak_inner.clone();
+                        crate::ui::sidebar::prompt_text_dialog(
+                            "Name Event",
+                            &format!("Name event for {date_str}:"),
+                            &initial,
+                            "Save",
+                            move |name| {
+                                if let Some(inner) = weak_c.upgrade() {
+                                    if let Some(db) = inner.db.borrow().as_ref() {
+                                        if let Ok(conn) = db.conn() {
+                                            if let Err(e) = queries::name_day_event(&conn, &name, y, m, d) {
+                                                log::error!("name_day_event failed: {e}");
+                                            }
+                                        }
+                                    }
+                                    if let Some(ref cb) = *inner.on_refresh.borrow() {
+                                        cb();
+                                    }
+                                }
+                            },
+                        );
+                    });
+                    row_box.append(&edit_btn);
+                }
             }
             Row::Photos(tiles) => {
                 row_box.set_margin_bottom(GAP);
@@ -1470,6 +1863,9 @@ impl Inner {
         } else if item.flagged == 1 {
             frame.add_css_class("photon-tile-pick");
         }
+        if item.missing {
+            frame.add_css_class("photon-tile-missing");
+        }
 
         this.visible_tiles.borrow_mut().insert(tile.index, frame.downgrade());
 
@@ -1490,8 +1886,16 @@ impl Inner {
         badges_box.set_valign(Align::End);
         badges_box.set_halign(Align::Start);
         badges_box.set_can_target(false);
-        rebuild_tile_badges(&badges_box, item.rating, item.flagged);
+        rebuild_tile_badges(&badges_box, item.rating, item.flagged, item.is_video, item.duration.as_deref(), item.missing);
         overlay.add_overlay(&badges_box);
+
+        // Shown on hover, while selecting, and on selected tiles (CSS).
+        let check = gtk4::Image::from_icon_name("object-select-symbolic");
+        check.add_css_class("photon-tile-check");
+        check.set_halign(Align::Start);
+        check.set_valign(Align::Start);
+        check.set_can_target(false);
+        overlay.add_overlay(&check);
 
         frame.append(&overlay);
 
@@ -1509,9 +1913,30 @@ impl Inner {
         let click = GestureClick::new();
         let weak = Rc::downgrade(this);
         let index = tile.index;
-        click.connect_released(move |gesture, n_press, _, _| {
+        click.connect_released(move |gesture, n_press, x, y| {
             let Some(inner) = weak.upgrade() else { return };
             inner.scrolled.grab_focus();
+
+            let on_check = x < CHECK_HIT && y < CHECK_HIT;
+            if inner.selection_mode.get() || on_check {
+                // A double click's second press would undo the first toggle.
+                if n_press == 1 {
+                    let state = gesture.current_event_state();
+                    if state.contains(gdk::ModifierType::SHIFT_MASK) {
+                        let anchor = inner.anchor_index.get().unwrap_or(index);
+                        inner.focused_index.set(Some(index));
+                        inner
+                            .selected_indices
+                            .borrow_mut()
+                            .extend(anchor.min(index)..=anchor.max(index));
+                        Inner::set_selection_mode(&inner, true);
+                        Inner::update_tile_styles(&inner);
+                    } else {
+                        Inner::toggle_selected(&inner, index);
+                    }
+                }
+                return;
+            }
 
             if n_press == 2 {
                 if let Some(f) = inner.on_activate.borrow().as_ref() {
@@ -1553,6 +1978,50 @@ impl Inner {
             Inner::update_tile_styles(&inner);
         });
         frame.add_controller(click);
+
+        let drag = DragSource::new();
+        drag.set_actions(gdk::DragAction::COPY);
+        let weak = Rc::downgrade(this);
+        let dragged = Rc::new(Cell::new(0usize));
+        let dragged_count = dragged.clone();
+        drag.connect_prepare(move |drag, _, _| {
+            // On a touchscreen, a drag is a scroll.
+            let touch = drag
+                .current_event_device()
+                .is_some_and(|d| d.source() == gdk::InputSource::Touchscreen);
+            if touch {
+                return None;
+            }
+            let files = weak.upgrade()?.drag_files(index);
+            if files.is_empty() {
+                return None;
+            }
+            dragged_count.set(files.len());
+            let list = gdk::FileList::from_array(&files);
+            Some(gdk::ContentProvider::for_value(&list.to_value()))
+        });
+        let pic = picture.downgrade();
+        drag.connect_drag_begin(move |_, drag| {
+            let Some(paintable) = pic.upgrade().and_then(|p| p.paintable()) else { return };
+            // A small thumbnail (thumbnails themselves are 640 px), with a
+            // count when several photos are dragged.
+            let thumb = Picture::for_paintable(&paintable);
+            thumb.set_content_fit(gtk4::ContentFit::Cover);
+            thumb.set_size_request(96, 96);
+            thumb.set_overflow(gtk4::Overflow::Hidden);
+            thumb.add_css_class("photon-drag-icon");
+            let icon = Overlay::new();
+            icon.set_child(Some(&thumb));
+            if dragged.get() > 1 {
+                let count = Label::new(Some(&dragged.get().to_string()));
+                count.add_css_class("photon-drag-count");
+                count.set_halign(Align::End);
+                count.set_valign(Align::Start);
+                icon.add_overlay(&count);
+            }
+            gtk4::DragIcon::for_drag(drag).set_child(Some(&icon));
+        });
+        frame.add_controller(drag);
         frame
     }
 
@@ -1588,8 +2057,31 @@ fn clear_children(container: &GtkBox) {
     }
 }
 
-fn rebuild_tile_badges(badges_box: &GtkBox, rating: i32, flagged: i32) {
+fn rebuild_tile_badges(
+    badges_box: &GtkBox,
+    rating: i32,
+    flagged: i32,
+    is_video: bool,
+    duration: Option<&str>,
+    missing: bool,
+) {
     clear_children(badges_box);
+    if missing {
+        let missing_label = Label::new(Some("⚠ Offline"));
+        missing_label.add_css_class("photon-tile-badge");
+        missing_label.add_css_class("photon-tile-warning-badge");
+        badges_box.append(&missing_label);
+    }
+    if is_video {
+        let label = match duration {
+            Some(d) if !d.is_empty() => format!("▶ {d}"),
+            _ => "▶".to_string(),
+        };
+        let video_label = Label::new(Some(&label));
+        video_label.add_css_class("photon-tile-badge");
+        video_label.add_css_class("photon-tile-video-badge");
+        badges_box.append(&video_label);
+    }
     if rating > 0 {
         let star_label = Label::new(Some(&format!("★ {}", rating)));
         star_label.add_css_class("photon-tile-badge");
@@ -1654,6 +2146,7 @@ mod tests {
             thumbhash: None,
             rating: 0,
             flagged: 0,
+            ..Default::default()
         }
     }
 
@@ -1819,3 +2312,32 @@ mod tests {
     }
 }
 
+/// Write the rating and reject state of photos `ids`, as the library now has
+/// them, into their XMP sidecars, so darktable and others see grid culling too.
+fn sync_cull_to_xmp(conn: &rusqlite::Connection, ids: &[i64]) {
+    for &id in ids {
+        let Ok(Some(image)) = queries::get_image(conn, id) else { continue };
+        let update = photon_import::XmpUpdate {
+            rating: Some(image.rating),
+            rejected: Some(image.flagged == -1),
+            ..Default::default()
+        };
+        if let Err(e) = photon_import::write_image_xmp(conn, id, &image.path, &update) {
+            log::warn!("Writing XMP for {}: {e}", image.path.display());
+        }
+    }
+}
+
+/// Write updated EXIF orientation of photos into their XMP sidecars.
+fn sync_orientation_to_xmp(conn: &rusqlite::Connection, updates: &[(i64, u16)]) {
+    for &(id, orientation) in updates {
+        let Ok(Some(image)) = queries::get_image(conn, id) else { continue };
+        let update = photon_import::XmpUpdate {
+            orientation: Some(orientation),
+            ..Default::default()
+        };
+        if let Err(e) = photon_import::write_image_xmp(conn, id, &image.path, &update) {
+            log::warn!("Writing XMP orientation for {}: {e}", image.path.display());
+        }
+    }
+}

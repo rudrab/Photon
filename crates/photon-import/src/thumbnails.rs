@@ -63,6 +63,30 @@ pub fn thumb_path(cache_root: &Path, size: ThumbSize, hash: &str) -> PathBuf {
     cache_root.join(size.dir()).join(shard).join(format!("{hash}.jpg"))
 }
 
+/// Remove cached thumbnails (Grid and Large) for a given image hash.
+pub fn invalidate_cache(cache_root: &Path, hash: &str) {
+    for size in [ThumbSize::Grid, ThumbSize::Large] {
+        let p = thumb_path(cache_root, size, hash);
+        if p.exists() {
+            let _ = fs::remove_file(p);
+        }
+    }
+}
+
+/// The ICC profile embedded in the file at `path`, if any (none = sRGB).
+pub(crate) fn extract_icc_profile(path: &Path, format: ImageFormat) -> Option<Vec<u8>> {
+    match format {
+        ImageFormat::Jpeg => crate::icc::extract_jpeg_icc(path),
+        ImageFormat::Png => crate::icc::extract_png_icc(path),
+        ImageFormat::Webp => crate::icc::extract_webp_icc(path),
+        ImageFormat::Heif | ImageFormat::Avif => crate::icc::extract_heif_icc(path),
+        ImageFormat::Tiff | ImageFormat::RawOrf | ImageFormat::RawCr2 | ImageFormat::RawCr3
+        | ImageFormat::RawNef | ImageFormat::RawArw | ImageFormat::RawDng | ImageFormat::RawRaf
+        | ImageFormat::RawRw2 => crate::icc::extract_tiff_icc(path),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub struct ThumbnailGenerator {
     cache_root: PathBuf,
@@ -75,6 +99,10 @@ impl ThumbnailGenerator {
 
     pub fn cache_root(&self) -> &Path {
         &self.cache_root
+    }
+
+    pub fn invalidate(&self, hash: &str) {
+        invalidate_cache(&self.cache_root, hash);
     }
 
     /// Delete the old id-keyed cache (`small/`, `medium/`). Its files belong to
@@ -108,9 +136,15 @@ impl ThumbnailGenerator {
             .or_else(|| metadata::extract(&image.path).ok()?.orientation)
             .unwrap_or(1);
 
+        let format = metadata::format_of(&image.path);
         let rgb = load_smart(&image.path, size.long_edge())?.into_rgb8();
+        let rgb = crate::icc::to_srgb(rgb, extract_icc_profile(&image.path, format));
         let resized = resize(rgb, size.long_edge())?;
-        let oriented = apply_orientation(resized, orientation);
+        let oriented = if matches!(format, ImageFormat::Heif | ImageFormat::Avif) && orientation == 1 {
+            resized
+        } else {
+            apply_orientation(resized, orientation)
+        };
 
         // Write to a unique temp name, then rename: the UI never sees a partial
         // file, and concurrent generators of the same image can't clash.
@@ -147,9 +181,15 @@ impl ThumbnailGenerator {
             .or_else(|| metadata::extract(&image.path).ok()?.orientation)
             .unwrap_or(1);
 
+        let format = metadata::format_of(&image.path);
         let rgb = load_smart(&image.path, ThumbSize::Grid.long_edge())?.into_rgb8();
+        let rgb = crate::icc::to_srgb(rgb, extract_icc_profile(&image.path, format));
         let resized = resize(rgb, ThumbSize::Grid.long_edge())?;
-        let oriented = apply_orientation(resized, orientation);
+        let oriented = if matches!(format, ImageFormat::Heif | ImageFormat::Avif) && orientation == 1 {
+            resized
+        } else {
+            apply_orientation(resized, orientation)
+        };
 
         let th = compute_thumbhash(&oriented);
 
@@ -305,8 +345,104 @@ fn resize(src: RgbImage, long_edge: u32) -> Result<RgbImage> {
     RgbImage::from_raw(dst_w, dst_h, dst.into_vec()).context("resize buffer mismatch")
 }
 
+/// `image` upright at full resolution, for 1:1 viewing: RAW files developed
+/// from their sensor data (see [`raw::develop`](crate::raw::develop)), the
+/// rest decoded in full. In sRGB.
+pub fn full_resolution(image: &Image) -> Result<RgbImage> {
+    let format = metadata::format_of(&image.path);
+    if format.is_raw() {
+        let rgb = crate::raw::develop(&image.path)?;
+        return Ok(apply_orientation(rgb, orientation_of(image)));
+    }
+    let (img, icc) = decode_upright(image)?;
+    Ok(crate::icc::to_srgb(img.into_rgb8(), icc))
+}
+
+/// `image`'s stored orientation, or, for rows imported by older versions, the
+/// file's.
+pub(crate) fn orientation_of(image: &Image) -> u16 {
+    image
+        .orientation
+        .or_else(|| metadata::extract(&image.path).ok()?.orientation)
+        .unwrap_or(1)
+}
+
+/// `image` (anything but a RAW file) decoded upright at full resolution, at
+/// its own bit depth and in its own colour space, with that space's ICC
+/// profile (`None` = sRGB).
+pub(crate) fn decode_upright(image: &Image) -> Result<(DynamicImage, Option<Vec<u8>>)> {
+    let orientation = orientation_of(image);
+    let format = metadata::format_of(&image.path);
+    let img = if format.is_video() {
+        load_video_frame(&image.path, 2560)?
+    } else if matches!(format, ImageFormat::Heif | ImageFormat::Avif) {
+        // libheif has already applied the file's rotation (irot/imir); only
+        // a rotation made in Photon since import is left.
+        decode_heif_or_avif(&image.path)?
+    } else if format == ImageFormat::Gif {
+        decode_gif_first_frame(&image.path)?
+    } else {
+        image::io::Reader::open(&image.path)?
+            .with_guessed_format()?
+            .decode()
+            .context("Failed to decode image")?
+    };
+    let icc = if format.is_video() || format == ImageFormat::Gif {
+        None
+    } else {
+        extract_icc_profile(&image.path, format)
+    };
+    Ok((orient_dynamic(img, orientation), icc))
+}
+
+/// [`apply_orientation`] for any pixel type.
+fn orient_dynamic(img: DynamicImage, orientation: u16) -> DynamicImage {
+    match orientation {
+        2 => img.fliph(),
+        3 => img.rotate180(),
+        4 => img.flipv(),
+        5 => img.rotate90().fliph(),
+        6 => img.rotate90(),
+        7 => img.rotate270().fliph(),
+        8 => img.rotate270(),
+        _ => img,
+    }
+}
+
+/// The largest preview the camera embedded in RAW `image`, upright.
+pub(crate) fn embedded_preview_upright(image: &Image) -> Result<RgbImage> {
+    let orientation = image
+        .orientation
+        .or_else(|| metadata::extract(&image.path).ok()?.orientation)
+        .unwrap_or(1);
+    let preview = load_raw_preview(&image.path, u32::MAX)?.into_rgb8();
+    Ok(apply_orientation(preview, orientation))
+}
+
+/// Mean brightness (sRGB-encoded luminance, 0–1) of the camera's embedded
+/// preview in RAW file `path`: what the camera meant the photo to look like.
+pub(crate) fn embedded_preview_luma(path: &Path) -> Option<f32> {
+    let data = fs::read(path).ok()?;
+    let (start, _, _) = largest_embedded_jpeg(&data)?;
+    let preview = decode_jpeg_scaled(Cursor::new(&data[start..]), 512).ok()?.into_rgb8();
+    let decode = |v: u8| {
+        let v = v as f32 / 255.0;
+        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    };
+    let encode = |y: f32| if y <= 0.003_130_8 { 12.92 * y } else { 1.055 * y.powf(1.0 / 2.4) - 0.055 };
+    let n = preview.pixels().len().max(1) as f32;
+    let sum: f32 = preview
+        .pixels()
+        .map(|p| encode(0.2126 * decode(p[0]) + 0.7152 * decode(p[1]) + 0.0722 * decode(p[2])))
+        .sum();
+    Some(sum / n)
+}
+
 /// Apply EXIF orientation so that the pixels are displayed upright.
-fn apply_orientation(img: RgbImage, orientation: u16) -> RgbImage {
+pub(crate) fn apply_orientation<P>(img: ImageBuffer<P, Vec<P::Subpixel>>, orientation: u16) -> ImageBuffer<P, Vec<P::Subpixel>>
+where
+    P: image::Pixel + 'static,
+{
     use image::imageops::{flip_horizontal, flip_vertical, rotate180, rotate270, rotate90};
     match orientation {
         2 => flip_horizontal(&img),
@@ -325,6 +461,15 @@ fn apply_orientation(img: RgbImage, orientation: u16) -> RgbImage {
 fn load_smart(path: &Path, long_edge: u32) -> Result<DynamicImage> {
     let format = metadata::format_of(path);
 
+    if format.is_video() {
+        return load_video_frame(path, long_edge);
+    }
+    if matches!(format, ImageFormat::Heif | ImageFormat::Avif) {
+        return decode_heif_or_avif(path);
+    }
+    if format == ImageFormat::Gif {
+        return decode_gif_first_frame(path);
+    }
     if format.is_raw() {
         return load_raw_preview(path, long_edge);
     }
@@ -338,6 +483,106 @@ fn load_smart(path: &Path, long_edge: u32) -> Result<DynamicImage> {
         .with_guessed_format()?
         .decode()
         .context("Failed to decode image")
+}
+
+/// Decode HEIF or AVIF file via libheif-rs into DynamicImage.
+/// Note that libheif automatically applies `irot` and `imir` transformations on decode.
+pub fn decode_heif_or_avif(path: &Path) -> Result<DynamicImage> {
+    use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
+    let path_str = path.to_str().context("invalid UTF-8 path")?;
+    let ctx = HeifContext::read_from_file(path_str)?;
+    let handle = ctx.primary_image_handle()?;
+    let lib_heif = LibHeif::new();
+    let img = lib_heif.decode(&handle, ColorSpace::Rgb(RgbChroma::Rgb), None)?;
+    let planes = img.planes();
+    let plane = planes.interleaved.context("libheif decoded plane is not interleaved")?;
+    let w = plane.width;
+    let h = plane.height;
+    let row_size = (w * 3) as usize;
+    if row_size > plane.stride {
+        anyhow::bail!("Row size exceeds stride in libheif plane");
+    }
+    let mut buf = Vec::with_capacity(row_size * h as usize);
+    for row in plane.data.chunks_exact(plane.stride).take(h as usize) {
+        buf.extend_from_slice(&row[..row_size]);
+    }
+    let rgb = RgbImage::from_raw(w, h, buf).context("mismatched buffer size in decoded HEIF")?;
+    Ok(DynamicImage::ImageRgb8(rgb))
+}
+
+/// Decode the first frame of a GIF file.
+pub fn decode_gif_first_frame(path: &Path) -> Result<DynamicImage> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let decoder = image::codecs::gif::GifDecoder::new(reader)?;
+    use image::AnimationDecoder;
+    let frames = decoder.into_frames();
+    let mut frames_iter = frames.into_iter();
+    if let Some(first_frame) = frames_iter.next() {
+        let frame = first_frame?;
+        let buffer = frame.into_buffer();
+        Ok(DynamicImage::ImageRgba8(buffer))
+    } else {
+        anyhow::bail!("GIF has no frames: {}", path.display());
+    }
+}
+
+/// Extract a video frame at approximately 1 second using installed video thumbnailer.
+/// Tries `gst-video-thumbnailer`, then `ffmpegthumbnailer`, then `gst-launch-1.0`.
+pub fn load_video_frame(path: &Path, long_edge: u32) -> Result<DynamicImage> {
+    let tmp = tempfile::Builder::new()
+        .prefix("photon-vid-thumb-")
+        .suffix(".png")
+        .tempfile()?;
+    let tmp_path = tmp.path().to_path_buf();
+
+    // 1. Try gst-video-thumbnailer (standard on GNOME / Fedora)
+    let gst_status = std::process::Command::new("gst-video-thumbnailer")
+        .arg("--input-path")
+        .arg(path)
+        .arg("--output")
+        .arg(&tmp_path)
+        .arg("--size")
+        .arg(long_edge.to_string())
+        .status();
+
+    if gst_status.is_ok_and(|s| s.success()) && tmp_path.exists() && fs::metadata(&tmp_path).map_or(false, |m| m.len() > 0) {
+        let bytes = fs::read(&tmp_path)?;
+        return Ok(image::load_from_memory(&bytes)?);
+    }
+
+    // 2. Try ffmpegthumbnailer
+    let ffmpeg_status = std::process::Command::new("ffmpegthumbnailer")
+        .arg("-i")
+        .arg(path)
+        .arg("-o")
+        .arg(&tmp_path)
+        .arg("-s")
+        .arg(long_edge.to_string())
+        .arg("-t")
+        .arg("1")
+        .status();
+
+    if ffmpeg_status.is_ok_and(|s| s.success()) && tmp_path.exists() && fs::metadata(&tmp_path).map_or(false, |m| m.len() > 0) {
+        let bytes = fs::read(&tmp_path)?;
+        return Ok(image::load_from_memory(&bytes)?);
+    }
+
+    // 3. Fallback to gst-launch-1.0
+    let uri = format!("file://{}", path.canonicalize().unwrap_or_else(|_| path.to_path_buf()).display());
+    let gst_launch = std::process::Command::new("gst-launch-1.0")
+        .arg("-q")
+        .arg("playbin")
+        .arg(format!("uri={uri}"))
+        .arg(format!("video-sink=videoconvert ! pngenc ! filesink location={}", tmp_path.display()))
+        .status();
+
+    if gst_launch.is_ok_and(|s| s.success()) && tmp_path.exists() && fs::metadata(&tmp_path).map_or(false, |m| m.len() > 0) {
+        let bytes = fs::read(&tmp_path)?;
+        return Ok(image::load_from_memory(&bytes)?);
+    }
+
+    anyhow::bail!("Failed to generate video thumbnail for {}", path.display());
 }
 
 /// RAW files can't be decoded here; use the best JPEG the camera stored.
@@ -655,4 +900,127 @@ mod tests {
         let preview = load_raw_preview(&orf, 640).unwrap();
         assert_eq!(preview.width().max(preview.height()), 800); // 1/2 IDCT scale, ≥ 640
     }
+
+    #[test]
+    fn invalidate_cache_removes_both_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("test.jpg");
+        write_jpeg(&src, &Spec { width: 1000, height: 1000, ..Default::default() });
+
+        let cache = dir.path().join("cache");
+        let gen = ThumbnailGenerator::new(cache.clone());
+        let img = image_at(&src, None);
+        let grid_path = gen.ensure_grid(&img).unwrap().0;
+        let large_path = gen.ensure(&img, ThumbSize::Large).unwrap();
+
+        assert!(grid_path.exists());
+        assert!(large_path.exists());
+
+        invalidate_cache(&cache, &img.hash);
+        assert!(!grid_path.exists());
+        assert!(!large_path.exists());
+    }
+
+    #[test]
+    fn decodes_heic_and_avif_fixtures() {
+        let fixtures_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let avif = fixtures_dir.join("sample.avif");
+        assert!(avif.exists(), "sample.avif fixture must exist in tests/fixtures");
+
+        let dyn_img = decode_heif_or_avif(&avif).expect("AVIF decode must succeed");
+        assert!(dyn_img.width() > 0 && dyn_img.height() > 0);
+
+        let img_model = Image {
+            id: Some(10),
+            hash: "avif_sample_hash".to_string(),
+            path: avif.clone(),
+            filename: "sample.avif".to_string(),
+            format: Some(ImageFormat::Avif),
+            orientation: Some(1),
+            ..Default::default()
+        };
+
+        // Full resolution decode
+        let full_res = full_resolution(&img_model).expect("AVIF full resolution decode must succeed");
+        assert!(full_res.width() > 0 && full_res.height() > 0);
+
+        // Thumbnail generator ensure_grid
+        let cache_dir = tempfile::tempdir().unwrap();
+        let gen = ThumbnailGenerator::new(cache_dir.path().to_path_buf());
+        let (thumb_path, _) = gen.ensure_grid(&img_model).expect("AVIF thumbnail generation must succeed");
+        assert!(thumb_path.exists());
+        assert!(fs::metadata(&thumb_path).unwrap().len() > 0);
+
+        let heic = fixtures_dir.join("sample.heic");
+        assert!(heic.exists(), "sample.heic fixture must exist in tests/fixtures");
+        match decode_heif_or_avif(&heic) {
+            Ok(dyn_img) => {
+                assert!(dyn_img.width() > 0 && dyn_img.height() > 0);
+                let heic_model = Image {
+                    id: Some(11),
+                    hash: "heic_sample_hash".to_string(),
+                    path: heic.clone(),
+                    filename: "sample.heic".to_string(),
+                    format: Some(ImageFormat::Heif),
+                    orientation: Some(1),
+                    ..Default::default()
+                };
+                let full = full_resolution(&heic_model).unwrap();
+                assert!(full.width() > 0 && full.height() > 0);
+            }
+            Err(e) => crate::testutil::assert_missing_hevc_decoder("decodes_heic_and_avif_fixtures", &e.to_string()),
+        }
+    }
+
+    #[test]
+    fn decodes_gif_first_frame_correctly() {
+        let fixtures_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let gif_path = fixtures_dir.join("sample.gif");
+        assert!(gif_path.exists(), "sample.gif fixture must exist");
+
+        let decoded = decode_gif_first_frame(&gif_path).expect("GIF decode first frame must succeed");
+        assert_eq!((decoded.width(), decoded.height()), (16, 16));
+
+        let img_model = Image {
+            id: Some(12),
+            hash: "gif_sample_hash".to_string(),
+            path: gif_path.clone(),
+            filename: "sample.gif".to_string(),
+            format: Some(ImageFormat::Gif),
+            orientation: Some(1),
+            ..Default::default()
+        };
+
+        let full = full_resolution(&img_model).expect("GIF full resolution must succeed");
+        assert_eq!((full.width(), full.height()), (16, 16));
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let gen = ThumbnailGenerator::new(cache_dir.path().to_path_buf());
+        let (thumb_path, _) = gen.ensure_grid(&img_model).expect("GIF thumbnail generation must succeed");
+        assert!(thumb_path.exists());
+    }
+
+    #[test]
+    fn video_thumbnail_graceful_degradation_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let dummy_vid = dir.path().join("corrupted.mp4");
+        std::fs::write(&dummy_vid, b"not a real video file").unwrap();
+
+        let img = Image {
+            id: Some(13),
+            hash: "corrupt_vid_hash".to_string(),
+            path: dummy_vid.clone(),
+            filename: "corrupted.mp4".to_string(),
+            format: Some(ImageFormat::VideoMp4),
+            ..Default::default()
+        };
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let gen = ThumbnailGenerator::new(cache_dir.path().to_path_buf());
+
+        // Generation should fail gracefully without crashing
+        let res = gen.ensure_grid(&img);
+        assert!(res.is_err(), "Invalid video thumbnail should return Err, not panic");
+    }
 }
+

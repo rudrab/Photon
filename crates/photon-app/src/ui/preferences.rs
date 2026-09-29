@@ -9,7 +9,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 use photon_core::db::queries;
 use photon_core::db::Database;
-use photon_core::models::{DesktopApp, Preferences};
+use photon_core::models::{Versions, DesktopApp, Preferences};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
@@ -113,6 +113,82 @@ pub fn show(
     group_display.add(&spin_row);
 
     page.add(&group_display);
+
+    // ── RAW + JPG shots ─────────────────────────────────
+    let group_delete = adw::PreferencesGroup::builder()
+        .title("RAW + JPG Shots")
+        .description(
+            "A shot can have several versions: a RAW file, a JPG from the camera, and edits. \
+             Photos without other versions are always used themselves.",
+        )
+        .build();
+
+    let versions_row = |title: &str, subtitle: &str, current: Versions| {
+        adw::ComboRow::builder()
+            .title(title)
+            .subtitle(subtitle)
+            .model(&StringList::new(&Versions::ALL.map(Versions::label)))
+            .selected(Versions::ALL.iter().position(|&m| m == current).unwrap_or(0) as u32)
+            .build()
+    };
+    let share_row = versions_row(
+        "Share Sends",
+        "Copy, email, chats and other apps; a selected RAW is swapped for its JPG under Raster only",
+        current_prefs.share_versions,
+    );
+    group_delete.add(&share_row);
+    let delete_row = versions_row(
+        "Move to Trash Removes",
+        "Applies to every version of the selected shots",
+        current_prefs.delete_mode,
+    );
+    group_delete.add(&delete_row);
+
+    page.add(&group_delete);
+
+    // ── Import safety ───────────────────────────────────
+    let group_import = adw::PreferencesGroup::builder()
+        .title("Import Safety")
+        .description("For imports that copy or move photos into the library, e.g. from a memory card.")
+        .build();
+
+    let verify_row = adw::SwitchRow::builder()
+        .title("Verify Copies")
+        .subtitle("Read each copy back from the disk and compare it with the card before trusting it")
+        .active(current_prefs.verify_imports)
+        .build();
+    group_import.add(&verify_row);
+
+    let backup_dir = Rc::new(RefCell::new(current_prefs.import_backup_dir.clone()));
+    let backup_row = adw::ActionRow::builder().title("Backup Copy").build();
+    let describe_backup = {
+        let backup_row = backup_row.clone();
+        move |dir: Option<&Path>| match dir {
+            None => backup_row.set_subtitle("Off: photos are only in the library after import"),
+            Some(dir) if same_disk(dir, &photon_import::library::library_root(None)) => backup_row.set_subtitle(&format!(
+                "{} — on the library's disk: guards against mistakes, not a disk failure",
+                dir.display()
+            )),
+            Some(dir) => backup_row.set_subtitle(&format!(
+                "{} — a move deletes a photo from the card only once both copies exist",
+                dir.display()
+            )),
+        }
+    };
+    describe_backup(backup_dir.borrow().as_deref());
+    let choose_btn = gtk4::Button::builder().label("Choose…").valign(gtk4::Align::Center).build();
+    let clear_btn = gtk4::Button::builder()
+        .icon_name("edit-clear-symbolic")
+        .tooltip_text("Turn off")
+        .valign(gtk4::Align::Center)
+        .build();
+    clear_btn.add_css_class("flat");
+    clear_btn.set_sensitive(backup_dir.borrow().is_some());
+    backup_row.add_suffix(&choose_btn);
+    backup_row.add_suffix(&clear_btn);
+    group_import.add(&backup_row);
+
+    page.add(&group_import);
     window.add(&page);
 
     // ── Live Save on changes ────────────────────────────
@@ -128,6 +204,10 @@ pub fn show(
         let raw_row = raw_row.clone();
         let viewer_row = viewer_row.clone();
         let spin_row = spin_row.clone();
+        let delete_row = delete_row.clone();
+        let share_row = share_row.clone();
+        let verify_row = verify_row.clone();
+        let backup_dir = backup_dir.clone();
         let on_save = on_save.clone();
         let db = db_clone.clone();
 
@@ -137,6 +217,16 @@ pub fn show(
                 raw_editor: get_combo_exec(&raw_row, &raw_execs),
                 viewer: get_combo_exec(&viewer_row, &viewer_execs),
                 thumbnail_size: spin_row.value() as u32,
+                delete_mode: Versions::ALL
+                    .get(delete_row.selected() as usize)
+                    .copied()
+                    .unwrap_or_default(),
+                share_versions: Versions::ALL
+                    .get(share_row.selected() as usize)
+                    .copied()
+                    .unwrap_or(Versions::RasterOnly),
+                verify_imports: verify_row.is_active(),
+                import_backup_dir: backup_dir.borrow().clone(),
             };
 
             *prefs.borrow_mut() = new_prefs.clone();
@@ -162,6 +252,39 @@ pub fn show(
 
     let sc4 = save_changes.clone();
     spin_row.connect_value_notify(move |_| sc4());
+
+    let sc5 = save_changes.clone();
+    delete_row.connect_selected_notify(move |_| sc5());
+
+    let sc6 = save_changes.clone();
+    share_row.connect_selected_notify(move |_| sc6());
+
+    let sc7 = save_changes.clone();
+    verify_row.connect_active_notify(move |_| sc7());
+
+    let set_backup_dir = {
+        let backup_dir = backup_dir.clone();
+        let clear_btn = clear_btn.clone();
+        let save = save_changes.clone();
+        Rc::new(move |dir: Option<std::path::PathBuf>| {
+            describe_backup(dir.as_deref());
+            clear_btn.set_sensitive(dir.is_some());
+            *backup_dir.borrow_mut() = dir;
+            save();
+        })
+    };
+    let set = set_backup_dir.clone();
+    clear_btn.connect_clicked(move |_| set(None));
+    let parent_win = window.clone();
+    choose_btn.connect_clicked(move |_| {
+        let dialog = gtk4::FileDialog::builder().title("Folder for Backup Copies").modal(true).build();
+        let set = set_backup_dir.clone();
+        dialog.select_folder(Some(&parent_win), gtk4::gio::Cancellable::NONE, move |result| {
+            if let Some(path) = result.ok().and_then(|f| f.path()) {
+                set(Some(path));
+            }
+        });
+    });
 
     window.present();
 }
@@ -378,4 +501,11 @@ fn get_combo_exec(row: &adw::ComboRow, execs: &[String]) -> String {
     } else {
         "xdg-open".to_string()
     }
+}
+
+/// Whether `a` and `b` (or their nearest existing ancestors) are on one filesystem.
+fn same_disk(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let dev = |p: &Path| p.ancestors().find_map(|p| fs::metadata(p).ok()).map(|m| m.dev());
+    matches!((dev(a), dev(b)), (Some(x), Some(y)) if x == y)
 }

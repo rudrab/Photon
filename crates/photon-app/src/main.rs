@@ -15,7 +15,7 @@ mod handlers;
 mod menu;
 mod ui;
 
-const APP_ID: &str = "com.github.photon";
+const APP_ID: &str = "org.mavensgroup.photon";
 const APP_CSS: &str = include_str!("../resources/style.css");
 
 fn main() -> Result<()> {
@@ -64,6 +64,7 @@ fn build_ui(app: &adw::Application) {
     // --- Database ---
     let db_path = data_dir.join("photon.db");
     let db = Database::open(&db_path).expect("Failed to initialize database");
+    let db_backup = db.clone();
 
     // --- Thumbnail cache ---
     let cache_dir = glib::user_cache_dir().join("photon").join("thumbnails");
@@ -86,6 +87,44 @@ fn build_ui(app: &adw::Application) {
     }
 
     handlers::import_handler::generate_missing_thumbnails(&window);
+    back_up_catalog(&window.window, db_backup, data_dir.join("backups"));
+}
+
+/// Daily, in the background: check the library database and keep a
+/// rotating set of copies of it. A failed check is shown to the user right
+/// away — the sooner they know, the more recent their last good copy is.
+fn back_up_catalog(window: &adw::ApplicationWindow, db: Database, dir: std::path::PathBuf) {
+    const KEEP: usize = 14;
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(20 * 3600);
+
+    let (tx, rx) = async_channel::bounded(1);
+    let backups = dir.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send_blocking(db.back_up(&backups, KEEP, EVERY));
+    });
+    let window = window.downgrade();
+    glib::spawn_future_local(async move {
+        let Ok(result) = rx.recv().await else { return };
+        match result {
+            Ok(photon_core::db::BackupOutcome::Saved(path)) => log::info!("Library backed up to {}", path.display()),
+            Ok(photon_core::db::BackupOutcome::Recent) => {}
+            Err(e) => {
+                log::error!("Library backup: {e}");
+                let Some(window) = window.upgrade() else { return };
+                let dialog = adw::MessageDialog::new(
+                    Some(&window),
+                    Some("Library Database Problem"),
+                    Some(&format!(
+                        "{e}\n\nRatings, tags and albums may be affected. Your photo files are not. \
+                         Earlier copies of the database are kept in {}.",
+                        dir.display()
+                    )),
+                );
+                dialog.add_response("ok", "OK");
+                dialog.present();
+            }
+        }
+    });
 }
 
 fn schedule_screenshot(window: &adw::ApplicationWindow, path: std::path::PathBuf) {

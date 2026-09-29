@@ -22,4 +22,11 @@ pub trait ImportSource: Send + Sync {
 
     /// Human-readable description (e.g. the root path or DB path).
     fn source_description(&self) -> &str;
+
+    /// After the files are in the library: carry over what the source knows
+    /// about them (ratings, flags, tags). Returns how many photos it updated.
+    fn apply_metadata(&self, _conn: &rusqlite::Connection) -> anyhow::Result<usize> {
+        Ok(0)
+    }
 }
+pub use digikam::DigikamSource;

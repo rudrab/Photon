@@ -104,3 +104,24 @@ pub fn write_jpeg(path: &Path, spec: &Spec) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, jpeg).unwrap();
 }
+
+/// Whether libheif has an HEVC decoder (libde265 or ffmpeg plugin). Fedora
+/// ships libheif without one, so HEIC tests can only check the error there.
+pub fn hevc_decoder_available() -> bool {
+    let lib = libheif_rs::LibHeif::new();
+    !lib.decoder_descriptors(1, Some(libheif_rs::CompressionFormat::Hevc)).is_empty()
+}
+
+/// Called when an HEIC test can't decode: the failure must be the missing
+/// decoder, and the skip is printed so it isn't mistaken for coverage.
+pub fn assert_missing_hevc_decoder(test: &str, err: &str) {
+    assert!(
+        !hevc_decoder_available(),
+        "{test}: an HEVC decoder is installed, but decoding failed: {err}"
+    );
+    assert!(
+        err.contains("No decoding plugin installed") || err.contains("NoMatchingDecoderInstalled"),
+        "{test}: unexpected HEIC error: {err}"
+    );
+    eprintln!("SKIPPED {test}: no HEVC decoder for libheif (install libde265); HEIC decode is untested here");
+}

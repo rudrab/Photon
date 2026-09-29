@@ -12,14 +12,19 @@
 //! days only when opened, so a multi-decade library costs a few dozen widgets.
 
 use async_channel::Sender;
-use chrono::NaiveDate;
+use chrono::{DateTime, Datelike, NaiveDate};
 use gtk4::prelude::*;
-use gtk4::{Align, Box, Button, Expander, Image, Label, Orientation, ScrolledWindow, Separator};
+use gtk4::{
+    gdk, Align, Box, Button, Entry, Expander, GestureClick, Image, Label,
+    Orientation, Popover, ScrolledWindow, Separator,
+};
+use libadwaita as adw;
+use libadwaita::prelude::*;
 use photon_core::db::queries;
 use photon_core::db::Database;
-use photon_core::models::UIAction;
+use photon_core::models::{Album, Event, UIAction};
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::thread;
 
@@ -27,7 +32,9 @@ use std::thread;
 #[derive(Clone)]
 pub struct Sidebar {
     pub widget: ScrolledWindow,
+    pub missing_container: Box,
     pub events_container: Box,
+    pub albums_container: Box,
     pub tags_container: Box,
     pub db: Database,
     pub sender: Sender<UIAction>,
@@ -39,6 +46,8 @@ pub struct Sidebar {
     /// Open years `(year, None)` and months `(year, Some(month))`. Survives
     /// refreshes, so live updates during an import don't snap the tree shut.
     expanded: Rc<RefCell<HashSet<NodeKey>>>,
+    /// Day events cache: (year, month, day) -> Event name
+    pub event_names: Rc<RefCell<HashMap<(i32, u32, u32), String>>>,
 }
 
 type NodeKey = (i32, Option<u32>);
@@ -87,43 +96,110 @@ fn build_tree(rows: &[(i32, u32, u32, u32)]) -> Vec<YearNode> {
 
 impl Sidebar {
     /// Reload the year/month/day events tree from DB.
-    ///
-    /// Only the year rows are built here; a year's months and a month's days
-    /// are built the first time that expander opens. Nodes the user left open
-    /// are reopened (and so built) on every refresh.
     pub fn refresh_events(&self) {
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
 
         let db = self.db.clone();
-        let (tx_db, rx_db) = async_channel::bounded::<Vec<(i32, u32, u32, u32)>>(1);
+        let (tx_db, rx_db) = async_channel::bounded::<(Vec<(i32, u32, u32, u32)>, Vec<Event>)>(1);
         thread::spawn(move || {
-            let rows = db.conn().map_err(|e| e.to_string()).and_then(|conn| {
-                queries::date_tree(&conn).map_err(|e| e.to_string())
-            });
-            match rows {
-                Ok(rows) => {
-                    let _ = tx_db.send_blocking(rows);
-                }
-                Err(e) => log::error!("Sidebar query failed: {e}"),
+            if let Ok(conn) = db.conn() {
+                let rows = queries::date_tree(&conn).unwrap_or_default();
+                let events = queries::get_all_events_with_counts(&conn)
+                    .map(|evs| evs.into_iter().map(|(e, _)| e).collect())
+                    .unwrap_or_default();
+                let _ = tx_db.send_blocking((rows, events));
             }
         });
 
         let this = self.clone();
         gtk4::glib::MainContext::default().spawn_local(async move {
-            let Ok(rows) = rx_db.recv().await else { return };
+            let Ok((rows, events)) = rx_db.recv().await else { return };
             if this.generation.get() != generation {
                 return; // a newer refresh will fill the tree
             }
-            let tree = build_tree(&rows);
-            if **this.tree.borrow() == tree {
-                return; // nothing changed: keep the widgets as they are
+
+            // Update day events map
+            let mut ev_map = HashMap::new();
+            for ev in &events {
+                let start_dt = DateTime::from_timestamp(ev.start_date, 0);
+                let end_dt = DateTime::from_timestamp(ev.end_date, 0);
+                if let (Some(s), Some(e)) = (start_dt, end_dt) {
+                    let mut curr = s.date_naive();
+                    let end = e.date_naive();
+                    while curr <= end {
+                        ev_map.insert((curr.year(), curr.month(), curr.day()), ev.name.clone());
+                        curr = curr.succ_opt().unwrap_or(curr);
+                        if curr == end {
+                            ev_map.insert((curr.year(), curr.month(), curr.day()), ev.name.clone());
+                            break;
+                        }
+                    }
+                }
             }
+            *this.event_names.borrow_mut() = ev_map;
+
+            let tree = build_tree(&rows);
             let tree = Rc::new(tree);
             *this.tree.borrow_mut() = tree.clone();
             this.rebuild(&tree);
         });
+        self.refresh_albums();
         self.refresh_tags();
+    }
+
+    /// Reload the albums list with photo counts.
+    pub fn refresh_albums(&self) {
+        let db = self.db.clone();
+        let (tx_albums, rx_albums) = async_channel::bounded::<Vec<(Album, u32)>>(1);
+        thread::spawn(move || {
+            if let Ok(conn) = db.conn() {
+                if let Ok(albums) = queries::get_all_albums_with_counts(&conn) {
+                    let _ = tx_albums.send_blocking(albums);
+                }
+            }
+        });
+
+        let this = self.clone();
+        gtk4::glib::MainContext::default().spawn_local(async move {
+            let Ok(albums) = rx_albums.recv().await else { return };
+            while let Some(child) = this.albums_container.first_child() {
+                this.albums_container.remove(&child);
+            }
+
+            if albums.is_empty() {
+                let empty_lbl = Label::new(Some("No albums yet"));
+                empty_lbl.set_css_classes(&["caption", "dim-label"]);
+                empty_lbl.set_halign(Align::Start);
+                empty_lbl.set_margin_start(16);
+                empty_lbl.set_margin_top(4);
+                empty_lbl.set_margin_bottom(4);
+                this.albums_container.append(&empty_lbl);
+            } else {
+                for (album, count) in albums {
+                    let btn = make_row_with_count(&album.name, "folder-pictures-symbolic", Some(count));
+                    let tx = this.sender.clone();
+                    let album_id = album.id;
+                    btn.connect_clicked(move |_| {
+                        let _ = tx.send_blocking(UIAction::FilterByAlbum(album_id));
+                    });
+
+                    // Context menu on secondary click
+                    let click = GestureClick::new();
+                    click.set_button(gdk::BUTTON_SECONDARY);
+                    let alb_id = album.id;
+                    let alb_name = album.name.clone();
+                    let this_c = this.clone();
+                    let btn_c = btn.clone();
+                    click.connect_released(move |_, _, x, y| {
+                        show_album_context_menu(&this_c, &btn_c, alb_id, &alb_name, x, y);
+                    });
+                    btn.add_controller(click);
+
+                    this.albums_container.append(&btn);
+                }
+            }
+        });
     }
 
     /// Reload the tags list with photo counts.
@@ -165,6 +241,36 @@ impl Sidebar {
                     });
                     this.tags_container.append(&btn);
                 }
+            }
+        });
+    }
+
+    /// Reload missing photos indicator and count.
+    pub fn refresh_missing(&self) {
+        let db = self.db.clone();
+        let (tx_m, rx_m) = async_channel::bounded::<usize>(1);
+        thread::spawn(move || {
+            if let Ok(conn) = db.conn() {
+                let missing_count = queries::get_missing_images(&conn).map(|imgs| imgs.len()).unwrap_or(0);
+                let _ = tx_m.send_blocking(missing_count);
+            }
+        });
+
+        let this = self.clone();
+        gtk4::glib::MainContext::default().spawn_local(async move {
+            let Ok(count) = rx_m.recv().await else { return };
+            while let Some(child) = this.missing_container.first_child() {
+                this.missing_container.remove(&child);
+            }
+
+            if count > 0 {
+                let btn = make_row_with_count("Missing Photos", "dialog-warning-symbolic", Some(count as u32));
+                btn.add_css_class("warning");
+                let tx = this.sender.clone();
+                btn.connect_clicked(move |_| {
+                    let _ = tx.send_blocking(UIAction::FilterMissing);
+                });
+                this.missing_container.append(&btn);
             }
         });
     }
@@ -222,6 +328,7 @@ impl Sidebar {
         expander.set_child(Some(&body));
 
         let sender = self.sender.clone();
+        let this = self.clone();
         self.lazy(&expander, (year, Some(month)), move || {
             // "All of <Month>" row → shows cover cards for dates
             let all = make_row_with_count(
@@ -235,16 +342,49 @@ impl Sidebar {
             });
             body.append(&all);
 
+            let this_m = this.clone();
             for &(day, day_count) in &tree[year_index].months[index].days {
+                let ev_name = this_m.event_names.borrow().get(&(year, month, day)).cloned();
+                let label_text = if let Some(ref name) = ev_name {
+                    format!("{} ({})", name, short_date_label(year, month, day))
+                } else {
+                    short_date_label(year, month, day)
+                };
                 let btn = make_row_with_count(
-                    &short_date_label(year, month, day),
-                    "x-office-calendar-symbolic",
+                    &label_text,
+                    if ev_name.is_some() { "emblem-favorite-symbolic" } else { "x-office-calendar-symbolic" },
                     Some(day_count),
                 );
                 let tx = sender.clone();
                 btn.connect_clicked(move |_| {
                     let _ = tx.send_blocking(UIAction::FilterByDay(year, month, day));
                 });
+
+                // Secondary click to Name Event
+                let click = GestureClick::new();
+                click.set_button(gdk::BUTTON_SECONDARY);
+                let this_c = this_m.clone();
+                let initial_name = ev_name.unwrap_or_default();
+                click.connect_released(move |_, _, _, _| {
+                    let sb = this_c.clone();
+                    let date_str = short_date_label(year, month, day);
+                    prompt_text_dialog(
+                        "Name Event",
+                        &format!("Name event for {date_str}:"),
+                        &initial_name,
+                        "Save",
+                        move |name| {
+                            if let Ok(conn) = sb.db.conn() {
+                                if let Err(e) = queries::name_day_event(&conn, &name, year, month, day) {
+                                    log::error!("name_day_event failed: {e}");
+                                }
+                            }
+                            sb.refresh_events();
+                        },
+                    );
+                });
+                btn.add_controller(click);
+
                 body.append(&btn);
             }
         });
@@ -299,6 +439,9 @@ pub fn create(db: Database, sender: Sender<UIAction>) -> Sidebar {
     });
     lib_box.append(&btn_all);
 
+    let missing_container = Box::new(Orientation::Vertical, 2);
+    lib_box.append(&missing_container);
+
     root.append(&lib_box);
     root.append(&make_separator());
 
@@ -308,6 +451,25 @@ pub fn create(db: Database, sender: Sender<UIAction>) -> Sidebar {
 
     let events_container = Box::new(Orientation::Vertical, 2);
     root.append(&events_container);
+
+    root.append(&make_separator());
+
+    // ── Albums header ───────────────────────────────────
+    let albums_header_box = Box::new(Orientation::Horizontal, 4);
+    albums_header_box.set_hexpand(true);
+    let albums_label = make_caption("Albums");
+    albums_label.set_hexpand(true);
+    albums_header_box.append(&albums_label);
+
+    let new_album_btn = Button::from_icon_name("list-add-symbolic");
+    new_album_btn.add_css_class("flat");
+    new_album_btn.add_css_class("circular");
+    new_album_btn.set_tooltip_text(Some("New Album"));
+    albums_header_box.append(&new_album_btn);
+    root.append(&albums_header_box);
+
+    let albums_container = Box::new(Orientation::Vertical, 2);
+    root.append(&albums_container);
 
     root.append(&make_separator());
 
@@ -322,20 +484,164 @@ pub fn create(db: Database, sender: Sender<UIAction>) -> Sidebar {
 
     let sidebar = Sidebar {
         widget: scrolled,
+        missing_container,
         events_container,
+        albums_container,
         tags_container,
-        db,
-        sender,
+        db: db.clone(),
+        sender: sender.clone(),
         generation: Rc::new(Cell::new(0)),
         tree: Rc::new(RefCell::new(Rc::new(Vec::new()))),
         expanded: Rc::new(RefCell::new(HashSet::new())),
+        event_names: Rc::new(RefCell::new(HashMap::new())),
     };
+
+    let sb_clone = sidebar.clone();
+    new_album_btn.connect_clicked(move |_| {
+        let sb = sb_clone.clone();
+        prompt_text_dialog(
+            "New Album",
+            "Enter a name for the new album:",
+            "",
+            "Create",
+            move |name| {
+                if let Ok(conn) = sb.db.conn() {
+                    if let Ok(album_id) = queries::create_album(&conn, &name) {
+                        sb.refresh_albums();
+                        let _ = sb.sender.send_blocking(UIAction::FilterByAlbum(album_id));
+                    }
+                }
+            },
+        );
+    });
 
     // Initial load
     sidebar.refresh_events();
+    sidebar.refresh_albums();
     sidebar.refresh_tags();
 
     sidebar
+}
+
+fn show_album_context_menu(
+    sidebar: &Sidebar,
+    target_btn: &Button,
+    album_id: i64,
+    album_name: &str,
+    x: f64,
+    y: f64,
+) {
+    let popover = Popover::new();
+    popover.set_parent(target_btn);
+    let rect = gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+    popover.set_pointing_to(Some(&rect));
+
+    let menu_box = Box::new(Orientation::Vertical, 4);
+    menu_box.set_margin_start(6);
+    menu_box.set_margin_end(6);
+    menu_box.set_margin_top(6);
+    menu_box.set_margin_bottom(6);
+
+    let rename_btn = Button::with_label("Rename Album…");
+    rename_btn.add_css_class("flat");
+    rename_btn.set_halign(Align::Fill);
+    let pop_c = popover.clone();
+    let sb_c = sidebar.clone();
+    let name_c = album_name.to_string();
+    rename_btn.connect_clicked(move |_| {
+        pop_c.popdown();
+        let sb = sb_c.clone();
+        let old_name = name_c.clone();
+        prompt_text_dialog(
+            "Rename Album",
+            &format!("Enter a new name for '{old_name}':"),
+            &old_name,
+            "Rename",
+            move |new_name| {
+                if let Ok(conn) = sb.db.conn() {
+                    if let Err(e) = queries::rename_album(&conn, album_id, &new_name) {
+                        log::error!("rename_album failed: {e}");
+                    }
+                }
+                sb.refresh_albums();
+            },
+        );
+    });
+
+    let delete_btn = Button::with_label("Delete Album");
+    delete_btn.add_css_class("flat");
+    delete_btn.add_css_class("destructive-action");
+    delete_btn.set_halign(Align::Fill);
+    let pop_c2 = popover.clone();
+    let sb_c2 = sidebar.clone();
+    let name_c2 = album_name.to_string();
+    delete_btn.connect_clicked(move |_| {
+        pop_c2.popdown();
+        let sb = sb_c2.clone();
+        let name = name_c2.clone();
+        let dialog = adw::MessageDialog::new(
+            None::<&gtk4::Window>,
+            Some(&format!("Delete album '{}'?", name)),
+            Some("Photos in this album will remain in your library."),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        dialog.connect_response(None, move |_, resp| {
+            if resp == "delete" {
+                if let Ok(conn) = sb.db.conn() {
+                    if let Err(e) = queries::delete_album(&conn, album_id) {
+                        log::error!("delete_album failed: {e}");
+                    }
+                }
+                sb.refresh_albums();
+                let _ = sb.sender.send_blocking(UIAction::ShowAll);
+            }
+        });
+        dialog.present();
+    });
+
+    menu_box.append(&rename_btn);
+    menu_box.append(&delete_btn);
+    popover.set_child(Some(&menu_box));
+    popover.popup();
+}
+
+pub fn prompt_text_dialog(
+    title: &str,
+    heading: &str,
+    initial: &str,
+    confirm_label: &str,
+    on_confirm: impl Fn(String) + 'static,
+) {
+    let dialog = adw::MessageDialog::new(
+        None::<&gtk4::Window>,
+        Some(title),
+        Some(heading),
+    );
+    let entry = Entry::new();
+    entry.set_text(initial);
+    entry.set_hexpand(true);
+    entry.set_activates_default(true);
+    entry.set_margin_top(8);
+    entry.set_margin_bottom(8);
+    dialog.set_extra_child(Some(&entry));
+
+    dialog.add_responses(&[("cancel", "Cancel"), ("confirm", confirm_label)]);
+    dialog.set_response_appearance("confirm", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("confirm"));
+    dialog.set_close_response("cancel");
+
+    dialog.connect_response(None, move |_, resp| {
+        if resp == "confirm" {
+            let text = entry.text().trim().to_string();
+            if !text.is_empty() {
+                on_confirm(text);
+            }
+        }
+    });
+    dialog.present();
 }
 
 // ── Helpers ──────────────────────────────────────────────

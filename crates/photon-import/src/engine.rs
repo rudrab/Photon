@@ -58,6 +58,13 @@ pub struct ImportConfig {
     /// Concurrent file reads/copies. Cards and USB drives are fastest with a
     /// few parallel streams; many more just makes the device seek.
     pub io_threads: usize,
+    /// Copy and Move: read every copy back from disk and compare it with the
+    /// original before it counts as imported (and before a move deletes it).
+    pub verify: bool,
+    /// Copy and Move: also copy each new photo here, in the library's
+    /// layout, so two copies exist before the card is formatted. A move only
+    /// deletes a file from the card once both copies are made.
+    pub backup_dir: Option<PathBuf>,
     pub cancel: CancelToken,
 }
 
@@ -71,6 +78,8 @@ impl Default for ImportConfig {
             deduplicate: true,
             batch_size: 200,
             io_threads: 4,
+            verify: true,
+            backup_dir: None,
             cancel: CancelToken::default(),
         }
     }
@@ -106,6 +115,9 @@ struct Context<'a> {
     /// Content hashes in the library plus those claimed by this import.
     hashes: Mutex<HashSet<String>>,
     planner: Mutex<DestinationPlanner>,
+    library_root: PathBuf,
+    /// Problems with files that were nonetheless imported (e.g. no backup).
+    warnings: Mutex<Vec<String>>,
 }
 
 impl Context<'_> {
@@ -189,16 +201,58 @@ impl ImportEngine {
             planner: Mutex::new(DestinationPlanner::new(library::library_root(
                 config.destination_dir.as_deref(),
             ))),
+            library_root: library::library_root(config.destination_dir.as_deref()),
+            warnings: Mutex::new(Vec::new()),
         };
         drop(conn);
 
         emit(ImportProgress::Started { total: files.len() });
         let result = self.run_pipeline(&files, &ctx, &mut out, &emit);
+        out.errors.extend(ctx.warnings.into_inner().unwrap_or_else(|e| e.into_inner()));
+        if result.is_ok() {
+            // Also for files that were already in the library: re-importing
+            // picks up ratings and tags set in the other app since.
+            match source.apply_metadata(&*self.db.conn()?) {
+                Ok(0) => {}
+                Ok(n) => log::info!("{}: carried over ratings/tags for {n} photos", source.source_type()),
+                Err(e) => out.errors.push(format!("Ratings and tags not imported: {e}")),
+            }
+        }
 
+        let file_errors = out.errors.len();
         let cancelled = config.cancel.is_cancelled();
+        if config.mode == FolderImportMode::Move && result.is_ok() && !cancelled {
+            let src_root = Path::new(source.source_description());
+            if src_root.is_dir() {
+                let remaining_unsupported: usize = walkdir::WalkDir::new(src_root)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().is_file())
+                    .filter(|e| {
+                        let path = e.path();
+                        let name = e.file_name().to_string_lossy();
+                        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                        !name.starts_with('.')
+                            && !name.ends_with(".xmp")
+                            && photon_core::models::ImageFormat::from_extension(ext)
+                                == photon_core::models::ImageFormat::Unknown
+                    })
+                    .count();
+                if remaining_unsupported > 0 {
+                    log::warn!(
+                        "{} unsupported files were left behind in source folder",
+                        remaining_unsupported
+                    );
+                    out.errors.push(format!(
+                        "{} unsupported files were left behind in source folder",
+                        remaining_unsupported
+                    ));
+                }
+            }
+        }
         batch.imported_count = out.inserted as i32;
         batch.duplicate_count = out.duplicates as i32;
-        batch.error_count = out.errors.len() as i32;
+        batch.error_count = file_errors as i32;
         batch.completed_at = Some(chrono::Utc::now().timestamp());
         batch.status = match (&result, cancelled) {
             (Err(_), _) => "failed",
@@ -297,6 +351,15 @@ impl ImportEngine {
                 return Ok(());
             }
             let (inserted, dupes) = queries::batch_insert_images(&mut conn, pending)?;
+            
+            for img in pending.iter() {
+                if let Some(id) = img.id {
+                    if let Err(e) = crate::sidecar::read_image_xmp(&mut conn, id, &img.path, None) {
+                        log::warn!("Could not update image {id} from XMP: {e}");
+                    }
+                }
+            }
+            
             out.inserted += inserted;
             out.duplicates += dupes;
             pending.clear();
@@ -534,13 +597,16 @@ fn try_process_file(src: &Path, ctx: &Context) -> anyhow::Result<Option<Image>> 
         }
         FolderImportMode::Copy => {
             let dest = ctx.planner.lock().unwrap().plan(src, created_at)?;
-            let staged = library::stage_copy(src, &dest, false)?;
+            let staged = library::stage_copy(src, &dest, config.verify)?;
             let hash = staged.hash.clone();
             if !ctx.claim(&hash) {
                 return Ok(None); // dropping `staged` deletes the copy
             }
             match staged.commit() {
-                Ok(dest) => (dest, hash),
+                Ok(dest) => {
+                    back_up(ctx, src, &dest, &hash);
+                    (dest, hash)
+                }
                 Err(e) => {
                     ctx.release(&hash);
                     return Err(e.into());
@@ -553,9 +619,18 @@ fn try_process_file(src: &Path, ctx: &Context) -> anyhow::Result<Option<Image>> 
                 return Ok(None); // the source of a duplicate is left untouched
             }
             let dest = ctx.planner.lock().unwrap().plan(src, created_at)?;
-            if let Err(e) = library::move_file(src, &dest) {
-                ctx.release(&hash);
-                return Err(e.into());
+            let moved = match library::move_into_place(src, &dest, Some(&hash), config.verify) {
+                Ok(moved) => moved,
+                Err(e) => {
+                    ctx.release(&hash);
+                    return Err(e.into());
+                }
+            };
+            // The card's copy goes only once the library copy (and backup) exist.
+            if back_up(ctx, src, &dest, &hash) && moved == library::Moved::Copied {
+                if let Err(e) = fs::remove_file(src) {
+                    ctx.warn(format!("{}: imported, but not removed from the source: {e}", src.display()));
+                }
             }
             (dest, hash)
         }
@@ -578,6 +653,11 @@ fn try_process_file(src: &Path, ctx: &Context) -> anyhow::Result<Option<Image>> 
     image.longitude = meta.longitude;
     image.orientation = meta.orientation;
 
+    let mut meta_obj = serde_json::Map::new();
+    if let Some(d) = meta.duration {
+        meta_obj.insert("duration".to_string(), serde_json::Value::String(d));
+    }
+
     if let Some(group) = ctx.groups.get(src) {
         image.group_hash = Some(group.clone());
         image.has_sidecar = true;
@@ -589,7 +669,17 @@ fn try_process_file(src: &Path, ctx: &Context) -> anyhow::Result<Option<Image>> 
         } else {
             let xmp_dest = sidecar::xmp_destination(src, &xmp, &path);
             match library::transfer_sidecar(config.mode, &xmp, &xmp_dest) {
-                Ok(()) => Some(xmp_dest),
+                Ok(()) => {
+                    if let Some(backup_root) = &config.backup_dir {
+                        let backed_up = fs::read(&xmp_dest).map_err(Into::into).and_then(|bytes| {
+                            library::back_up(&xmp_dest, &blake3::hash(&bytes).to_hex(), &ctx.library_root, backup_root)
+                        });
+                        if let Err(e) = backed_up {
+                            ctx.warn(format!("{}: XMP sidecar not backed up: {e}", src.display()));
+                        }
+                    }
+                    Some(xmp_dest)
+                }
                 Err(e) => {
                     log::warn!("XMP sidecar for {} not transferred: {e}", src.display());
                     None
@@ -598,12 +688,41 @@ fn try_process_file(src: &Path, ctx: &Context) -> anyhow::Result<Option<Image>> 
         };
         if let Some(xmp_path) = xmp_path {
             image.has_sidecar = true;
-            image.metadata_json =
-                Some(serde_json::json!({ "xmp_sidecar": xmp_path.to_string_lossy() }).to_string());
+            meta_obj.insert(
+                "xmp_sidecar".to_string(),
+                serde_json::Value::String(xmp_path.to_string_lossy().to_string()),
+            );
         }
     }
 
+    if !meta_obj.is_empty() {
+        image.metadata_json = Some(serde_json::Value::Object(meta_obj).to_string());
+    }
+
     Ok(Some(image))
+}
+
+/// Make the backup copy of newly placed library file `dest` (from `src`),
+/// if a backup folder is set. True when the file is now safe to delete from
+/// the source: backed up, or no backup wanted. Failures are reported as
+/// warnings — the photo itself is imported.
+fn back_up(ctx: &Context, src: &Path, dest: &Path, hash: &str) -> bool {
+    let Some(backup_root) = &ctx.config.backup_dir else { return true };
+    match library::back_up(dest, hash, &ctx.library_root, backup_root) {
+        Ok(_) => true,
+        Err(e) => {
+            let kept = if ctx.config.mode == FolderImportMode::Move { "; kept on the source" } else { "" };
+            ctx.warn(format!("{}: imported, but not backed up{kept}: {e}", src.display()));
+            false
+        }
+    }
+}
+
+impl Context<'_> {
+    fn warn(&self, message: String) {
+        log::warn!("{message}");
+        self.warnings.lock().unwrap().push(message);
+    }
 }
 
 fn file_name(path: &Path) -> String {
@@ -745,6 +864,73 @@ mod tests {
         let img = &photos(&engine)[0];
         assert!(img.has_sidecar);
         assert!(img.metadata_json.as_deref().unwrap().contains("IMG_9.jpg.xmp"));
+    }
+
+    #[test]
+    fn copy_import_makes_a_backup_copy_in_library_layout() {
+        let card = tempfile::tempdir().unwrap();
+        let lib = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        write_jpeg(&card.path().join("IMG_9.jpg"), &Spec::default());
+        fs::write(card.path().join("IMG_9.jpg.xmp"), "<xmp/>").unwrap();
+
+        let cfg = ImportConfig {
+            backup_dir: Some(backup.path().to_path_buf()),
+            ..config(FolderImportMode::Copy, lib.path())
+        };
+        let batch = engine().import(&DiskSource::new(card.path().to_path_buf(), true), &cfg, None).unwrap();
+
+        assert_eq!((batch.imported_count, batch.error_count), (1, 0));
+        let day = Path::new("2023/07/04");
+        assert_eq!(
+            fs::read(backup.path().join(day).join("IMG_9.jpg")).unwrap(),
+            fs::read(lib.path().join(day).join("IMG_9.jpg")).unwrap()
+        );
+        assert!(backup.path().join(day).join("IMG_9.jpg.xmp").exists());
+    }
+
+    /// A card on another filesystem than the library (so a move copies):
+    /// /tmp is usually tmpfs, the build directory is not.
+    fn cross_device_dirs() -> Option<(tempfile::TempDir, tempfile::TempDir)> {
+        use std::os::unix::fs::MetadataExt;
+        let card = tempfile::tempdir().unwrap();
+        let lib = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let dev = |p: &Path| fs::metadata(p).unwrap().dev();
+        (dev(card.path()) != dev(lib.path())).then_some((card, lib))
+    }
+
+    #[test]
+    fn move_keeps_the_card_copy_until_it_is_backed_up() {
+        let Some((card, lib)) = cross_device_dirs() else {
+            eprintln!("skipped: needs /tmp and the build dir on different filesystems");
+            return;
+        };
+        let src = card.path().join("IMG_9.jpg");
+        write_jpeg(&src, &Spec::default());
+        // A backup folder that can't be created.
+        let blocker = card.path().join("not-a-dir");
+        fs::write(&blocker, b"").unwrap();
+
+        let cfg = ImportConfig {
+            backup_dir: Some(blocker.join("backup")),
+            ..config(FolderImportMode::Move, lib.path())
+        };
+        let engine = engine();
+        let batch = engine.import(&DiskSource::new(card.path().to_path_buf(), true), &cfg, None).unwrap();
+
+        assert_eq!((batch.imported_count, batch.error_count), (1, 1));
+        assert!(src.exists(), "no backup, so the card copy stays");
+        assert!(lib.path().join("2023/07/04/IMG_9.jpg").exists());
+
+        // With a working backup, the move completes.
+        let backup = tempfile::tempdir().unwrap();
+        let src2 = card.path().join("IMG_10.jpg");
+        write_jpeg(&src2, &Spec { seed: 9, ..Default::default() });
+        let cfg = ImportConfig { backup_dir: Some(backup.path().to_path_buf()), ..cfg };
+        let batch = engine.import(&DiskSource::new(card.path().to_path_buf(), true), &cfg, None).unwrap();
+        assert_eq!(batch.imported_count, 1);
+        assert!(!src2.exists());
+        assert!(backup.path().join("2023/07/04/IMG_10.jpg").exists());
     }
 
     #[test]

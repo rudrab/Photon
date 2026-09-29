@@ -31,6 +31,13 @@ pub fn run_migrations(conn: &Connection) -> Result<(), PhotonError> {
         (5, MIGRATION_005_ORIENTATION_AND_PATH_INDEX),
         (6, MIGRATION_006_ORIGINAL_FILENAME),
         (7, MIGRATION_007_THUMBHASH),
+        (8, MIGRATION_008_ALBUMS),
+        (9, MIGRATION_009_EVENTS),
+        (10, MIGRATION_010_XMP_MTIME),
+        (11, MIGRATION_011_MISSING),
+        (12, MIGRATION_012_EXPORT_PRESETS),
+        (13, MIGRATION_013_XMP_REJECT_REPAIR),
+        (14, MIGRATION_014_DEFAULT_EXPORT_PRESETS),
     ];
 
     for (version, sql) in migrations {
@@ -228,6 +235,99 @@ const MIGRATION_007_THUMBHASH: &str = "
 ALTER TABLE images ADD COLUMN thumbhash BLOB;
 ";
 
+// ---------------------------------------------------------------------------
+// Migration 008: Albums (manual collections)
+// ---------------------------------------------------------------------------
+
+const MIGRATION_008_ALBUMS: &str = "
+CREATE TABLE IF NOT EXISTS albums (
+    id             INTEGER PRIMARY KEY,
+    name           TEXT NOT NULL,
+    created_at     INTEGER NOT NULL DEFAULT (unixepoch()),
+    cover_image_id INTEGER,
+    FOREIGN KEY (cover_image_id) REFERENCES images(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS album_images (
+    album_id INTEGER NOT NULL,
+    image_id INTEGER NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (album_id, image_id),
+    FOREIGN KEY (album_id) REFERENCES albums(id) ON DELETE CASCADE,
+    FOREIGN KEY (image_id) REFERENCES images(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_album_images_album ON album_images(album_id);
+CREATE INDEX IF NOT EXISTS idx_album_images_image ON album_images(image_id);
+";
+
+// ---------------------------------------------------------------------------
+// Migration 009: Named events (date range groupings)
+// ---------------------------------------------------------------------------
+
+const MIGRATION_009_EVENTS: &str = "
+CREATE TABLE IF NOT EXISTS events (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL,
+    start_date INTEGER NOT NULL,
+    end_date   INTEGER NOT NULL,
+    comment    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_dates ON events(start_date, end_date);
+";
+
+// ---------------------------------------------------------------------------
+// Migration 010: XMP read-back
+// ---------------------------------------------------------------------------
+
+const MIGRATION_010_XMP_MTIME: &str = "
+ALTER TABLE images ADD COLUMN xmp_mtime INTEGER;
+";
+
+// ---------------------------------------------------------------------------
+// Migration 011: Missing/offline files
+// ---------------------------------------------------------------------------
+
+const MIGRATION_011_MISSING: &str = "
+ALTER TABLE images ADD COLUMN missing INTEGER NOT NULL DEFAULT 0;
+";
+
+// ---------------------------------------------------------------------------
+// Migration 012: Export presets
+// ---------------------------------------------------------------------------
+
+const MIGRATION_012_EXPORT_PRESETS: &str = "
+CREATE TABLE IF NOT EXISTS export_presets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    config_json TEXT NOT NULL
+);
+";
+
+// ---------------------------------------------------------------------------
+// Migration 013: repair rejects read back from XMP as a -1 rating
+// ---------------------------------------------------------------------------
+
+// Before this fix, `xmp:Rating="-1"` was stored in `rating` instead of as a
+// reject in `flagged`. The stars it overwrote are gone, so it becomes 0.
+const MIGRATION_013_XMP_REJECT_REPAIR: &str = "
+UPDATE images SET flagged = -1, rating = 0 WHERE rating < 0;
+";
+
+// ---------------------------------------------------------------------------
+// Migration 014: default export presets
+// ---------------------------------------------------------------------------
+
+// photon-import's `ExportConfig` as JSON; fields left out take their defaults
+// (a test there checks these parse).
+const MIGRATION_014_DEFAULT_EXPORT_PRESETS: &str = r#"
+INSERT OR IGNORE INTO export_presets (name, config_json) VALUES
+ ('Web 2048 sRGB', '{"format":{"Jpeg":{"quality":85}},"resize":{"FitLongEdge":2048},"sharpening":"Screen","suffix":"_web","color_space":"Srgb"}'),
+ ('Client full-res', '{"format":{"Jpeg":{"quality":95}},"resize":"Original","sharpening":"None","color_space":"Srgb"}'),
+ ('Print TIFF', '{"format":{"Tiff":{"bit_depth":16}},"resize":"Original","sharpening":"Print","color_space":"AdobeRgb"}');
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,5 +392,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn albums_and_events_tables_exist() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO albums (name) VALUES ('Vacation 2026')",
+            [],
+        )
+        .unwrap();
+        let album_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO events (name, start_date, end_date) VALUES ('Trip', 1700000000, 1700100000)",
+            [],
+        )
+        .unwrap();
+        let event_id = conn.last_insert_rowid();
+
+        assert!(album_id > 0);
+        assert!(event_id > 0);
     }
 }

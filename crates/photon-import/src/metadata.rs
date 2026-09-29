@@ -28,7 +28,7 @@ use chrono::NaiveDateTime;
 use exif::{Exif, In, Reader as ExifReader, Tag, Value};
 use photon_core::models::ImageFormat;
 use std::fs::File;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::process::Command;
 
@@ -55,6 +55,8 @@ pub struct ImageMetadata {
     pub longitude: Option<f64>,
     /// EXIF orientation, 1–8.
     pub orientation: Option<u16>,
+    /// Video duration formatted as M:SS or H:MM:SS.
+    pub duration: Option<String>,
 }
 
 impl ImageMetadata {
@@ -65,7 +67,7 @@ impl ImageMetadata {
         }
         fill!(
             width, height, capture_date, camera_make, camera_model, f_number, exposure_time, iso,
-            focal_length, lens_model, latitude, longitude, orientation
+            focal_length, lens_model, latitude, longitude, orientation, duration
         );
     }
 }
@@ -74,20 +76,34 @@ pub fn extract(path: &Path) -> Result<ImageMetadata> {
     let mut meta = ImageMetadata::default();
     let format = format_of(path);
     let is_raw = format.is_raw();
+    let is_vid = format.is_video();
 
     let mut modify_date = None;
-    if let Ok(exif) = read_exif(path) {
-        read_fields(&exif, &mut meta);
-        modify_date = ascii(&exif, Tag::DateTime).and_then(|s| parse_exif_date(&s));
+    if !is_vid {
+        if let Ok(exif) = read_exif(path) {
+            read_fields(&exif, &mut meta);
+            modify_date = ascii(&exif, Tag::DateTime).and_then(|s| parse_exif_date(&s));
+        }
+
+        if meta.capture_date.is_none() {
+            meta.capture_date = read_xmp_capture_date(path);
+        }
     }
 
-    if meta.capture_date.is_none() {
-        meta.capture_date = read_xmp_capture_date(path);
-    }
-
-    if meta.capture_date.is_none() && may_need_exiftool(format) {
+    if (meta.capture_date.is_none() || (is_vid && meta.duration.is_none())) && may_need_exiftool(format) {
         if let Some(fallback) = exiftool(path) {
             meta.merge(fallback);
+        }
+    }
+
+    if is_vid && (meta.capture_date.is_none() || meta.duration.is_none()) {
+        if let Some((cd, dur)) = parse_quicktime_mvhd(path) {
+            if meta.capture_date.is_none() && cd > 0 {
+                meta.capture_date = Some(cd);
+            }
+            if meta.duration.is_none() && !dur.is_empty() {
+                meta.duration = Some(dur);
+            }
         }
     }
 
@@ -96,8 +112,18 @@ pub fn extract(path: &Path) -> Result<ImageMetadata> {
         meta.capture_date = modify_date;
     }
 
-    // The image crate can't open RAW files, but can read plain-file dimensions cheaply.
-    if (meta.width.is_none() || meta.height.is_none()) && !is_raw {
+    // HEIF rotation lives in its irot/imir boxes, which libheif applies while
+    // decoding; the EXIF orientation (iPhones write both) only describes it.
+    // Record the photo as upright, at the size it decodes to.
+    if matches!(format, ImageFormat::Heif | ImageFormat::Avif) {
+        if matches!(meta.orientation, Some(5..=8)) {
+            (meta.width, meta.height) = (meta.height, meta.width);
+        }
+        meta.orientation = Some(1);
+    }
+
+    // The image crate can't open RAW files or videos, but can read plain-file dimensions cheaply.
+    if (meta.width.is_none() || meta.height.is_none()) && !is_raw && !is_vid {
         if let Ok((w, h)) = image::image_dimensions(path) {
             meta.width.get_or_insert(w);
             meta.height.get_or_insert(h);
@@ -116,7 +142,7 @@ pub fn detect_mime(path: &Path) -> Option<String> {
 
 /// Formats where kamadak may miss metadata that exiftool can read.
 fn may_need_exiftool(format: ImageFormat) -> bool {
-    format.is_raw() || matches!(format, ImageFormat::Heif | ImageFormat::Avif)
+    format.is_raw() || format.is_video() || matches!(format, ImageFormat::Heif | ImageFormat::Avif)
 }
 
 /// Formats whose EXIF block can sit beyond the first [`HEADER_BYTES`]:
@@ -386,6 +412,7 @@ fn exiftool(path: &Path) -> Option<ImageMetadata> {
             "-GPSLatitude",
             "-GPSLongitude",
             "-Orientation",
+            "-Duration",
         ])
         .arg(path)
         .output()
@@ -418,7 +445,133 @@ fn exiftool(path: &Path) -> Option<ImageMetadata> {
         orientation: num("Orientation")
             .map(|v| v as u16)
             .filter(|o| (1..=8).contains(o)),
+        duration: num("Duration").map(format_duration_seconds).or_else(|| text("Duration")),
     })
+}
+
+/// Format seconds into "M:SS" or "H:MM:SS".
+pub fn format_duration_seconds(seconds: f64) -> String {
+    let total = seconds.round() as u64;
+    let mins = total / 60;
+    let s = total % 60;
+    if mins >= 60 {
+        let h = mins / 60;
+        let m = mins % 60;
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{mins}:{s:02}")
+    }
+}
+
+/// Try to extract creation time (unix timestamp) and duration (formatted "M:SS" or "H:MM:SS")
+/// from QuickTime / MP4 `mvhd` atom.
+pub fn parse_quicktime_mvhd(path: &Path) -> Option<(i64, String)> {
+    let mut file = File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    let mut offset = 0u64;
+    let mut buf = [0u8; 8];
+
+    while offset + 8 <= file_len {
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        if file.read_exact(&mut buf).is_err() {
+            break;
+        }
+        let size = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
+        let tag = &buf[4..8];
+
+        let atom_size = if size == 1 {
+            let mut ext = [0u8; 8];
+            if file.read_exact(&mut ext).is_err() {
+                break;
+            }
+            u64::from_be_bytes(ext)
+        } else if size == 0 {
+            file_len - offset
+        } else {
+            size
+        };
+
+        if atom_size < 8 {
+            break;
+        }
+
+        if tag == b"moov" {
+            let moov_header_len = if size == 1 { 16 } else { 8 };
+            let mut moov_offset = offset + moov_header_len;
+            let moov_end = offset + atom_size;
+
+            while moov_offset + 8 <= moov_end {
+                file.seek(SeekFrom::Start(moov_offset)).ok()?;
+                if file.read_exact(&mut buf).is_err() {
+                    break;
+                }
+                let sub_size = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
+                let sub_tag = &buf[4..8];
+                let sub_atom_size = if sub_size == 1 {
+                    let mut ext = [0u8; 8];
+                    if file.read_exact(&mut ext).is_err() {
+                        break;
+                    }
+                    u64::from_be_bytes(ext)
+                } else if sub_size == 0 {
+                    moov_end - moov_offset
+                } else {
+                    sub_size
+                };
+
+                if sub_atom_size < 8 {
+                    break;
+                }
+
+                if sub_tag == b"mvhd" {
+                    let payload_offset = moov_offset + if sub_size == 1 { 16 } else { 8 };
+                    file.seek(SeekFrom::Start(payload_offset)).ok()?;
+                    let mut mvhd_data = vec![0u8; (sub_atom_size.saturating_sub(if sub_size == 1 { 16 } else { 8 })).min(128) as usize];
+                    file.read_exact(&mut mvhd_data).ok()?;
+
+                    if mvhd_data.len() < 20 {
+                        return None;
+                    }
+                    let version = mvhd_data[0];
+                    let (created_raw, timescale, duration_raw) = if version == 0 {
+                        let c = u32::from_be_bytes([mvhd_data[4], mvhd_data[5], mvhd_data[6], mvhd_data[7]]) as u64;
+                        let ts = u32::from_be_bytes([mvhd_data[12], mvhd_data[13], mvhd_data[14], mvhd_data[15]]) as u64;
+                        let d = u32::from_be_bytes([mvhd_data[16], mvhd_data[17], mvhd_data[18], mvhd_data[19]]) as u64;
+                        (c, ts, d)
+                    } else if version == 1 && mvhd_data.len() >= 32 {
+                        let c = u64::from_be_bytes(mvhd_data[4..12].try_into().ok()?);
+                        let ts = u32::from_be_bytes([mvhd_data[20], mvhd_data[21], mvhd_data[22], mvhd_data[23]]) as u64;
+                        let d = u64::from_be_bytes(mvhd_data[24..32].try_into().ok()?);
+                        (c, ts, d)
+                    } else {
+                        return None;
+                    };
+
+                    const SECS_1904_TO_1970: u64 = 2_082_844_800;
+                    let capture_date = if created_raw > SECS_1904_TO_1970 {
+                        (created_raw - SECS_1904_TO_1970) as i64
+                    } else {
+                        0
+                    };
+
+                    let duration_str = if timescale > 0 {
+                        format_duration_seconds(duration_raw as f64 / timescale as f64)
+                    } else {
+                        String::new()
+                    };
+
+                    return Some((capture_date, duration_str));
+                }
+
+                moov_offset += sub_atom_size;
+            }
+            break;
+        }
+
+        offset += atom_size;
+    }
+
+    None
 }
 
 /// 0.004 → "1/250", 2.0 → "2".
@@ -600,5 +753,50 @@ mod tests {
         let meta = extract(&path).unwrap();
         assert!(meta.capture_date.is_none());
         assert_eq!((meta.width, meta.height), (Some(8), Some(4))); // image-crate fallback
+    }
+
+    #[test]
+    fn parses_quicktime_mvhd_creation_date_and_duration() {
+        let mut data = Vec::new();
+        // ftyp
+        data.extend_from_slice(&[0, 0, 0, 16]);
+        data.extend_from_slice(b"ftypisom");
+        data.extend_from_slice(&[0, 0, 2, 0]);
+
+        // mvhd payload: 100 bytes (header 8 bytes + payload 100 = 108 bytes)
+        let mut mvhd = Vec::new();
+        mvhd.extend_from_slice(&[0, 0, 0, 108]);
+        mvhd.extend_from_slice(b"mvhd");
+        mvhd.push(0); // version 0
+        mvhd.extend_from_slice(&[0, 0, 0]); // flags
+        // Creation time: 2082844800 (1970) + 1700000000 = 3782844800
+        let qt_time: u32 = (2_082_844_800u64 + 1_700_000_000u64) as u32;
+        mvhd.extend_from_slice(&qt_time.to_be_bytes());
+        mvhd.extend_from_slice(&qt_time.to_be_bytes()); // modification time
+        mvhd.extend_from_slice(&1000u32.to_be_bytes()); // timescale: 1000 Hz
+        mvhd.extend_from_slice(&65_000u32.to_be_bytes()); // duration: 65,000 ticks = 65s (1:05)
+        // Pad the rest of mvhd to 108 bytes
+        mvhd.resize(108, 0);
+
+        // moov box enclosing mvhd
+        let moov_size = (8 + mvhd.len()) as u32;
+        data.extend_from_slice(&moov_size.to_be_bytes());
+        data.extend_from_slice(b"moov");
+        data.extend_from_slice(&mvhd);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.mp4");
+        std::fs::write(&path, &data).unwrap();
+
+        let (created, duration) = parse_quicktime_mvhd(&path).unwrap();
+        assert_eq!(created, 1_700_000_000);
+        assert_eq!(duration, "1:05");
+    }
+
+    #[test]
+    fn formats_duration() {
+        assert_eq!(format_duration_seconds(42.3), "0:42");
+        assert_eq!(format_duration_seconds(65.0), "1:05");
+        assert_eq!(format_duration_seconds(3665.0), "1:01:05");
     }
 }

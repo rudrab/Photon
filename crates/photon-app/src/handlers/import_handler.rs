@@ -1,6 +1,8 @@
 //! Import dialog flows:
 //!   - Folder import   (native FileDialog portal picker)
 //!   - Shotwell DB     (native FileDialog with .db filter)
+//!   - digiKam DB      (same, preselecting digiKam's database; brings ratings,
+//!                      pick labels and tags along)
 //!   - Camera / device (auto-detect via GIO VolumeMonitor, pick DCIM)
 //!
 //! Progress is polled on the GTK main loop at 50 ms intervals.
@@ -15,6 +17,7 @@ use gtk4::{
 use photon_core::models::{FolderImportMode, ImportProgress};
 use photon_import::engine::ImportConfig;
 use photon_import::sources::disk::DiskSource;
+use photon_import::sources::digikam::{self, DigikamSource};
 use photon_import::sources::shotwell::ShotwellSource;
 use photon_import::sources::ImportSource;
 use std::path::PathBuf;
@@ -222,7 +225,7 @@ fn show_import_options_dialog(mw: &MainWindow, source_path: PathBuf, from_device
 
             for item in report.duplicates.iter().take(50) {
                 let row = GtkBox::new(Orientation::Horizontal, 8);
-                let icon = gtk4::Image::from_icon_name("emblem-ok-symbolic");
+                let icon = gtk4::Image::from_icon_name("object-select-symbolic");
                 let name = Label::new(Some(&item.filename));
                 name.set_css_classes(&["dim-label"]);
                 name.set_halign(Align::Start);
@@ -281,8 +284,11 @@ fn show_import_options_dialog(mw: &MainWindow, source_path: PathBuf, from_device
                 FolderImportMode::InPlace
             };
 
+            let prefs = mw.prefs.borrow().clone();
             let config = ImportConfig {
                 mode,
+                verify: prefs.verify_imports,
+                backup_dir: prefs.import_backup_dir,
                 ..ImportConfig::default()
             };
 
@@ -425,6 +431,40 @@ pub fn show_shotwell_import_dialog(mw: &MainWindow) {
                 let source = ShotwellSource::new(path);
                 let config = ImportConfig::default();
                 run_import(&mw, Box::new(source), config);
+            }
+        }
+    });
+}
+
+// ═══════════════════════════════════════════════════════════
+// digiKam DB import
+// ═══════════════════════════════════════════════════════════
+
+/// Pick digiKam's database (preselected when found) and import its photos
+/// in place, with their ratings, pick labels and tags.
+pub fn show_digikam_import_dialog(mw: &MainWindow) {
+    let filter = FileFilter::new();
+    filter.set_name(Some("digiKam Database (digikam4.db)"));
+    filter.add_pattern("*.db");
+
+    let filters = gio::ListStore::new::<FileFilter>();
+    filters.append(&filter);
+
+    let dialog = FileDialog::builder()
+        .title("Select digiKam Database")
+        .modal(true)
+        .filters(&filters)
+        .build();
+    if let Some(db) = digikam::find_default_db() {
+        dialog.set_initial_file(Some(&gio::File::for_path(db)));
+    }
+
+    let mw = mw.clone();
+    let parent_win = mw.window.clone();
+    dialog.open(Some(&parent_win), gio::Cancellable::NONE, move |result| {
+        if let Ok(file) = result {
+            if let Some(path) = file.path() {
+                run_import(&mw, Box::new(DigikamSource::new(path)), ImportConfig::default());
             }
         }
     });

@@ -9,14 +9,21 @@ use gtk4::Application;
 pub fn build_primary_menu() -> gio::MenuModel {
     let menu = gio::Menu::new();
 
+    // ── Edit Section ────────────────────────────────────
+    let edit_section = gio::Menu::new();
+    edit_section.append(Some("Undo"), Some("win.undo"));
+    edit_section.append(Some("Redo"), Some("win.redo"));
+    menu.append_section(None, &edit_section);
+
     // ── View Section ────────────────────────────────────
     let view_section = gio::Menu::new();
+    view_section.append(Some("Slideshow"), Some("win.slideshow"));
     view_section.append(Some("Refresh Library"), Some("win.refresh"));
     menu.append_section(None, &view_section);
 
     // ── Preferences & Shortcuts ─────────────────────────
     let prefs_section = gio::Menu::new();
-    prefs_section.append(Some("Preferences"), Some("app.preferences"));
+    prefs_section.append(Some("Preferences"), Some("win.preferences"));
     prefs_section.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
     menu.append_section(None, &prefs_section);
 
@@ -43,9 +50,12 @@ pub fn build_import_menu() -> gio::MenuModel {
 pub fn setup_shortcuts(app: &impl IsA<Application>) {
     let app = app.as_ref();
     app.set_accels_for_action("win.import_folder", &["<Ctrl>o"]);
-    app.set_accels_for_action("win.refresh", &["F5", "<Ctrl>r"]);
+    app.set_accels_for_action("win.refresh", &["<Ctrl>r"]);
+    app.set_accels_for_action("win.slideshow", &["F5"]);
+    app.set_accels_for_action("win.undo", &["<Ctrl>z"]);
+    app.set_accels_for_action("win.redo", &["<Ctrl><Shift>z"]);
     app.set_accels_for_action("win.search", &["<Ctrl>f"]);
     app.set_accels_for_action("app.quit", &["<Ctrl>q"]);
-    app.set_accels_for_action("app.preferences", &["<Ctrl>comma"]);
+    app.set_accels_for_action("win.preferences", &["<Ctrl>comma"]);
     app.set_accels_for_action("win.shortcuts", &["<Ctrl>question"]);
 }
