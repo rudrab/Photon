@@ -2,7 +2,11 @@
 //! style): appears at the bottom while photos are selected, or in selection
 //! mode.
 //!
-//!   N selected  [Pick] [Reject] … [Open] [Show in Files] [Share ▾] [Export] [Remove] [Trash]  [×]
+//!   N selected [×] [Select all] | Pick Reject Unflag ★▾ | ⟲ ⟳ | Compare |
+//!   Album▾ | Open  Show in Files  Share▾  Export | Trash ⋯
+//!
+//! Compare needs exactly two photos. On narrow windows Album, Open and Show
+//! in Files move into the ⋯ menu (which always holds Remove from Library).
 //!
 //! Actions work on photo *ids*, so they stay correct even if a live refresh
 //! (e.g. an import) reorders the timeline between selecting and acting.
@@ -42,6 +46,8 @@ pub struct Context {
     pub undo_manager: Rc<RefCell<UndoManager>>,
     pub current_album_id: Rc<RefCell<Option<i64>>>,
     pub on_start_slideshow: Option<Rc<dyn Fn()>>,
+    /// Compare the two photos (ids) side by side.
+    pub on_compare: Rc<dyn Fn(Vec<i64>)>,
 }
 
 /// Handle to control the adaptable bottom bar.
@@ -60,18 +66,23 @@ pub fn attach(timeline: &Timeline, ctx: Context) -> BottomBarHandle {
     // ── Start area: Idle status vs Selection count ─────────────
     let start_box = GtkBox::new(Orientation::Horizontal, 8);
     start_box.set_valign(Align::Center);
+    // The same 8px from the bar's edges as between groups.
+    start_box.set_margin_start(8);
 
+    // Every cluster is a `photon-bar-group` (see style.css): one height and
+    // corner radius, no dividers, spacing between groups.
+    let idle_group = GtkBox::new(Orientation::Horizontal, 2);
+    idle_group.add_css_class("photon-bar-group");
     let idle_label = Label::new(Some("Ready"));
     idle_label.add_css_class("dim-label");
-    idle_label.set_halign(Align::Start);
-    start_box.append(&idle_label);
+    idle_group.append(&idle_label);
+    start_box.append(&idle_group);
 
-    let selection_box = GtkBox::new(Orientation::Horizontal, 6);
+    let selection_box = GtkBox::new(Orientation::Horizontal, 2);
+    selection_box.add_css_class("photon-bar-group");
     selection_box.set_valign(Align::Center);
     let count = Label::new(None);
     count.add_css_class("heading");
-    count.set_margin_start(4);
-    count.set_margin_end(4);
     selection_box.append(&count);
 
     let clear = Button::from_icon_name("window-close-symbolic");
@@ -86,85 +97,101 @@ pub fn attach(timeline: &Timeline, ctx: Context) -> BottomBarHandle {
         }
     });
     selection_box.append(&clear);
+
+    let select_all = Button::from_icon_name("edit-select-all-symbolic");
+    select_all.set_tooltip_text(Some("Select All (Ctrl+A)"));
+    select_all.add_css_class("flat");
+    let w_all = weak.clone();
+    select_all.connect_clicked(move |_| {
+        if let Some(t) = w_all.upgrade() {
+            t.set_selection_mode(true);
+            t.select_all();
+        }
+    });
+    selection_box.append(&select_all);
     selection_box.set_visible(false);
     start_box.append(&selection_box);
 
     action_bar.pack_start(&start_box);
 
-    // ── Center area: Selection actions ─────────────────────────
-    let center_box = GtkBox::new(Orientation::Horizontal, 2);
+    // ── Center area: Selection actions, in groups ──────────────
+    let center_box = GtkBox::new(Orientation::Horizontal, 8);
     center_box.set_valign(Align::Center);
 
+    // Actions that need at least one photo selected.
     let actions: Rc<RefCell<Vec<gtk4::Widget>>> = Rc::default();
-    let button = |icon: &str, tooltip: &str| {
+    let group = || {
+        let g = GtkBox::new(Orientation::Horizontal, 2);
+        g.add_css_class("photon-bar-group");
+        g.set_valign(Align::Center);
+        center_box.append(&g);
+        g
+    };
+    let button = |into: &GtkBox, icon: &str, tooltip: &str| {
         let b = Button::from_icon_name(icon);
         b.set_tooltip_text(Some(tooltip));
         b.add_css_class("flat");
-        center_box.append(&b);
+        into.append(&b);
         actions.borrow_mut().push(b.clone().upcast());
         b
     };
+    let on_timeline = |f: fn(&Timeline)| {
+        let w = weak.clone();
+        move |_: &Button| {
+            if let Some(t) = w.upgrade() {
+                f(&t);
+            }
+        }
+    };
 
-    let pick = button("object-select-symbolic", "Pick (P)");
+    // Mark: pick/reject, stars and colour label, in one button.
+    let cull = group();
     let w = weak.clone();
-    pick.connect_clicked(move |_| {
-        if let Some(t) = w.upgrade() {
-            t.cull_flag_selected(1);
+    let mark = crate::ui::mark::mark_button(move |m| {
+        let Some(t) = w.upgrade() else { return };
+        match m {
+            crate::ui::mark::Mark::Flag(f) => t.cull_flag_selected(f),
+            crate::ui::mark::Mark::Rating(r) => t.cull_rating_selected(r),
+            crate::ui::mark::Mark::Color(c) => t.cull_color_selected(c),
         }
     });
+    cull.append(&mark.button);
+    actions.borrow_mut().push(mark.button.clone().upcast());
 
-    let reject = button("process-stop-symbolic", "Reject (X)");
-    let w = weak.clone();
-    reject.connect_clicked(move |_| {
-        if let Some(t) = w.upgrade() {
-            t.cull_flag_selected(-1);
-        }
-    });
-
-    let unflag = button("view-refresh-symbolic", "Unflag (U)");
-    let w = weak.clone();
-    unflag.connect_clicked(move |_| {
-        if let Some(t) = w.upgrade() {
-            t.cull_flag_selected(0);
-        }
-    });
-
-    let rate5 = button("starred-symbolic", "Rate 5 Stars (5)");
-    let w = weak.clone();
-    rate5.connect_clicked(move |_| {
-        if let Some(t) = w.upgrade() {
-            t.cull_rating_selected(5);
-        }
-    });
-
-    let rotate_left = button(
+    // Rotate
+    let rotate = group();
+    button(
+        &rotate,
         "object-rotate-left-symbolic",
         "Rotate Counter-Clockwise ([)\nNote: darktable ignores XMP rotation; exported RAWs via darktable use camera orientation.",
-    );
-    let w = weak.clone();
-    rotate_left.connect_clicked(move |_| {
-        if let Some(t) = w.upgrade() {
-            t.rotate_selected(false);
-        }
-    });
-
-    let rotate_right = button(
+    )
+    .connect_clicked(on_timeline(|t| t.rotate_selected(false)));
+    button(
+        &rotate,
         "object-rotate-right-symbolic",
         "Rotate Clockwise (] / Ctrl+R)\nNote: darktable ignores XMP rotation; exported RAWs via darktable use camera orientation.",
-    );
-    let w = weak.clone();
-    rotate_right.connect_clicked(move |_| {
+    )
+    .connect_clicked(on_timeline(|t| t.rotate_selected(true)));
+
+    // Compare: exactly two photos (its sensitivity is set below, not with `actions`).
+    let compare_group = group();
+    let compare = Button::from_icon_name("view-dual-symbolic");
+    compare.set_tooltip_text(Some("Compare 2 photos side by side, or survey 3–9 in a grid"));
+    compare.add_css_class("flat");
+    let (w, c) = (weak.clone(), ctx.clone());
+    compare.connect_clicked(move |_| {
         if let Some(t) = w.upgrade() {
-            t.rotate_selected(true);
+            let ids = t.selected_ids();
+            if (2..=9).contains(&ids.len()) {
+                (c.on_compare)(ids);
+            }
         }
     });
+    compare_group.append(&compare);
 
-    let sep1 = gtk4::Separator::new(Orientation::Vertical);
-    sep1.set_margin_start(4);
-    sep1.set_margin_end(4);
-    center_box.append(&sep1);
-
-    let album_btn = button("folder-pictures-symbolic", "Add to Album…");
+    // Organise (folds into ⋯ on narrow windows)
+    let organise = group();
+    let album_btn = button(&organise, "folder-pictures-symbolic", "Add to Album…");
     let (w, c) = (weak.clone(), ctx.clone());
     let alb_b = album_btn.clone();
     album_btn.connect_clicked(move |_| {
@@ -173,8 +200,7 @@ pub fn attach(timeline: &Timeline, ctx: Context) -> BottomBarHandle {
             show_add_to_album_popover(&alb_b, imgs, &c);
         }
     });
-
-    let remove_album_btn = button("edit-delete-symbolic", "Remove from Album");
+    let remove_album_btn = button(&organise, "list-remove-symbolic", "Remove from Album");
     let (w, c) = (weak.clone(), ctx.clone());
     remove_album_btn.connect_clicked(move |_| {
         let Some(album_id) = *c.current_album_id.borrow() else { return };
@@ -191,20 +217,21 @@ pub fn attach(timeline: &Timeline, ctx: Context) -> BottomBarHandle {
     });
     remove_album_btn.set_visible(false);
 
-    let open = button("document-edit-symbolic", "Open in Editor");
+    // Output: Open and Show in Files fold into ⋯ on narrow windows.
+    let output = group();
+    let output_extra = GtkBox::new(Orientation::Horizontal, 2);
+    output.append(&output_extra);
+    let open = button(&output_extra, "document-edit-symbolic", "Open in Editor");
     let (w, c) = (weak.clone(), ctx.clone());
     open.connect_clicked(move |_| open_in_editors(&selected_images(&w, &c.db), &c));
-
-    let show = button("folder-open-symbolic", "Show in Files");
+    let show = button(&output_extra, "folder-open-symbolic", "Show in Files");
     let (w, c) = (weak.clone(), ctx.clone());
     show.connect_clicked(move |_| show_in_files(&selected_images(&w, &c.db)));
-
     let (w, db) = (weak.clone(), ctx.db.clone());
     let share_btn = share::menu_button(&ctx.share, Rc::new(move || selected_images(&w, &db)));
-    center_box.append(&share_btn);
+    output.append(&share_btn);
     actions.borrow_mut().push(share_btn.upcast());
-
-    let export = button("document-save-symbolic", "Export Selected (Ctrl+E)");
+    let export = button(&output, "document-save-symbolic", "Export Selected (Ctrl+E)");
     let (w, c) = (weak.clone(), ctx.clone());
     export.connect_clicked(move |_| {
         let imgs = selected_images(&w, &c.db);
@@ -213,25 +240,88 @@ pub fn attach(timeline: &Timeline, ctx: Context) -> BottomBarHandle {
         }
     });
 
-    let sep2 = gtk4::Separator::new(Orientation::Vertical);
-    sep2.set_margin_start(4);
-    sep2.set_margin_end(4);
-    center_box.append(&sep2);
-
-    let remove = button("list-remove-symbolic", "Remove from Library");
-    let (w, c) = (weak.clone(), ctx.clone());
-    remove.connect_clicked(move |_| confirm_remove(&w, &c));
-
-    let trash = button("user-trash-symbolic", "Move to Trash (Delete)");
+    // Trash, and ⋯ for the rest
+    let end_group = group();
+    let trash = button(&end_group, "user-trash-symbolic", "Move to Trash (Delete)");
     trash.add_css_class("destructive-action");
     let (w, c) = (weak.clone(), ctx.clone());
     trash.connect_clicked(move |_| confirm_trash(&w, &c));
+
+    let overflow = gtk4::MenuButton::builder().icon_name("view-more-symbolic").tooltip_text("More").build();
+    overflow.add_css_class("flat");
+    let overflow_pop = Popover::new();
+    let overflow_box = GtkBox::new(Orientation::Vertical, 2);
+    for m in [&overflow_box] {
+        m.set_margin_top(6);
+        m.set_margin_bottom(6);
+        m.set_margin_start(6);
+        m.set_margin_end(6);
+    }
+    let menu_item = |into: &GtkBox, label: &str, target: &Button| {
+        let item = Button::with_label(label);
+        item.add_css_class("flat");
+        if let Some(l) = item.child().and_downcast::<Label>() {
+            l.set_xalign(0.0);
+        }
+        let (target, pop) = (target.clone(), overflow_pop.clone());
+        item.connect_clicked(move |_| {
+            pop.popdown();
+            target.emit_clicked();
+        });
+        into.append(&item);
+    };
+    // Shown only when the window is narrow (see the breakpoint below).
+    let overflow_extra = GtkBox::new(Orientation::Vertical, 2);
+    overflow_extra.set_visible(false);
+    let album_item = Button::with_label("Add to Album…");
+    album_item.add_css_class("flat");
+    if let Some(l) = album_item.child().and_downcast::<Label>() {
+        l.set_xalign(0.0);
+    }
+    let (w, c, anchor, pop) = (weak.clone(), ctx.clone(), overflow.clone(), overflow_pop.clone());
+    album_item.connect_clicked(move |_| {
+        pop.popdown();
+        let imgs = selected_images(&w, &c.db);
+        if !imgs.is_empty() {
+            show_add_to_album_popover(&anchor, imgs, &c);
+        }
+    });
+    overflow_extra.append(&album_item);
+    menu_item(&overflow_extra, "Open in Editor", &open);
+    menu_item(&overflow_extra, "Show in Files", &show);
+    overflow_extra.append(&gtk4::Separator::new(Orientation::Horizontal));
+    overflow_box.append(&overflow_extra);
+    let remove = Button::new();
+    remove.connect_clicked({
+        let (w, c) = (weak.clone(), ctx.clone());
+        move |_| confirm_remove(&w, &c)
+    });
+    menu_item(&overflow_box, "Remove from Library…", &remove);
+    overflow_pop.set_child(Some(&overflow_box));
+    overflow.set_popover(Some(&overflow_pop));
+    end_group.append(&overflow);
+    actions.borrow_mut().push(overflow.clone().upcast());
+
+    if let Some(window) = ctx.window.downcast_ref::<adw::ApplicationWindow>() {
+        // Too narrow for every group: Album, Open and Show in Files go to ⋯.
+        match adw::BreakpointCondition::parse("max-width: 1250sp") {
+            Ok(condition) => {
+                let narrow = adw::Breakpoint::new(condition);
+                narrow.add_setter(&organise, "visible", Some(&false.to_value()));
+                narrow.add_setter(&output_extra, "visible", Some(&false.to_value()));
+                narrow.add_setter(&overflow_extra, "visible", Some(&true.to_value()));
+                window.add_breakpoint(narrow);
+            }
+            Err(e) => log::warn!("Bottom bar breakpoint: {e}"),
+        }
+    }
 
     center_box.set_visible(false);
     action_bar.set_center_widget(Some(&center_box));
 
     // ── End area: Zoom slider & Slideshow ─────────────────────
-    let end_box = GtkBox::new(Orientation::Horizontal, 6);
+    let end_box = GtkBox::new(Orientation::Horizontal, 8);
+    end_box.set_margin_end(8);
     end_box.set_valign(Align::Center);
 
     if let Some(on_slideshow) = ctx.on_start_slideshow.clone() {
@@ -239,11 +329,14 @@ pub fn attach(timeline: &Timeline, ctx: Context) -> BottomBarHandle {
         slideshow_btn.set_tooltip_text(Some("Start Slideshow (F5)"));
         slideshow_btn.add_css_class("flat");
         slideshow_btn.connect_clicked(move |_| on_slideshow());
-        end_box.append(&slideshow_btn);
+        let slideshow_group = GtkBox::new(Orientation::Horizontal, 2);
+        slideshow_group.add_css_class("photon-bar-group");
+        slideshow_group.append(&slideshow_btn);
+        end_box.append(&slideshow_group);
     }
 
     let zoom_group = GtkBox::new(Orientation::Horizontal, 2);
-    zoom_group.add_css_class("zoom-slider-group");
+    zoom_group.add_css_class("photon-bar-group");
     zoom_group.set_valign(Align::Center);
 
     let zoom_out = Button::from_icon_name("image-zoom-out-symbolic");
@@ -298,8 +391,9 @@ pub fn attach(timeline: &Timeline, ctx: Context) -> BottomBarHandle {
     let w = weak.clone();
     let c_alb = ctx.current_album_id.clone();
     let rab_c = remove_album_btn.clone();
+    let compare_c = compare.clone();
     let sb_c = selection_box.clone();
-    let ib_c = idle_label.clone();
+    let ib_c = idle_group.clone();
     let cb_c = center_box.clone();
     timeline.connect_selection_changed(move |selected| {
         let n = selected.len();
@@ -318,7 +412,19 @@ pub fn attach(timeline: &Timeline, ctx: Context) -> BottomBarHandle {
         for action in actions.borrow().iter() {
             action.set_sensitive(n > 0);
         }
+        compare_c.set_sensitive((2..=9).contains(&n));
         rab_c.set_visible(c_alb.borrow().is_some() && n > 0);
+
+        // The Mark button shows the selection's marks when they all agree.
+        let states: Vec<crate::ui::mark::MarkState> = w
+            .upgrade()
+            .map(|t| t.selected_items())
+            .unwrap_or_default()
+            .iter()
+            .map(|i| crate::ui::mark::MarkState { flag: i.flagged, rating: i.rating, color: i.color_label })
+            .collect();
+        let common = states.first().copied().filter(|first| states.iter().all(|s| s == first));
+        mark.set_state(common);
     });
 
     // Keyboard shortcuts controller on timeline
@@ -331,6 +437,13 @@ pub fn attach(timeline: &Timeline, ctx: Context) -> BottomBarHandle {
                 on_slideshow();
                 return glib::Propagation::Stop;
             }
+        }
+        if (key == gdk::Key::a || key == gdk::Key::A) && state.contains(gdk::ModifierType::CONTROL_MASK) {
+            if let Some(t) = w.upgrade() {
+                t.set_selection_mode(true);
+                t.select_all();
+            }
+            return glib::Propagation::Stop;
         }
         if key == gdk::Key::Delete && has_selection {
             confirm_trash(&w, &c);
@@ -364,6 +477,32 @@ pub fn attach(timeline: &Timeline, ctx: Context) -> BottomBarHandle {
         set_status_text: Rc::new(move |text| lbl_status.set_text(text)),
         set_zoom_value: Rc::new(move |val| zs_setter.set_value(val as f64)),
     }
+}
+
+/// A small dot in a colour label's colour (the theme's palette), hollow for
+/// no label. Symbolic, unlike emoji, which render in their own colours.
+pub(crate) fn label_dot(color: photon_core::models::ColorLabel) -> GtkBox {
+    let dot = GtkBox::new(Orientation::Horizontal, 0);
+    dot.add_css_class("photon-label-dot");
+    dot.set_valign(Align::Center);
+    dot.set_halign(Align::Center);
+    set_label_dot(&dot, color);
+    dot
+}
+
+pub(crate) fn set_label_dot(dot: &GtkBox, color: photon_core::models::ColorLabel) {
+    use photon_core::models::ColorLabel;
+    for class in ["red", "yellow", "green", "blue", "purple", "none"] {
+        dot.remove_css_class(class);
+    }
+    dot.add_css_class(match color {
+        ColorLabel::Red => "red",
+        ColorLabel::Yellow => "yellow",
+        ColorLabel::Green => "green",
+        ColorLabel::Blue => "blue",
+        ColorLabel::Purple => "purple",
+        ColorLabel::None => "none",
+    });
 }
 
 fn selected_images(timeline: &WeakTimeline, db: &Database) -> Vec<Image> {
@@ -408,7 +547,7 @@ fn open_in_editors(images: &[Image], ctx: &Context) {
 
 /// Ask the file manager to open the folders with the files selected
 /// (org.freedesktop.FileManager1), falling back to opening the folder.
-fn show_in_files(images: &[Image]) {
+pub(crate) fn show_in_files(images: &[Image]) {
     let Some(first) = images.first() else { return };
     let uris: Vec<String> = images
         .iter()
@@ -672,7 +811,7 @@ fn trash(images: &[Image], kept_xmps: &HashSet<PathBuf>, timeline: &WeakTimeline
     });
 }
 
-fn show_add_to_album_popover(target: &Button, images: Vec<Image>, ctx: &Context) {
+fn show_add_to_album_popover(target: &impl IsA<gtk4::Widget>, images: Vec<Image>, ctx: &Context) {
     let popover = Popover::new();
     popover.set_parent(target);
 

@@ -24,7 +24,7 @@ use gtk4::{
 };
 use photon_core::db::queries;
 use photon_core::db::Database;
-use photon_core::models::{Image, Preferences, TimelineItem, UIAction};
+use photon_core::models::{ColorLabel, Image, Preferences, TimelineItem, UIAction};
 use photon_import::thumbnails::{thumb_path, ThumbSize, ThumbnailGenerator};
 use crate::ui::histogram::HistogramWidget;
 use libadwaita as adw;
@@ -55,7 +55,6 @@ pub fn build_viewer(
     on_export: Option<Rc<dyn Fn(Vec<Image>)>>,
     share_ctx: share::Context,
     undo_manager: Option<Rc<RefCell<crate::ui::undo::UndoManager>>>,
-    on_start_slideshow: Option<Rc<dyn Fn()>>,
     parent_window: Option<gtk4::Window>,
 ) -> GtkBox {
     let root = GtkBox::new(Orientation::Vertical, 0);
@@ -70,6 +69,7 @@ pub fn build_viewer(
     root.append(&body);
 
     let image_box = GtkBox::new(Orientation::Vertical, 0);
+    image_box.add_css_class("photon-photo-backdrop");
     image_box.set_vexpand(true);
     image_box.set_hexpand(true);
     image_box.set_halign(Align::Fill);
@@ -103,8 +103,15 @@ pub fn build_viewer(
     action_bar.add_css_class("photon-bottom-bar");
 
     // ── Start area: Navigation & Title ──────────────────
-    let start_box = GtkBox::new(Orientation::Horizontal, 6);
+    // Every cluster below is a `photon-bar-group` (see style.css): one
+    // height and corner radius, no dividers, spacing between groups.
+    let start_box = GtkBox::new(Orientation::Horizontal, 8);
     start_box.set_valign(Align::Center);
+    // The same 8px from the bar's edges as between groups.
+    start_box.set_margin_start(8);
+
+    let nav_group = GtkBox::new(Orientation::Horizontal, 2);
+    nav_group.add_css_class("photon-bar-group");
 
     let back_btn = Button::from_icon_name("view-grid-symbolic");
     back_btn.add_css_class("flat");
@@ -114,10 +121,7 @@ pub fn build_viewer(
     back_btn.connect_clicked(move |_| {
         let _ = tx_b.send_blocking(ba_b.clone());
     });
-    start_box.append(&back_btn);
-
-    let nav_group = GtkBox::new(Orientation::Horizontal, 0);
-    nav_group.add_css_class("linked");
+    nav_group.append(&back_btn);
 
     let prev_btn = Button::from_icon_name("go-previous-symbolic");
     prev_btn.add_css_class("flat");
@@ -131,8 +135,8 @@ pub fn build_viewer(
     nav_group.append(&next_btn);
     start_box.append(&nav_group);
 
-    let title_box = GtkBox::new(Orientation::Horizontal, 6);
-    title_box.add_css_class("photon-viewer-title-box");
+    let title_box = GtkBox::new(Orientation::Horizontal, 2);
+    title_box.add_css_class("photon-bar-group");
     title_box.set_valign(Align::Center);
 
     let filename_label = Label::new(None);
@@ -145,6 +149,13 @@ pub fn build_viewer(
 
     title_box.append(&filename_label);
     title_box.append(&counter_label);
+
+    // A shot with several files (RAW + JPG): which one is on screen, and
+    // switching to the next (V).
+    let version_btn = Button::from_icon_name("image-x-generic-symbolic");
+    version_btn.add_css_class("flat");
+    version_btn.set_visible(false);
+    title_box.append(&version_btn);
     start_box.append(&title_box);
 
     action_bar.pack_start(&start_box);
@@ -156,10 +167,11 @@ pub fn build_viewer(
     // Zoom: Fit, 1:1 and a continuous slider. The slider is log2 of the
     // zoom, so every step along it is the same ratio.
     let zoom_group = GtkBox::new(Orientation::Horizontal, 2);
-    zoom_group.add_css_class("zoom-slider-group");
+    zoom_group.add_css_class("photon-bar-group");
     zoom_group.set_valign(Align::Center);
 
-    let fit_btn = Button::from_icon_name("zoom-fit-best-symbolic");
+    // Lit while the photo is fitted: that is the "Fit" state, no text needed.
+    let fit_btn = ToggleButton::builder().icon_name("zoom-fit-best-symbolic").build();
     fit_btn.add_css_class("flat");
     fit_btn.set_tooltip_text(Some("Fit to window (Ctrl+0)"));
 
@@ -174,23 +186,14 @@ pub fn build_viewer(
     zoom_scale.set_focusable(false);
     zoom_scale.set_tooltip_text(Some("Zoom (Ctrl+scroll, + / −)"));
 
-    let zoom_label = Label::new(Some("Fit"));
-    zoom_label.set_width_chars(5);
-    zoom_label.add_css_class("caption");
-    zoom_label.add_css_class("numeric");
-
     zoom_group.append(&fit_btn);
     zoom_group.append(&zoom_scale);
     zoom_group.append(&one_btn);
-    zoom_group.append(&zoom_label);
     center_box.append(&zoom_group);
 
-    let sep_tools = gtk4::Separator::new(Orientation::Vertical);
-    center_box.append(&sep_tools);
-
     // Rotate buttons
-    let rotate_group = GtkBox::new(Orientation::Horizontal, 0);
-    rotate_group.add_css_class("linked");
+    let rotate_group = GtkBox::new(Orientation::Horizontal, 2);
+    rotate_group.add_css_class("photon-bar-group");
 
     let rotate_left_btn = Button::from_icon_name("object-rotate-left-symbolic");
     rotate_left_btn.add_css_class("flat");
@@ -204,33 +207,47 @@ pub fn build_viewer(
     rotate_group.append(&rotate_right_btn);
     center_box.append(&rotate_group);
 
-    // Star rating
-    let rating_btn = Button::with_label("★ 0");
-    rating_btn.add_css_class("flat");
-    rating_btn.set_tooltip_text(Some("Rating (1-5, 0 to clear)"));
-    center_box.append(&rating_btn);
-
-    // Compare button
-    let compare_btn = ToggleButton::builder()
-        .icon_name("view-dual-symbolic")
-        .tooltip_text("Side-by-side Compare (C)")
-        .build();
-    compare_btn.add_css_class("flat");
-    center_box.append(&compare_btn);
+    // The photo's marks (pick/reject, stars, colour label) in one button.
+    // Its choices are applied by `update_cull`, set below once it exists.
+    let apply_mark: Rc<RefCell<Option<Rc<dyn Fn(crate::ui::mark::Mark)>>>> = Rc::default();
+    let apply_mark_c = apply_mark.clone();
+    let mark = crate::ui::mark::mark_button(move |m| {
+        let apply = apply_mark_c.borrow().clone();
+        if let Some(apply) = apply {
+            apply(m);
+        }
+    });
+    // One surface for the verdict: the marks on the left, the photo quality
+    // (a graded ring) on the right.
+    let verdict_group = GtkBox::new(Orientation::Horizontal, 2);
+    verdict_group.add_css_class("photon-bar-group");
+    verdict_group.set_valign(Align::Center);
+    verdict_group.append(&mark.button);
+    let quality = crate::ui::mark::quality_gauge();
+    quality.widget.set_margin_start(4);
+    quality.widget.set_margin_end(7);
+    verdict_group.append(&quality.widget);
+    center_box.append(&verdict_group);
 
     action_bar.set_center_widget(Some(&center_box));
 
     // ── End area: Actions, Slideshow & Info ──────────────
-    let end_box = GtkBox::new(Orientation::Horizontal, 6);
+    let end_box = GtkBox::new(Orientation::Horizontal, 8);
     end_box.set_valign(Align::Center);
+    end_box.set_margin_end(8);
 
-    let action_group = GtkBox::new(Orientation::Horizontal, 0);
-    action_group.add_css_class("linked");
+    let action_group = GtkBox::new(Orientation::Horizontal, 2);
+    action_group.add_css_class("photon-bar-group");
 
     let open_btn = Button::from_icon_name("document-edit-symbolic");
     open_btn.add_css_class("flat");
     open_btn.set_tooltip_text(Some("Open in editor"));
     action_group.append(&open_btn);
+
+    let show_files_btn = Button::from_icon_name("folder-open-symbolic");
+    show_files_btn.add_css_class("flat");
+    show_files_btn.set_tooltip_text(Some("Show in Files"));
+    action_group.append(&show_files_btn);
 
     let current_image: Rc<RefCell<Option<Image>>> = Rc::new(RefCell::new(None));
     let image_share = current_image.clone();
@@ -251,27 +268,16 @@ pub fn build_viewer(
 
     end_box.append(&action_group);
 
-    let sep_end = gtk4::Separator::new(Orientation::Vertical);
-    end_box.append(&sep_end);
-
-    let slideshow_btn = Button::from_icon_name("media-playback-start-symbolic");
-    slideshow_btn.add_css_class("flat");
-    slideshow_btn.set_tooltip_text(Some("Start Slideshow (F5)"));
-    if let Some(ref ss) = on_start_slideshow {
-        let ss_cb = ss.clone();
-        slideshow_btn.connect_clicked(move |_| ss_cb());
-    } else {
-        slideshow_btn.set_visible(false);
-    }
-    end_box.append(&slideshow_btn);
-
+    let info_group = GtkBox::new(Orientation::Horizontal, 2);
+    info_group.add_css_class("photon-bar-group");
     let info_btn = ToggleButton::builder()
         .icon_name("dialog-information-symbolic")
         .tooltip_text("Show details (I)")
         .active(false)
         .build();
     info_btn.add_css_class("flat");
-    end_box.append(&info_btn);
+    info_group.append(&info_btn);
+    end_box.append(&info_group);
 
     action_bar.pack_end(&end_box);
 
@@ -279,7 +285,8 @@ pub fn build_viewer(
 
     // ── Showing a photo ─────────────────────────────────
     let current_idx = Rc::new(Cell::new(index));
-    let is_comparing = Rc::new(Cell::new(false));
+    // The file of the current shot on screen, when not its cover (the JPG).
+    let version_shown: Rc<Cell<Option<i64>>> = Rc::default();
     let cache = cache_dir.to_path_buf();
     let prefs = Rc::new(prefs.clone());
 
@@ -291,7 +298,7 @@ pub fn build_viewer(
 
     let sync_zoom_ui: Rc<dyn Fn(&PhotoView)> = Rc::new(glib::clone!(
         #[weak] zoom_scale,
-        #[weak] zoom_label,
+        #[weak] fit_btn,
         #[strong] syncing_zoom,
         move |view: &PhotoView| {
             let scale = view.scale();
@@ -301,10 +308,9 @@ pub fn build_viewer(
             adj.set_lower(lower);
             adj.set_upper(MAX_ZOOM.max(view.fit_scale()).log2());
             adj.set_value(scale.log2().max(lower));
+            fit_btn.set_active(view.zoom() == Zoom::Fit);
             syncing_zoom.set(false);
-            let pct = format!("{:.0}%", scale * 100.0);
-            zoom_label.set_text(if view.zoom() == Zoom::Fit { "Fit" } else { &pct });
-            zoom_label.set_tooltip_text(Some(&pct));
+            zoom_scale.set_tooltip_text(Some(&format!("Zoom {:.0}% (Ctrl+scroll, + / −)", scale * 100.0)));
         }
     ));
 
@@ -330,24 +336,19 @@ pub fn build_viewer(
         Rc::new(move |zoom| with_view(&|v| v.set_zoom(zoom, None)))
     };
 
-    let toggle_compare: Rc<dyn Fn()> = {
-        let compare_btn = compare_btn.clone();
-        Rc::new(move || {
-            compare_btn.set_active(!compare_btn.is_active());
-        })
-    };
 
     let show: Rc<dyn Fn(usize)> = Rc::new(glib::clone!(
         #[weak] image_box,
         #[weak] info_box,
         #[weak] filename_label,
         #[weak] counter_label,
+        #[weak] version_btn,
+        #[strong] version_shown,
         #[weak] prev_btn,
         #[weak] next_btn,
-        #[weak] rating_btn,
+        #[strong] mark,
+        #[strong] quality,
         #[weak] zoom_group,
-        #[weak] zoom_label,
-        #[weak] compare_btn,
         #[weak] rotate_left_btn,
         #[weak] rotate_right_btn,
         #[strong] photos,
@@ -355,7 +356,6 @@ pub fn build_viewer(
         #[strong] current_image,
         #[strong] current_view,
         #[strong] sync_zoom_ui,
-        #[strong] is_comparing,
         #[strong] prefs,
         #[strong] db,
         #[strong] cache,
@@ -368,6 +368,8 @@ pub fn build_viewer(
                 current_view.borrow_mut().take().map(|v| v.state())
             } else {
                 current_view.borrow_mut().take();
+                // Another shot starts at its cover.
+                version_shown.set(None);
                 None
             };
             current_idx.set(i);
@@ -375,17 +377,16 @@ pub fn build_viewer(
             prev_btn.set_sensitive(i > 0);
             next_btn.set_sensitive(i + 1 < photos.len());
 
-            let mut image = db
-                .conn()
-                .ok()
-                .and_then(|c| queries::get_image(&c, item.id).ok().flatten());
+            // The file on screen: the shot's cover, or the version switched to.
+            let shown_id = version_shown.get().unwrap_or(item.id);
+            let mut image = db.conn().ok().and_then(|c| queries::get_image(&c, shown_id).ok().flatten());
 
             if let Some(ref mut img) = image {
                 let exists = img.path.exists();
                 if exists == img.missing {
                     img.missing = !exists;
                     let marked = db.conn().map_err(|e| e.to_string()).and_then(|conn| {
-                        queries::mark_missing(&conn, &[item.id], !exists).map_err(|e| e.to_string())
+                        queries::mark_missing(&conn, &[shown_id], !exists).map_err(|e| e.to_string())
                     });
                     if let Err(e) = marked {
                         log::warn!("Marking {} missing={}: {e}", img.path.display(), !exists);
@@ -394,9 +395,9 @@ pub fn build_viewer(
 
                 if exists {
                     let applied = db.conn().map_err(anyhow::Error::from).and_then(|mut conn| {
-                        let applied = photon_import::read_image_xmp(&mut conn, item.id, &img.path, img.xmp_mtime)?;
+                        let applied = photon_import::read_image_xmp(&mut conn, shown_id, &img.path, img.xmp_mtime)?;
                         if applied {
-                            if let Some(refreshed) = queries::get_image(&conn, item.id)? {
+                            if let Some(refreshed) = queries::get_image(&conn, shown_id)? {
                                 *img = refreshed;
                             }
                         }
@@ -411,7 +412,6 @@ pub fn build_viewer(
             match &image {
                 Some(img) => {
                     let is_vid = img.format.as_ref().map_or(false, |f| f.is_video());
-                    compare_btn.set_sensitive(!is_vid);
                     rotate_left_btn.set_sensitive(!is_vid);
                     rotate_right_btn.set_sensitive(!is_vid);
 
@@ -448,49 +448,24 @@ pub fn build_viewer(
                         rotate_right_btn.set_tooltip_text(Some("Rotate clockwise (] / Ctrl+R)"));
                     }
 
-                    rating_btn.set_label(&format!("★ {}", img.rating));
+                    mark.set_state(Some(crate::ui::mark::MarkState {
+                        flag: img.flagged,
+                        rating: img.rating,
+                        color: img.color_label,
+                    }));
 
-                    if is_comparing.get() {
-                        let next_idx = if i + 1 < photos.len() { i + 1 } else { i.saturating_sub(1) };
-                        let image_b = if next_idx != i {
-                            db.conn()
-                                .ok()
-                                .and_then(|c| queries::get_image(&c, photos[next_idx].id).ok().flatten())
-                        } else {
-                            None
-                        };
-
-                        if let Some(img_b) = image_b {
-                            filename_label.set_text(&format!("{}  vs  {}", img.filename, img_b.filename));
-                            render_compare(&image_box, &info_box, img, &img_b, &cache, &prefs, &db);
-                        } else {
-                            filename_label.set_text(&img.filename);
-                            *current_view.borrow_mut() = render_photo(
-                                &image_box,
-                                &info_box,
-                                img,
-                                &cache,
-                                &prefs,
-                                &db,
-                                restore,
-                                sync_zoom_ui.clone(),
-                                undo_manager.clone(),
-                            );
-                        }
-                    } else {
-                        filename_label.set_text(&img.filename);
-                        *current_view.borrow_mut() = render_photo(
-                            &image_box,
-                            &info_box,
-                            img,
-                            &cache,
-                            &prefs,
-                            &db,
-                            restore,
-                            sync_zoom_ui.clone(),
-                            undo_manager.clone(),
-                        );
-                    }
+                    filename_label.set_text(&img.filename);
+                    *current_view.borrow_mut() = render_photo(
+                        &image_box,
+                        &info_box,
+                        img,
+                        &cache,
+                        &prefs,
+                        &db,
+                        restore,
+                        sync_zoom_ui.clone(),
+                        undo_manager.clone(),
+                    );
                 }
                 None => {
                     filename_label.set_text("Photo no longer in library");
@@ -499,13 +474,40 @@ pub fn build_viewer(
                     clear(&info_box);
                 }
             }
+            version_btn.set_visible(item.versions > 1);
+            if let Some(img) = image.as_ref().filter(|_| item.versions > 1) {
+                let raw = img.format.is_some_and(|f| f.is_raw());
+                version_btn.set_icon_name(if raw { "camera-photo-symbolic" } else { "image-x-generic-symbolic" });
+                let ext = img.path.extension().unwrap_or_default().to_string_lossy().to_uppercase();
+                version_btn.set_tooltip_text(Some(&format!(
+                    "Showing the {ext}: one of {} files of this shot — switch (V)",
+                    item.versions
+                )));
+            }
+
+            // The quality analysis' reading of this shot, in its session.
+            quality.set(None, "Photo quality: …");
+            if let Some(img) = image.as_ref() {
+                let (db, img, quality) = (db.clone(), img.clone(), quality.clone());
+                let (current, id) = (current_image.clone(), img.id);
+                glib::spawn_future_local(async move {
+                    let reading = gtk4::gio::spawn_blocking(move || quality_reading(&db, &img)).await.ok().flatten();
+                    // Stepped on meanwhile: this reading is for another photo.
+                    if current.borrow().as_ref().and_then(|i| i.id) != id {
+                        return;
+                    }
+                    match reading {
+                        Some((score, text)) => quality.set(score, &text),
+                        None => quality.set(None, "Photo quality: not analysed yet (Analyse Photo Quality…)"),
+                    }
+                });
+            }
             *current_image.borrow_mut() = image;
 
             let view = current_view.borrow().clone();
             zoom_group.set_sensitive(view.is_some());
-            match view {
-                Some(view) => sync_zoom_ui(&view),
-                None => zoom_label.set_text("—"),
+            if let Some(view) = view {
+                sync_zoom_ui(&view);
             }
         }
     ));
@@ -527,61 +529,16 @@ pub fn build_viewer(
         let db = db.clone();
         let photos = photos.clone();
         let current_idx = current_idx.clone();
-        let current_image = current_image.clone();
         let show = show.clone();
         let um_c = undo_manager.clone();
-        Rc::new(move |new_rating: Option<i32>, new_flag: Option<i32>| {
+        let notify = share_ctx.notify.clone();
+        Rc::new(move |new_rating: Option<i32>, new_flag: Option<i32>, new_color: Option<ColorLabel>| {
             let idx = current_idx.get();
             let Some(item) = photos.get(idx) else { return };
-            let img_id = item.id;
-
-            let (old_rating, old_flag) = current_image
-                .borrow()
-                .as_ref()
-                .map(|i| (i.rating, i.flagged))
-                .unwrap_or((item.rating, item.flagged));
-
-            if let Some(ref um) = um_c {
-                if let Some(r) = new_rating {
-                    um.borrow_mut().push(crate::ui::undo::UndoAction::Rating {
-                        previous: vec![(img_id, old_rating)],
-                        new_rating: r,
-                    });
-                }
-                if let Some(f) = new_flag {
-                    um.borrow_mut().push(crate::ui::undo::UndoAction::Flag {
-                        previous: vec![(img_id, old_flag)],
-                        new_flag: f,
-                    });
-                }
+            // The whole shot (RAW + JPG), whichever file is on screen.
+            if !crate::ui::mark::save_marks(&db, um_c.as_ref(), &notify, item.id, new_rating, new_flag, new_color) {
+                return;
             }
-
-            let mut img_info = None;
-            if let Some(img) = current_image.borrow_mut().as_mut() {
-                if let Some(r) = new_rating {
-                    img.rating = r;
-                }
-                if let Some(f) = new_flag {
-                    img.flagged = f;
-                }
-                img_info = Some((img.path.clone(), img.rating, img.flagged));
-            }
-
-            let db = db.clone();
-            thread::spawn(move || {
-                if let Ok(mut conn) = db.conn() {
-                    if let Some(r) = new_rating {
-                        let _ = queries::set_rating(&mut conn, img_id, r);
-                    }
-                    if let Some(f) = new_flag {
-                        let _ = queries::set_flag(&mut conn, img_id, f);
-                    }
-                    if let Some((path, r, f)) = img_info {
-                        sync_image_xmp(&conn, img_id, &path, XmpChange::Cull { rating: r, flagged: f });
-                    }
-                }
-            });
-
             show(idx);
         })
     };
@@ -663,14 +620,30 @@ pub fn build_viewer(
 
 
     let uc = update_cull.clone();
-    let img_c = current_image.clone();
-    rating_btn.connect_clicked(move |_| {
-        let cur = img_c.borrow().as_ref().map(|i| i.rating).unwrap_or(0);
-        uc(Some((cur + 1) % 6), None);
+    *apply_mark.borrow_mut() = Some(Rc::new(move |m| match m {
+        crate::ui::mark::Mark::Flag(f) => uc(None, Some(f), None),
+        crate::ui::mark::Mark::Rating(r) => uc(Some(r), None, None),
+        crate::ui::mark::Mark::Color(c) => uc(None, None, Some(c)),
+    }));
+
+    let image_files = current_image.clone();
+    show_files_btn.connect_clicked(move |_| {
+        if let Some(image) = image_files.borrow().as_ref() {
+            crate::ui::selection_bar::show_in_files(std::slice::from_ref(image));
+        }
     });
 
-    let zt = zoom_to.clone();
-    fit_btn.connect_clicked(move |_| zt(Zoom::Fit));
+    // Fit is a state, not a toggle: clicking it always fits (and stays lit).
+    let (zt, sz) = (zoom_to.clone(), syncing_zoom.clone());
+    fit_btn.connect_toggled(move |btn| {
+        if sz.get() {
+            return;
+        }
+        zt(Zoom::Fit);
+        sz.set(true);
+        btn.set_active(true);
+        sz.set(false);
+    });
     let zt = zoom_to.clone();
     one_btn.connect_clicked(move |_| zt(Zoom::Scale(1.0)));
     let zt = zoom_to.clone();
@@ -680,20 +653,16 @@ pub fn build_viewer(
         }
     });
 
-    let s = show.clone();
-    let ci = current_idx.clone();
-    let ic = is_comparing.clone();
-    compare_btn.connect_toggled(move |btn| {
-        ic.set(btn.is_active());
-        s(ci.get());
-    });
 
     let db_open = db.clone();
     let prefs_open = prefs.clone();
     let image_open = current_image.clone();
+    let notify_open = share_ctx.notify.clone();
     open_btn.connect_clicked(move |_| {
         if let Some(image) = image_open.borrow().as_ref() {
-            open_in_editor(image, &prefs_open, &db_open);
+            if let Err(e) = open_in_editor(image, &prefs_open, &db_open) {
+                notify_open(&e);
+            }
         }
     });
 
@@ -815,6 +784,33 @@ pub fn build_viewer(
         Rc::new(move || share::copy_selection(&sc, ci.borrow().iter().cloned().collect()))
     };
 
+    version_btn.connect_clicked(glib::clone!(
+        #[strong] photos,
+        #[strong] current_idx,
+        #[strong] version_shown,
+        #[strong] show,
+        #[strong] db,
+        move |_| {
+            let i = current_idx.get();
+            let Some(item) = photos.get(i) else { return };
+            let members = db.conn().map_err(|e| e.to_string()).and_then(|c| {
+                queries::shot_member_ids(&c, &[item.id]).map_err(|e| e.to_string())
+            });
+            let mut members = match members {
+                Ok(m) if m.len() > 1 => m,
+                Ok(_) => return,
+                Err(e) => return log::warn!("Listing the files of photo {}: {e}", item.id),
+            };
+            // The cover first, then the others in import order.
+            members.sort_by_key(|&id| (id != item.id, id));
+            let shown = version_shown.get().unwrap_or(item.id);
+            let pos = members.iter().position(|&m| m == shown).unwrap_or(0);
+            let next = members[(pos + 1) % members.len()];
+            version_shown.set((next != item.id).then_some(next));
+            show(i);
+        }
+    ));
+
     let step_prev = step.clone();
     prev_btn.connect_clicked(move |_| step_prev(-1));
     let step_next = step.clone();
@@ -825,17 +821,16 @@ pub fn build_viewer(
     let tx_esc = nav_tx.clone();
     key_ctrl.connect_key_pressed(glib::clone!(
         #[weak] info_btn,
+        #[weak] version_btn,
         #[strong] toggle_zoom,
         #[strong] zoom_by,
         #[strong] zoom_to,
-        #[strong] toggle_compare,
         #[strong] update_cull,
         #[strong] rotate,
         #[strong] step,
         #[strong] trigger_export,
         #[strong] copy_photo,
         #[strong] confirm_trash,
-        #[strong] on_start_slideshow,
         #[upgrade_or] glib::Propagation::Proceed,
         move |_, key, _, state| {
             let is_shift = state.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
@@ -870,13 +865,15 @@ pub fn build_viewer(
                 }
                 gtk4::gdk::Key::Left => step(-1),
                 gtk4::gdk::Key::Right => step(1),
-                gtk4::gdk::Key::F5 => {
-                    if let Some(ref ss) = on_start_slideshow {
-                        ss();
-                    }
-                }
+                // Slideshows start from the library, not from one photo.
+                gtk4::gdk::Key::F5 => {}
                 gtk4::gdk::Key::Delete => {
                     confirm_trash();
+                }
+                gtk4::gdk::Key::v | gtk4::gdk::Key::V => {
+                    if version_btn.is_visible() {
+                        version_btn.emit_clicked();
+                    }
                 }
                 gtk4::gdk::Key::i | gtk4::gdk::Key::I => {
                     info_btn.set_active(!info_btn.is_active());
@@ -890,59 +887,81 @@ pub fn build_viewer(
                 gtk4::gdk::Key::minus | gtk4::gdk::Key::KP_Subtract => {
                     zoom_by(1.0 / ZOOM_STEP);
                 }
-                gtk4::gdk::Key::c | gtk4::gdk::Key::C => {
-                    toggle_compare();
-                }
                 gtk4::gdk::Key::_1 | gtk4::gdk::Key::KP_1 | gtk4::gdk::Key::exclam => {
-                    update_cull(Some(1), None);
+                    update_cull(Some(1), None, None);
                     if is_shift {
                         step(1);
                     }
                 }
                 gtk4::gdk::Key::_2 | gtk4::gdk::Key::KP_2 | gtk4::gdk::Key::at => {
-                    update_cull(Some(2), None);
+                    update_cull(Some(2), None, None);
                     if is_shift {
                         step(1);
                     }
                 }
                 gtk4::gdk::Key::_3 | gtk4::gdk::Key::KP_3 | gtk4::gdk::Key::numbersign => {
-                    update_cull(Some(3), None);
+                    update_cull(Some(3), None, None);
                     if is_shift {
                         step(1);
                     }
                 }
                 gtk4::gdk::Key::_4 | gtk4::gdk::Key::KP_4 | gtk4::gdk::Key::dollar => {
-                    update_cull(Some(4), None);
+                    update_cull(Some(4), None, None);
                     if is_shift {
                         step(1);
                     }
                 }
                 gtk4::gdk::Key::_5 | gtk4::gdk::Key::KP_5 | gtk4::gdk::Key::percent => {
-                    update_cull(Some(5), None);
+                    update_cull(Some(5), None, None);
+                    if is_shift {
+                        step(1);
+                    }
+                }
+                gtk4::gdk::Key::_6 | gtk4::gdk::Key::KP_6 | gtk4::gdk::Key::asciicircum => {
+                    update_cull(None, None, Some(ColorLabel::Red));
+                    if is_shift {
+                        step(1);
+                    }
+                }
+                gtk4::gdk::Key::_7 | gtk4::gdk::Key::KP_7 | gtk4::gdk::Key::ampersand => {
+                    update_cull(None, None, Some(ColorLabel::Yellow));
+                    if is_shift {
+                        step(1);
+                    }
+                }
+                gtk4::gdk::Key::_8 | gtk4::gdk::Key::KP_8 | gtk4::gdk::Key::asterisk => {
+                    update_cull(None, None, Some(ColorLabel::Green));
+                    if is_shift {
+                        step(1);
+                    }
+                }
+                gtk4::gdk::Key::_9 | gtk4::gdk::Key::KP_9 | gtk4::gdk::Key::parenleft => {
+                    update_cull(None, None, Some(ColorLabel::Blue));
                     if is_shift {
                         step(1);
                     }
                 }
                 gtk4::gdk::Key::_0 | gtk4::gdk::Key::KP_0 | gtk4::gdk::Key::parenright | gtk4::gdk::Key::grave | gtk4::gdk::Key::asciitilde => {
-                    update_cull(Some(0), None);
+                    // As in the grid: 0 clears the rating, not the colour label.
+                    update_cull(Some(0), None, None);
                     if is_shift {
                         step(1);
                     }
                 }
                 gtk4::gdk::Key::p | gtk4::gdk::Key::P => {
-                    update_cull(None, Some(1));
+                    update_cull(None, Some(1), None);
                     if is_shift {
                         step(1);
                     }
                 }
                 gtk4::gdk::Key::x | gtk4::gdk::Key::X => {
-                    update_cull(None, Some(-1));
+                    update_cull(None, Some(-1), None);
                     if is_shift {
                         step(1);
                     }
                 }
                 gtk4::gdk::Key::u | gtk4::gdk::Key::U => {
-                    update_cull(None, Some(0));
+                    update_cull(None, Some(0), None);
                     if is_shift {
                         step(1);
                     }
@@ -958,6 +977,63 @@ pub fn build_viewer(
     root.grab_focus();
 
     root
+}
+
+/// How the quality analysis sees `img`, judged with its session (same
+/// camera, ±30 min) as the Photo Quality results do: its relative sharpness
+/// and grade, and a description. The grade is red whenever the results would
+/// suggest rejecting it (also for clipping). `None` if it isn't scored.
+pub(crate) fn quality_reading(db: &Database, img: &Image) -> Option<(Option<(f64, photon_import::quality::Grade)>, String)> {
+    use photon_import::quality::{self, Grade, SESSION_SECONDS};
+    let conn = db.conn().ok()?;
+    let id = img.id?;
+    let t = img.created_at;
+    let session = match t {
+        Some(t) => queries::images_in_session(&conn, img.camera_model.as_deref(), t - SESSION_SECONDS, t + SESSION_SECONDS)
+            .map_err(|e| log::warn!("Session of photo {id}: {e}"))
+            .ok()?,
+        None => vec![img.clone()],
+    };
+    let ids: Vec<i64> = session.iter().filter_map(|i| i.id).collect();
+    let scores = queries::get_image_quality_batch(&conn, &ids).ok()?;
+    let q = scores.get(&id)?;
+    let library = quality::library_reference(&conn);
+
+    // One eye score per shot (its files score alike), for the session's reference.
+    let mut per_shot: std::collections::HashMap<String, f64> = Default::default();
+    for i in &session {
+        if let Some(eyes) = i.id.and_then(|i| scores.get(&i)).and_then(|q| q.eye_sharpness) {
+            let key = i.group_hash.clone().unwrap_or_else(|| format!("id:{:?}", i.id));
+            let e = per_shot.entry(key).or_insert(eyes);
+            *e = e.max(eyes);
+        }
+    }
+    let session_ref = quality::session_eye_reference(per_shot.into_values().collect());
+    let relative = quality::relative_sharpness(q, session_ref, &library);
+    let suggested = quality::suggest_rejects(&session, &scores, library).into_iter().find(|s| s.image_id == id);
+
+    let mut text = match relative {
+        Some(r) => {
+            let what = if r.by_eyes { "eyes" } else { "whole photo" };
+            let of = match (r.by_eyes, r.in_session) {
+                (true, true) => "of this session's sharp shots",
+                (true, false) => "of your sharp portraits",
+                _ => "of your typical photo",
+            };
+            format!("Sharpness ({what}): {:.0}% {of}", r.percent)
+        }
+        None => "Sharpness: nothing to compare with yet".to_string(),
+    };
+    if let Some(s) = &suggested {
+        text.push_str(&format!("\nSuggested to reject: {}", s.reason));
+    }
+    let score = match (relative, &suggested) {
+        (Some(r), Some(_)) => Some((r.percent, Grade::Bad)),
+        (Some(r), None) => Some((r.percent, quality::grade(&r))),
+        (None, Some(_)) => Some((5.0, Grade::Bad)),
+        (None, None) => None,
+    };
+    Some((score, format!("Photo quality — {text}")))
 }
 
 fn clear(container: &GtkBox) {
@@ -1068,7 +1144,6 @@ fn xmp_sidecar(img: &Image) -> Option<PathBuf> {
 
 /// What changed about a photo, to be merged into its XMP sidecar.
 enum XmpChange<'a> {
-    Cull { rating: i32, flagged: i32 },
     Title(&'a str),
     Description(&'a str),
     Tags,
@@ -1089,11 +1164,6 @@ fn sync_image_xmp(conn: &rusqlite::Connection, image_id: i64, image_path: &Path,
     };
 
     let update = match change {
-        XmpChange::Cull { rating, flagged } => photon_import::XmpUpdate {
-            rating: Some(rating),
-            rejected: Some(flagged == -1),
-            ..Default::default()
-        },
         XmpChange::Title(title) => photon_import::XmpUpdate { title: Some(title), ..Default::default() },
         XmpChange::Description(text) => {
             photon_import::XmpUpdate { description: Some(text), ..Default::default() }
@@ -1446,6 +1516,48 @@ fn populate_info_panel(
     if let Some(ref fmt) = image.format {
         add_row(&meta_col, "Format", fmt.as_str());
     }
+    if let (Some(id), Ok(conn)) = (image.id, db.conn()) {
+        if let Ok(Some(q)) = queries::get_image_quality(&conn, id) {
+            let mut burst_info = String::new();
+            if image.created_at.is_some() {
+                if let Ok(nearby) = queries::timeline_items(&conn, &queries::TimelineFilter::All) {
+                    let bursts = photon_import::find_bursts(&nearby);
+                    for burst in bursts {
+                        if burst.items.iter().any(|b| b.id == id) {
+                            let burst_ids: Vec<i64> = burst.items.iter().map(|b| b.id).collect();
+                            if let Ok(batch) = queries::get_image_quality_batch(&conn, &burst_ids) {
+                                let mut best_sharpness = 0.0f64;
+                                for item in &burst.items {
+                                    if let Some(sq) = batch.get(&item.id) {
+                                        if sq.sharpness > best_sharpness {
+                                            best_sharpness = sq.sharpness;
+                                        }
+                                    }
+                                }
+                                if best_sharpness > 0.0 {
+                                    let pct = (q.sharpness / best_sharpness) * 100.0;
+                                    if (pct - 100.0).abs() < 1e-3 {
+                                        burst_info = format!(" (best of {} in burst)", burst.items.len());
+                                    } else {
+                                        burst_info = format!(" ({:.0}% of burst best)", pct);
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            add_row(&meta_col, "Sharpness", &format!("{:.1}{}", q.sharpness, burst_info));
+            if q.clip_highlights > 0.05 || q.clip_shadows > 0.05 {
+                add_row(
+                    &meta_col,
+                    "Clipping",
+                    &format!("Shadows {:.0}%, Highlights {:.0}%", q.clip_shadows * 100.0, q.clip_highlights * 100.0),
+                );
+            }
+        }
+    }
 
     columns.append(&meta_col);
 
@@ -1606,7 +1718,7 @@ fn populate_info_panel(
 
 /// Generate the large preview on a worker thread and show it in `picture`,
 /// unless the viewer has moved on to another photo by then.
-fn load_large_preview(picture: &Picture, image: &Image, cache_dir: &Path) {
+pub(crate) fn load_large_preview(picture: &Picture, image: &Image, cache_dir: &Path) {
     let generator = ThumbnailGenerator::new(cache_dir.to_path_buf());
     let image = image.clone();
     let weak = picture.downgrade();
@@ -1625,19 +1737,30 @@ fn load_large_preview(picture: &Picture, image: &Image, cache_dir: &Path) {
 }
 
 
-/// Open in the appropriate editor based on format.
-fn open_in_editor(image: &Image, prefs: &Preferences, db: &Database) {
+/// Open in the appropriate editor based on format. The error says why the
+/// editor couldn't be started, for the user.
+fn open_in_editor(image: &Image, prefs: &Preferences, db: &Database) -> Result<(), String> {
     let is_raw = image.format.as_ref().map(|f| f.is_raw()).unwrap_or(false);
     let cmd = if is_raw {
         &prefs.raw_editor
     } else {
         &prefs.raster_editor
     };
-    let _ = Command::new(cmd).arg(&image.path).spawn();
+    Command::new(cmd).arg(&image.path).spawn().map_err(|e| {
+        log::warn!("Starting {cmd} for {}: {e}", image.path.display());
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!("Couldn't open the editor: “{cmd}” isn't installed (Preferences → Editors)")
+        } else {
+            format!("Couldn't open the editor “{cmd}”: {e}")
+        }
+    })?;
 
     if let (Some(id), Ok(conn)) = (image.id, db.conn()) {
-        let _ = queries::record_edit(&conn, id, cmd, None);
+        if let Err(e) = queries::record_edit(&conn, id, cmd, None) {
+            log::warn!("Recording the edit of photo {id}: {e}");
+        }
     }
+    Ok(())
 }
 
 // ── Helpers ──────────────────────────────────────────────
@@ -1693,99 +1816,3 @@ fn format_size(bytes: i64) -> String {
     }
 }
 
-fn render_compare(
-    image_box: &GtkBox,
-    info_box: &GtkBox,
-    img_a: &Image,
-    img_b: &Image,
-    cache_dir: &Path,
-    prefs: &Preferences,
-    db: &Database,
-) {
-    clear(image_box);
-    clear(info_box);
-
-    let split_box = GtkBox::new(Orientation::Horizontal, 12);
-    split_box.set_hexpand(true);
-    split_box.set_vexpand(true);
-    split_box.set_homogeneous(true);
-    split_box.set_halign(Align::Fill);
-    split_box.set_valign(Align::Fill);
-
-    // Left pane (Image A)
-    let left_box = GtkBox::new(Orientation::Vertical, 6);
-    left_box.set_hexpand(true);
-    left_box.set_vexpand(true);
-    left_box.set_halign(Align::Fill);
-    left_box.set_valign(Align::Fill);
-
-    let pic_a = Picture::new();
-    let large_a = thumb_path(cache_dir, ThumbSize::Large, &img_a.hash);
-    let grid_a = thumb_path(cache_dir, ThumbSize::Grid, &img_a.hash);
-    if grid_a.exists() {
-        pic_a.set_filename(Some(&grid_a));
-    }
-    if large_a.exists() {
-        load_texture_async(&pic_a, &large_a);
-    } else {
-        load_large_preview(&pic_a, img_a, cache_dir);
-    }
-    pic_a.set_content_fit(gtk4::ContentFit::Contain);
-    pic_a.set_can_shrink(true);
-    pic_a.set_hexpand(true);
-    pic_a.set_vexpand(true);
-    pic_a.set_halign(Align::Fill);
-    pic_a.set_valign(Align::Fill);
-
-    let flag_str_a = match img_a.flagged {
-        1 => " [Pick ✓]",
-        -1 => " [Reject ✕]",
-        _ => "",
-    };
-    let lbl_a = Label::new(Some(&format!("A: {} (★ {}){}", img_a.filename, img_a.rating, flag_str_a)));
-    lbl_a.add_css_class("heading");
-    lbl_a.set_halign(Align::Center);
-    left_box.append(&lbl_a);
-    left_box.append(&pic_a);
-    split_box.append(&left_box);
-
-    // Right pane (Image B)
-    let right_box = GtkBox::new(Orientation::Vertical, 6);
-    right_box.set_hexpand(true);
-    right_box.set_vexpand(true);
-    right_box.set_halign(Align::Fill);
-    right_box.set_valign(Align::Fill);
-
-    let pic_b = Picture::new();
-    let large_b = thumb_path(cache_dir, ThumbSize::Large, &img_b.hash);
-    let grid_b = thumb_path(cache_dir, ThumbSize::Grid, &img_b.hash);
-    if grid_b.exists() {
-        pic_b.set_filename(Some(&grid_b));
-    }
-    if large_b.exists() {
-        load_texture_async(&pic_b, &large_b);
-    } else {
-        load_large_preview(&pic_b, img_b, cache_dir);
-    }
-    pic_b.set_content_fit(gtk4::ContentFit::Contain);
-    pic_b.set_can_shrink(true);
-    pic_b.set_hexpand(true);
-    pic_b.set_vexpand(true);
-    pic_b.set_halign(Align::Fill);
-    pic_b.set_valign(Align::Fill);
-
-    let flag_str_b = match img_b.flagged {
-        1 => " [Pick ✓]",
-        -1 => " [Reject ✕]",
-        _ => "",
-    };
-    let lbl_b = Label::new(Some(&format!("B: {} (★ {}){}", img_b.filename, img_b.rating, flag_str_b)));
-    lbl_b.add_css_class("heading");
-    lbl_b.set_halign(Align::Center);
-    right_box.append(&lbl_b);
-    right_box.append(&pic_b);
-    split_box.append(&right_box);
-
-    image_box.append(&split_box);
-    populate_info_panel(info_box, img_a, cache_dir, prefs, db, None);
-}

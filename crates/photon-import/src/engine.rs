@@ -102,7 +102,8 @@ impl CancelToken {
 
 /// What happened to one file.
 enum FileOutcome {
-    New(Box<Image>),
+    /// Imported; with a problem to report (e.g. no preview could be made).
+    New(Box<Image>, Option<String>),
     Duplicate,
     Failed(String),
 }
@@ -310,13 +311,21 @@ impl ImportEngine {
                     .into_iter()
                     .par_bridge()
                     .for_each_with(ready_tx, |tx, (path, mut outcome)| {
-                        if let (FileOutcome::New(img), Some(thumbs)) = (&mut outcome, thumbs) {
+                        if let (FileOutcome::New(img, warning), Some(thumbs)) = (&mut outcome, thumbs) {
                             match thumbs.ensure_grid(img) {
                                 Ok((_, th)) => {
                                     img.thumbhash = th;
                                 }
                                 Err(e) => {
                                     log::warn!("Thumbnail failed for {}: {e:#}", img.path.display());
+                                    // Most likely a damaged file, or not what its
+                                    // extension says: the user should know now,
+                                    // while the card is still at hand.
+                                    warning.get_or_insert(format!(
+                                        "{}: imported, but it can't be shown (damaged, or not really a .{} file?): {e:#}",
+                                        path.display(),
+                                        path.extension().unwrap_or_default().to_string_lossy()
+                                    ));
                                 }
                             }
                         }
@@ -374,7 +383,10 @@ impl ImportEngine {
                 Ok((path, outcome)) => {
                     processed += 1;
                     match outcome {
-                        FileOutcome::New(img) => pending.push(*img),
+                        FileOutcome::New(img, warning) => {
+                            pending.push(*img);
+                            out.errors.extend(warning);
+                        }
                         FileOutcome::Duplicate => out.duplicates += 1,
                         FileOutcome::Failed(msg) => out.errors.push(msg),
                     }
@@ -554,7 +566,7 @@ pub struct PreImportReport {
 /// Decide one file's fate with as little I/O as possible, and place it.
 fn process_file(src: &Path, ctx: &Context) -> FileOutcome {
     match try_process_file(src, ctx) {
-        Ok(Some(img)) => FileOutcome::New(Box::new(img)),
+        Ok(Some(img)) => FileOutcome::New(Box::new(img), None),
         Ok(None) => FileOutcome::Duplicate,
         Err(e) => FileOutcome::Failed(format!("{}: {e:#}", src.display())),
     }
@@ -563,6 +575,10 @@ fn process_file(src: &Path, ctx: &Context) -> FileOutcome {
 fn try_process_file(src: &Path, ctx: &Context) -> anyhow::Result<Option<Image>> {
     let config = ctx.config;
     let fs_meta = fs::metadata(src)?;
+    if fs_meta.len() == 0 {
+        // Nothing to keep; a card write that never finished.
+        anyhow::bail!("empty file (0 bytes), not imported");
+    }
     let original_name = file_name(src);
 
     // EXIF lives in the header: cheap even for 50 MB RAW files.
@@ -585,6 +601,11 @@ fn try_process_file(src: &Path, ctx: &Context) -> anyhow::Result<Option<Image>> 
     if ctx.suspected.contains(&key) {
         return Ok(None);
     }
+
+    // How the XMP sidecar follows the photo: as the photo did. A move whose
+    // source had to stay (no backup) copies the sidecar, so the photo left
+    // on the card keeps its edits and ratings.
+    let mut sidecar_mode = config.mode;
 
     // Content identity + placement.
     let (path, hash) = match config.mode {
@@ -627,9 +648,13 @@ fn try_process_file(src: &Path, ctx: &Context) -> anyhow::Result<Option<Image>> 
                 }
             };
             // The card's copy goes only once the library copy (and backup) exist.
-            if back_up(ctx, src, &dest, &hash) && moved == library::Moved::Copied {
-                if let Err(e) = fs::remove_file(src) {
+            let backed_up = back_up(ctx, src, &dest, &hash);
+            if moved == library::Moved::Copied {
+                if !backed_up {
+                    sidecar_mode = FolderImportMode::Copy;
+                } else if let Err(e) = fs::remove_file(src) {
                     ctx.warn(format!("{}: imported, but not removed from the source: {e}", src.display()));
+                    sidecar_mode = FolderImportMode::Copy;
                 }
             }
             (dest, hash)
@@ -668,7 +693,7 @@ fn try_process_file(src: &Path, ctx: &Context) -> anyhow::Result<Option<Image>> 
             Some(xmp)
         } else {
             let xmp_dest = sidecar::xmp_destination(src, &xmp, &path);
-            match library::transfer_sidecar(config.mode, &xmp, &xmp_dest) {
+            match library::transfer_sidecar(sidecar_mode, &xmp, &xmp_dest) {
                 Ok(()) => {
                     if let Some(backup_root) = &config.backup_dir {
                         let backed_up = fs::read(&xmp_dest).map_err(Into::into).and_then(|bytes| {
@@ -907,6 +932,8 @@ mod tests {
         };
         let src = card.path().join("IMG_9.jpg");
         write_jpeg(&src, &Spec::default());
+        let src_xmp = card.path().join("IMG_9.jpg.xmp");
+        fs::write(&src_xmp, "<xmp/>").unwrap();
         // A backup folder that can't be created.
         let blocker = card.path().join("not-a-dir");
         fs::write(&blocker, b"").unwrap();
@@ -918,9 +945,14 @@ mod tests {
         let engine = engine();
         let batch = engine.import(&DiskSource::new(card.path().to_path_buf(), true), &cfg, None).unwrap();
 
-        assert_eq!((batch.imported_count, batch.error_count), (1, 1));
+        // Two warnings: the photo and its sidecar weren't backed up.
+        assert_eq!(batch.imported_count, 1);
+        assert!(batch.error_count >= 1);
         assert!(src.exists(), "no backup, so the card copy stays");
+        assert!(src_xmp.exists(), "and so does its sidecar");
         assert!(lib.path().join("2023/07/04/IMG_9.jpg").exists());
+        assert!(lib.path().join("2023/07/04/IMG_9.jpg.xmp").exists(), "the library copy has one too");
+        fs::remove_file(&src_xmp).unwrap();
 
         // With a working backup, the move completes.
         let backup = tempfile::tempdir().unwrap();
@@ -1061,5 +1093,57 @@ mod tests {
         // The garbage file still imports (hash + mtime date); nothing panics or aborts.
         assert_eq!(batch.imported_count, 2);
         assert!(rx.try_iter().any(|p| matches!(p, ImportProgress::Completed { .. })));
+    }
+
+    #[test]
+    fn damaged_and_unreadable_files_are_reported_and_the_import_continues() {
+        use std::os::unix::fs::PermissionsExt;
+        let card = tempfile::tempdir().unwrap();
+        let lib = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let good = card.path().join("good.jpg");
+        write_jpeg(&good, &Spec { seed: 1, ..Default::default() });
+        let jpeg = fs::read(&good).unwrap();
+
+        fs::write(card.path().join("empty.jpg"), b"").unwrap();
+        fs::write(card.path().join("notes.png"), b"shopping list, not a picture").unwrap();
+        fs::write(card.path().join("half.jpg"), &jpeg[..jpeg.len() / 2]).unwrap();
+        let locked = card.path().join("locked.jpg");
+        write_jpeg(&locked, &Spec { seed: 2, ..Default::default() });
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads anything: then there is no permission error to see.
+        let can_lock = fs::File::open(&locked).is_err();
+
+        let engine = ImportEngine::new(
+            Database::open_in_memory().unwrap(),
+            Some(ThumbnailGenerator::new(cache.path().to_path_buf())),
+        );
+        let cfg = ImportConfig { generate_thumbnails: true, ..config(FolderImportMode::Copy, lib.path()) };
+        let (tx, rx) = crossbeam_channel::unbounded();
+        engine.import(&DiskSource::new(card.path().to_path_buf(), true), &cfg, Some(&tx)).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let errors = rx
+            .try_iter()
+            .find_map(|p| match p {
+                ImportProgress::Completed { errors, .. } => Some(errors),
+                _ => None,
+            })
+            .expect("the import completes");
+        let reported = |name: &str, why: &str| errors.iter().any(|e| e.contains(name) && e.contains(why));
+
+        let names: Vec<String> = photos(&engine).into_iter().map(|i| i.filename).collect();
+        assert!(names.contains(&"good.jpg".to_string()), "{names:?}");
+        assert!(!names.contains(&"empty.jpg".to_string()), "empty files are not imported");
+        assert!(reported("empty.jpg", "empty file"), "{errors:?}");
+        assert!(reported("notes.png", "can't be shown"), "{errors:?}");
+        if can_lock {
+            assert!(!names.contains(&"locked.jpg".to_string()));
+            assert!(reported("locked.jpg", "ermission denied"), "{errors:?}");
+        }
+        // The truncated JPEG may or may not decode; either way it is imported
+        // (its bytes are the photo) and nothing aborted.
+        assert!(names.contains(&"half.jpg".to_string()), "{names:?}");
+        assert_eq!(files_in(card.path()), 5, "a copy import never touches the card");
     }
 }

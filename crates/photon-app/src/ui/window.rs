@@ -31,7 +31,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 use photon_core::db::queries::{self, RatingFilter, TimelineFilter};
 use photon_core::db::Database;
-use photon_core::models::{Image, Preferences, TimelineItem, UIAction};
+use photon_core::models::{ColorLabel, Image, Preferences, TimelineItem, UIAction};
 use photon_import::ImportEngine;
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -64,6 +64,8 @@ pub struct MainWindow {
     timeline_stale: Rc<Cell<bool>>,
     pub rating_filter: Rc<Cell<RatingFilter>>,
     pub cull_flag: Rc<Cell<Option<i32>>>,
+    pub color_filter: Rc<Cell<Option<ColorLabel>>>,
+    pub blur_filter: Rc<Cell<bool>>,
     /// Names the active rating/flag filter on the header bar's filter button.
     filter_label: Label,
     pub sidebar: sidebar::Sidebar,
@@ -74,6 +76,8 @@ pub struct MainWindow {
     /// When the last library check (missing files, changed sidecars) started,
     /// and whether one is running.
     library_check: Rc<Cell<(Option<std::time::Instant>, bool)>>,
+    /// The user said "Not Now" to downloading the face model, this session.
+    face_model_declined: Rc<Cell<bool>>,
 }
 
 /// Coming back to Photon from darktable re-reads changed sidecars, at most
@@ -168,6 +172,14 @@ impl MainWindow {
         let paned = Paned::new(Orientation::Horizontal);
         paned.set_position(260);
         paned.set_vexpand(true);
+        paned.add_css_class("photon-main-paned");
+        // Neither side may be squeezed below its minimum width (the viewer's
+        // bottom bar has a wide one): the divider would move on while that
+        // side overflowed under it. The sidebar keeps its width when the
+        // window is resized.
+        paned.set_shrink_start_child(false);
+        paned.set_shrink_end_child(false);
+        paned.set_resize_start_child(false);
         root_box.append(&paned);
 
         let (nav_tx, nav_rx) = async_channel::unbounded::<UIAction>();
@@ -206,6 +218,8 @@ impl MainWindow {
         // ── Filter Popover ──────────────────────────────
         let rating_filter = Rc::new(Cell::new(RatingFilter::Any));
         let cull_flag = Rc::new(Cell::new(None));
+        let color_filter = Rc::new(Cell::new(None));
+        let blur_filter = Rc::new(Cell::new(false));
 
         let popover = gtk4::Popover::new();
         let pop_box = GtkBox::new(Orientation::Vertical, 8);
@@ -266,6 +280,55 @@ impl MainWindow {
             flag_btns.push((b, val));
         }
         pop_box.append(&status_box);
+
+        let color_lbl = Label::new(Some("Colour Label Filter"));
+        color_lbl.add_css_class("caption-heading");
+        color_lbl.set_halign(Align::Start);
+        pop_box.append(&color_lbl);
+
+        let color_box = GtkBox::new(Orientation::Horizontal, 0);
+        color_box.add_css_class("linked");
+        let colors: [(&str, Option<ColorLabel>); 7] = [
+            ("All", None),
+            ("", Some(ColorLabel::Red)),
+            ("", Some(ColorLabel::Yellow)),
+            ("", Some(ColorLabel::Green)),
+            ("", Some(ColorLabel::Blue)),
+            ("", Some(ColorLabel::Purple)),
+            ("None", Some(ColorLabel::None)),
+        ];
+        let mut color_btns: Vec<(ToggleButton, Option<ColorLabel>)> = Vec::new();
+        for (label, val) in colors {
+            // Colours as dots (symbolic), "All" and "None" as words.
+            let b = if label.is_empty() {
+                let b = ToggleButton::new();
+                b.set_child(Some(&selection_bar::label_dot(val.unwrap_or_default())));
+                b
+            } else {
+                ToggleButton::with_label(label)
+            };
+            b.set_active(val.is_none());
+            if let Some((first, _)) = color_btns.first() {
+                b.set_group(Some(first));
+            }
+            if let Some(c) = val {
+                b.set_tooltip_text(Some(c.display_name()));
+            } else {
+                b.set_tooltip_text(Some("All colour labels"));
+            }
+            color_box.append(&b);
+            color_btns.push((b, val));
+        }
+        pop_box.append(&color_box);
+
+        let quality_lbl = Label::new(Some("Quality Filter"));
+        quality_lbl.add_css_class("caption-heading");
+        quality_lbl.set_halign(Align::Start);
+        pop_box.append(&quality_lbl);
+
+        let blur_btn = ToggleButton::with_label("Possibly blurred");
+        blur_btn.add_css_class("flat");
+        pop_box.append(&blur_btn);
 
         let zoom_lbl = Label::new(Some("Grid Density"));
         zoom_lbl.add_css_class("caption-heading");
@@ -334,20 +397,28 @@ impl MainWindow {
         let progress_revealer = Revealer::new();
         progress_revealer.set_transition_type(gtk4::RevealerTransitionType::SlideUp);
 
+        // The theme's stock card (its radius, colours and shadow), padded inside.
+        let status_card = GtkBox::new(Orientation::Vertical, 0);
+        status_card.add_css_class("card");
+        status_card.set_margin_top(8);
+        status_card.set_margin_bottom(12);
+        status_card.set_margin_start(16);
+        status_card.set_margin_end(16);
         let status_box = GtkBox::new(Orientation::Vertical, 6);
-        status_box.add_css_class("status-card");
-        status_box.set_margin_top(8);
-        status_box.set_margin_bottom(12);
-        status_box.set_margin_start(16);
-        status_box.set_margin_end(16);
+        status_box.set_margin_top(10);
+        status_box.set_margin_bottom(10);
+        status_box.set_margin_start(12);
+        status_box.set_margin_end(12);
+        status_card.append(&status_box);
 
         let status_label = Label::new(Some("Ready"));
         status_label.set_halign(Align::Start);
+        status_label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+        // The label says how far along; the bar only shows it.
         let progress_bar = ProgressBar::new();
-        progress_bar.set_show_text(true);
 
+        // Stopping keeps what's done: not a destructive action (HIG).
         let cancel_button = Button::with_label("Stop Import");
-        cancel_button.add_css_class("destructive-action");
         cancel_button.set_visible(false);
 
         let progress_row = GtkBox::new(Orientation::Horizontal, 12);
@@ -358,7 +429,7 @@ impl MainWindow {
 
         status_box.append(&status_label);
         status_box.append(&progress_row);
-        progress_revealer.set_child(Some(&status_box));
+        progress_revealer.set_child(Some(&status_card));
         content_box.append(&progress_revealer);
 
         paned.set_end_child(Some(&content_box));
@@ -384,8 +455,11 @@ impl MainWindow {
             timeline_filter: Rc::new(RefCell::new(None)),
             timeline_stale: Rc::new(Cell::new(true)),
             library_check: Rc::new(Cell::new((None, false))),
+            face_model_declined: Rc::new(Cell::new(false)),
             rating_filter,
             cull_flag,
+            color_filter,
+            blur_filter,
             filter_label,
             sidebar: sidebar_handle,
             toasts,
@@ -399,6 +473,14 @@ impl MainWindow {
         let mw_t_ss = mw.clone();
         mw.timeline.connect_start_slideshow(move || mw_t_ss.start_slideshow());
         mw.timeline.set_undo_manager(mw.undo_manager.clone());
+        let toasts = mw.toasts.clone();
+        mw.timeline.set_notify(move |text| toasts.add_toast(adw::Toast::new(text)));
+
+        let mw_b = mw.clone();
+        blur_btn.connect_toggled(move |b| {
+            mw_b.blur_filter.set(b.is_active());
+            mw_b.filters_changed();
+        });
 
         for (b, val) in rating_btns {
             let mw_f = mw.clone();
@@ -415,6 +497,16 @@ impl MainWindow {
             b.connect_toggled(move |b| {
                 if b.is_active() {
                     mw_f.cull_flag.set(val);
+                    mw_f.filters_changed();
+                }
+            });
+        }
+
+        for (b, val) in color_btns {
+            let mw_f = mw.clone();
+            b.connect_toggled(move |b| {
+                if b.is_active() {
+                    mw_f.color_filter.set(val);
                     mw_f.filters_changed();
                 }
             });
@@ -497,6 +589,12 @@ impl MainWindow {
         act_locate.connect_activate(move |_, _| mw_loc.locate_missing_folder());
         mw.window.add_action(&act_locate);
 
+
+        let mw_aq = mw.clone();
+        let act_analyse_quality = gio::SimpleAction::new("analyse_quality", None);
+        act_analyse_quality.connect_activate(move |_, _| mw_aq.analyse_quality());
+        mw.window.add_action(&act_analyse_quality);
+
         // ── Preferences ─────────────────────────────────
         let mw_p = mw.clone();
         let act_prefs = gio::SimpleAction::new("preferences", None);
@@ -553,6 +651,10 @@ impl MainWindow {
             }
             sb.set_sensitive(on_timeline);
             mw_vis.set_bottom_bar_revealed(!is_viewer);
+            // Slideshows (F5) start from the library, not from the 1-up view.
+            if let Some(action) = mw_vis.window.lookup_action("slideshow").and_downcast::<gio::SimpleAction>() {
+                action.set_enabled(!is_viewer);
+            }
         });
 
         // Dragged-out photos follow the "Share Sends" preference too.
@@ -574,6 +676,10 @@ impl MainWindow {
                 undo_manager: mw.undo_manager.clone(),
                 current_album_id: mw.current_album_id.clone(),
                 on_start_slideshow: Some(Rc::new(move || mw_ss_sel.start_slideshow())),
+                on_compare: {
+                    let mw = mw.clone();
+                    Rc::new(move |ids| mw.show_compare(ids))
+                },
             },
         );
         content_box.append(&bottom_bar_handle.widget);
@@ -633,6 +739,16 @@ impl MainWindow {
                             Err(e) => log::warn!("Reading XMP for {}: {e}", path.display()),
                         }
                     }
+                }
+
+                // One rating per shot: repair shots whose files disagree.
+                match photon_import::reconcile_shots(&mut conn) {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        log::info!("Made the files of {n} shots agree on rating and pick/reject");
+                        changed = true;
+                    }
+                    Err(e) => log::warn!("Reconciling shots: {e:#}"),
                 }
 
                 for (ids, missing) in [(&to_mark_missing, true), (&to_mark_found, false)] {
@@ -722,6 +838,18 @@ impl MainWindow {
             UIAction::FilterMissing => {
                 self.show_timeline(TimelineFilter::Missing, "Missing Photos".to_string());
             }
+            UIAction::FilterBySmartCollection(coll_id) => {
+                let name = if let Ok(conn) = self.db.conn() {
+                    queries::get_smart_collection(&conn, *coll_id)
+                        .ok()
+                        .flatten()
+                        .map(|c| c.name)
+                        .unwrap_or_else(|| "Smart Collection".to_string())
+                } else {
+                    "Smart Collection".to_string()
+                };
+                self.show_timeline(TimelineFilter::SmartCollection(*coll_id), format!("Smart Collection: {name}"));
+            }
         }
     }
 
@@ -733,6 +861,7 @@ impl MainWindow {
         self.sidebar.refresh_events();
         self.sidebar.refresh_tags();
         self.sidebar.refresh_albums();
+        self.sidebar.refresh_smart_collections();
         self.sidebar.refresh_missing();
         let action = self.last_grid_action.borrow().clone();
         let showing_viewer = self.stack.visible_child_name().as_deref() == Some("viewer");
@@ -811,7 +940,7 @@ impl MainWindow {
         }
     }
 
-    /// The rating or flag filter changed: relabel the filter button and
+    /// The rating, flag, color or blur filter changed: relabel the filter button and
     /// reload the timeline.
     fn filters_changed(&self) {
         let rating = match self.rating_filter.get() {
@@ -822,16 +951,23 @@ impl MainWindow {
         };
         let flag = match self.cull_flag.get() {
             None => None,
-            Some(1) => Some("Picks"),
-            Some(-1) => Some("Rejects"),
-            Some(_) => Some("Unflagged"),
+            Some(1) => Some("Picks".to_string()),
+            Some(-1) => Some("Rejects".to_string()),
+            Some(_) => Some("Unflagged".to_string()),
         };
-        let text = match (rating, flag) {
-            (None, None) => "All".to_string(),
-            (Some(r), None) => r,
-            (None, Some(f)) => f.to_string(),
-            (Some(r), Some(f)) => format!("{r} · {f}"),
+        let color = match self.color_filter.get() {
+            None => None,
+            Some(c) => Some(c.display_name().to_string()),
         };
+        let blur = if self.blur_filter.get() { Some("Blurred".to_string()) } else { None };
+
+        let mut parts = Vec::new();
+        if let Some(r) = rating { parts.push(r); }
+        if let Some(f) = flag { parts.push(f); }
+        if let Some(c) = color { parts.push(c); }
+        if let Some(b) = blur { parts.push(b); }
+
+        let text = if parts.is_empty() { "All".to_string() } else { parts.join(" · ") };
         self.filter_label.set_text(&text);
         if text == "All" {
             self.filter_label.remove_css_class("accent");
@@ -852,16 +988,31 @@ impl MainWindow {
     /// Show `filter` in the virtualized timeline. Reuses the loaded timeline
     /// (and its scroll position) when nothing changed.
     fn show_timeline(&self, filter: TimelineFilter, title: String) {
-        let same = self.timeline_filter.borrow().as_ref() == Some(&filter);
+        let effective_filter = if self.blur_filter.get() {
+            // The same threshold as Analyse Photo Quality uses outside bursts.
+            let median = self
+                .db
+                .conn()
+                .ok()
+                .and_then(|c| queries::library_sharpness_median(&c, photon_import::QUALITY_VERSION).ok().flatten());
+            TimelineFilter::Blurred(median.map_or(photon_import::quality::BLUR_SHARPNESS_FLOOR, |m| {
+                m * photon_import::quality::BLUR_RATIO_OF_LIBRARY_MEDIAN
+            }))
+        } else {
+            filter.clone()
+        };
+
+        let same = self.timeline_filter.borrow().as_ref() == Some(&effective_filter);
         if !same || self.timeline_stale.get() {
             let started = std::time::Instant::now();
             let items = match self.db.conn() {
                 Ok(conn) => {
-                    queries::timeline_items_with_cull(
+                    queries::timeline_items_with_filters(
                         &conn,
-                        &filter,
+                        &effective_filter,
                         self.rating_filter.get(),
                         self.cull_flag.get(),
+                        self.color_filter.get(),
                     ).unwrap_or_else(|e| {
                         log::error!("Timeline query failed: {e}");
                         Vec::new()
@@ -874,13 +1025,16 @@ impl MainWindow {
             let count = items.len();
             self.timeline.set_items(items, true, same);
             log::debug!("Timeline: {count} photos loaded and laid out in {:?}", started.elapsed());
-            *self.timeline_filter.borrow_mut() = Some(filter);
+            *self.timeline_filter.borrow_mut() = Some(effective_filter);
             self.timeline_stale.set(false);
         }
 
         let count = self.current_photos.borrow().len();
         let count_str = if count == 1 { "1 photo" } else { &format!("{count} photos") };
-        let is_filtered = self.rating_filter.get() != RatingFilter::Any || self.cull_flag.get().is_some();
+        let is_filtered = self.rating_filter.get() != RatingFilter::Any
+            || self.cull_flag.get().is_some()
+            || self.color_filter.get().is_some()
+            || self.blur_filter.get();
         let filter_tag = if is_filtered { " · Filtered" } else { "" };
         let subtitle = format!("{title} · {count_str}{filter_tag}");
         self.window_title.set_subtitle(&subtitle);
@@ -984,6 +1138,48 @@ impl MainWindow {
 
     fn show_viewer(&self, index: usize) {
         let photos = self.current_photos.borrow().clone();
+        self.open_viewer(photos, index);
+    }
+
+    /// The selected photos compared: 2 side by side (Compare), 3–9 in a
+    /// grid (Survey).
+    pub fn show_compare(&self, ids: Vec<i64>) {
+        let all = self.current_photos.borrow().clone();
+        let mut positions: Vec<usize> = ids.iter().filter_map(|id| all.iter().position(|p| p.id == *id)).collect();
+        positions.sort_unstable();
+        let back_tx = self.nav_tx.clone();
+        let back_action = self.last_grid_action.borrow().clone();
+        let ctx = crate::ui::compare::ViewContext {
+            db: self.db.clone(),
+            cache_dir: self.cache_dir.clone(),
+            notify: self.share_context().notify,
+            undo: Some(self.undo_manager.clone()),
+            on_back: Rc::new(move || {
+                let _ = back_tx.send_blocking(back_action.clone());
+            }),
+        };
+        let view = match positions.as_slice() {
+            &[a, b] => crate::ui::compare::build_compare(ctx, all, a, b),
+            p if (3..=9).contains(&p.len()) => {
+                let items: Vec<TimelineItem> = p.iter().map(|&i| all[i].clone()).collect();
+                let mw = self.clone();
+                let on_open = Rc::new(move |id: i64| {
+                    let index = mw.current_photos.borrow().iter().position(|p| p.id == id);
+                    if let Some(index) = index {
+                        mw.show_viewer(index);
+                    }
+                });
+                crate::ui::survey::build_survey(ctx, items, on_open)
+            }
+            _ => return self.toast("Select 2 photos to compare, or 3–9 to survey"),
+        };
+        self.clear_viewer();
+        self.viewer_container.append(&view);
+        self.stack.set_visible_child_name("viewer");
+        self.set_bottom_bar_revealed(false);
+    }
+
+    fn open_viewer(&self, photos: Rc<Vec<TimelineItem>>, index: usize) {
         if index >= photos.len() {
             return;
         }
@@ -994,8 +1190,6 @@ impl MainWindow {
         self.clear_viewer();
         let this = self.clone();
         let on_export = Some(Rc::new(move |images| this.start_export(images)) as Rc<dyn Fn(Vec<Image>)>);
-        let this_ss = self.clone();
-        let on_slideshow = Some(Rc::new(move || this_ss.start_slideshow()) as Rc<dyn Fn()>);
         let viewer = detail::build_viewer(
             photos,
             index,
@@ -1007,7 +1201,6 @@ impl MainWindow {
             on_export,
             self.share_context(),
             Some(self.undo_manager.clone()),
-            on_slideshow,
             Some(self.window.clone().upcast()),
         );
         self.viewer_container.append(&viewer);
@@ -1236,6 +1429,370 @@ impl MainWindow {
             items,
             self.cache_dir.clone(),
         );
+    }
+
+    /// The photos a quality tool works on: the selection, else the photos
+    /// of the current view (a day, event, album, tag, search). The year and
+    /// month overviews list no photos: then `None`, the whole library.
+    /// Also a phrase naming it, for messages.
+    fn quality_scope(&self) -> (Option<Vec<i64>>, &'static str) {
+        let selected = self.timeline.selected_items();
+        if !selected.is_empty() {
+            return (Some(selected.iter().map(|p| p.id).collect()), "the selected photos");
+        }
+        if self.stack.visible_child_name().as_deref() == Some("cards") {
+            return (None, "the library");
+        }
+        (Some(self.current_photos.borrow().iter().map(|p| p.id).collect()), "this view")
+    }
+
+    /// Score what isn't scored yet in the selection or view, then show the
+    /// photos that look blurred or badly exposed.
+    fn run_quality_check(&self) {
+        let (scope, what) = self.quality_scope();
+        let ids = match scope {
+            Some(ids) => ids,
+            None => match self.db.conn().map_err(|e| e.to_string()).and_then(|c| {
+                queries::get_all_images(&c, i32::MAX, 0).map_err(|e| e.to_string())
+            }) {
+                Ok(all) => all.iter().filter_map(|i| i.id).collect(),
+                Err(e) => return self.show_error(&e),
+            },
+        };
+        if ids.is_empty() {
+            self.toast("No photos in this view");
+            return;
+        }
+        let mw = self.clone();
+        let ids_after = ids.clone();
+        self.analyse_quality_in(Some(ids), what, false, Some(Box::new(move || mw.open_quality_results(ids_after, what))));
+    }
+
+    /// Score `ids` again from scratch, then show the results again.
+    fn reanalyse_quality(&self, ids: Vec<i64>, what: &'static str) {
+        let mw = self.clone();
+        let ids_after = ids.clone();
+        self.analyse_quality_in(Some(ids), what, true, Some(Box::new(move || mw.open_quality_results(ids_after, what))));
+    }
+
+    fn open_quality_results(&self, target_ids: Vec<i64>, what: &'static str) {
+        let conn = match self.db.conn() {
+            Ok(c) => c,
+            Err(e) => return self.show_error(&e.to_string()),
+        };
+        let full_images: Vec<Image> =
+            target_ids.iter().filter_map(|&id| queries::get_image(&conn, id).ok().flatten()).collect();
+        let scores = queries::get_image_quality_batch(&conn, &target_ids).unwrap_or_default();
+        let library = photon_import::quality::library_reference(&conn);
+        drop(conn);
+
+        let mw = self.clone();
+        let (mw_again, ids_again) = (self.clone(), target_ids.clone());
+        crate::ui::rejects_dialog::show(
+            &self.window,
+            full_images,
+            scores,
+            library,
+            self.cache_dir.clone(),
+            move |reject_ids| mw.apply_rejects(reject_ids),
+            move || mw_again.reanalyse_quality(ids_again.clone(), what),
+        );
+    }
+
+    /// Reject the photos the user confirmed in the Photo Quality results: the same DB
+    /// write and XMP sync as culling by hand, off the UI thread. Undoable once
+    /// saved; sidecars that couldn't be written are reported.
+    pub fn apply_rejects(&self, reject_ids: Vec<i64>) {
+        if reject_ids.is_empty() {
+            return;
+        }
+        let db = self.db.clone();
+        let mw = self.clone();
+        glib::spawn_future_local(async move {
+            let result = gio::spawn_blocking(move || -> Result<(Vec<(i64, i32)>, usize), String> {
+                let mut conn = db.conn().map_err(|e| e.to_string())?;
+                let mut previous = Vec::with_capacity(reject_ids.len());
+                for &id in &reject_ids {
+                    if let Some(img) = queries::get_image(&conn, id).map_err(|e| e.to_string())? {
+                        previous.push((id, img.flagged));
+                    }
+                }
+                let ids: Vec<i64> = previous.iter().map(|&(id, _)| id).collect();
+                queries::batch_set_flag(&mut conn, &ids, -1).map_err(|e| e.to_string())?;
+                let xmp_failed = crate::ui::timeline::sync_cull_to_xmp(&conn, &ids, crate::ui::timeline::XmpFields::CULL);
+                Ok((previous, xmp_failed))
+            })
+            .await
+            .unwrap_or_else(|_| Err("the worker thread panicked".into()));
+
+            match result {
+                Ok((previous, xmp_failed)) => {
+                    let count = previous.len();
+                    mw.undo_manager.borrow_mut().push(crate::ui::undo::UndoAction::Flag { previous, new_flag: -1 });
+                    mw.timeline_stale.set(true);
+                    mw.refresh();
+                    if xmp_failed > 0 {
+                        mw.toast(&format!(
+                            "Rejected {count} photos, but {xmp_failed} XMP sidecars couldn't be updated (see the log)"
+                        ));
+                    } else {
+                        mw.toast(&format!("Rejected {count} photos (Ctrl+Z to undo)"));
+                    }
+                }
+                Err(e) => {
+                    log::error!("Rejecting suggested photos: {e}");
+                    mw.show_error(&format!("The photos couldn't be rejected: {e}"));
+                }
+            }
+        });
+    }
+
+    /// Score the photos without a current quality score (AI-7), in the
+    /// background with progress and Stop. Scores come only from the Large
+    /// preview (made if missing), so every score is comparable; a photo
+    /// without one is skipped.
+    /// Run `then`, first offering to download the face model if it isn't
+    /// there yet and could run: without it, a blurred face in front of a
+    /// sharp background passes (the whole frame looks sharp).
+    fn with_face_model(&self, then: Rc<dyn Fn()>) {
+        let store = photon_ai::store::ModelStore::default_store();
+        let spec = photon_ai::faces::face_spec();
+        let offer = !self.face_model_declined.get()
+            && !photon_ai::faces::model_ready(&store)
+            && photon_ai::openvino::OpenVinoBackend::is_available();
+        let Some(spec) = spec.filter(|_| offer) else { return then() };
+
+        let dialog = adw::MessageDialog::new(
+            Some(&self.window),
+            Some("Check Faces for Blur?"),
+            Some(&format!(
+                "A blurred face in front of a sharp background looks sharp to the whole-photo check. \
+                 A small face-detection model finds faces so their eyes can be checked.\n\n\
+                 {} · {} KB · {} · {} licence\nIt runs on this computer; no photo leaves it.",
+                spec.id,
+                spec.size_bytes / 1024,
+                spec.source,
+                spec.licence
+            )),
+        );
+        dialog.add_response("later", "Not Now");
+        dialog.add_response("download", "Download");
+        dialog.set_response_appearance("download", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("download"));
+        dialog.set_close_response("later");
+        let mw = self.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response != "download" {
+                mw.face_model_declined.set(true);
+                return then();
+            }
+            mw.toast("Downloading the face model…");
+            let (mw, then, spec, store) = (mw.clone(), then.clone(), spec.clone(), store.clone());
+            glib::spawn_future_local(async move {
+                let result = gio::spawn_blocking(move || store.download(&spec, None, None).map(drop))
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("the download worker crashed")));
+                if let Err(e) = result {
+                    log::warn!("Downloading the face model: {e:#}");
+                    mw.toast(&format!("The face model couldn't be downloaded: {e}. Continuing without it."));
+                    mw.face_model_declined.set(true);
+                }
+                then();
+            });
+        });
+        dialog.present();
+    }
+
+    /// "Analyse Photo Quality…": offer the face model if missing, score the
+    /// selection or view, and show what looks blurred or badly exposed.
+    pub fn analyse_quality(&self) {
+        let mw = self.clone();
+        self.with_face_model(Rc::new(move || mw.run_quality_check()));
+    }
+
+    /// Score the photos of `scope` (all photos if `None`; `what` names it)
+    /// that have no current score — all of them with `force` — then run
+    /// `then` (also when there was nothing to score; not when stopped).
+    fn analyse_quality_in(
+        &self,
+        scope: Option<Vec<i64>>,
+        what: &'static str,
+        force: bool,
+        then: Option<Box<dyn FnOnce()>>,
+    ) {
+        if self.progress_revealer.reveals_child() {
+            self.toast("Wait for the current task (import or thumbnails) to finish");
+            return;
+        }
+        // "Unscored below version MAX" = every photo that can be scored.
+        let below = if force { i32::MAX } else { photon_import::QUALITY_VERSION };
+        // With the face model downloaded, photos scored before it get their faces checked.
+        let faces_on = photon_ai::faces::model_ready(&photon_ai::store::ModelStore::default_store())
+            && photon_ai::openvino::OpenVinoBackend::is_available();
+        let mut unscored = match self
+            .db
+            .conn()
+            .map_err(|e| e.to_string())
+            .and_then(|c| queries::get_unscored_images(&c, below, faces_on).map_err(|e| e.to_string()))
+        {
+            Ok(list) => list,
+            Err(e) => return self.show_error(&e),
+        };
+        if let Some(ids) = &scope {
+            let ids: std::collections::HashSet<i64> = ids.iter().copied().collect();
+            unscored.retain(|(id, _, _)| ids.contains(id));
+        }
+        if unscored.is_empty() {
+            match then {
+                Some(then) => then(),
+                None => self.toast(&format!("All photos in {what} have current quality scores")),
+            }
+            return;
+        }
+
+        let total = unscored.len();
+        self.status_label.set_text(&format!("Analysing the quality of {what}: 0 of {total}"));
+        self.progress_bar.set_fraction(0.0);
+        self.cancel_button.set_label("Stop");
+        self.cancel_button.set_visible(true);
+        self.progress_revealer.set_reveal_child(true);
+
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_c = cancel.clone();
+        let cancel_handler = self
+            .cancel_button
+            .connect_clicked(move |_| cancel_c.store(true, std::sync::atomic::Ordering::Relaxed));
+
+        enum Progress {
+            Step(usize),
+            Done { scored: usize, skipped: usize, failed: usize, stopped: bool },
+        }
+        let (tx, rx) = async_channel::bounded::<Progress>(64);
+
+        let mw = self.clone();
+        let mut then = then;
+        glib::spawn_future_local(async move {
+            let mut cancel_handler = Some(cancel_handler);
+            while let Ok(msg) = rx.recv().await {
+                match msg {
+                    Progress::Step(done) => {
+                        mw.progress_bar.set_fraction(done as f64 / total as f64);
+                        mw.status_label.set_text(&format!("Analysing the quality of {what}: {done} of {total}"));
+                    }
+                    Progress::Done { scored, skipped, failed, stopped } => {
+                        mw.progress_revealer.set_reveal_child(false);
+                        mw.cancel_button.set_visible(false);
+                        if let Some(h) = cancel_handler.take() {
+                            mw.cancel_button.disconnect(h);
+                        }
+                        mw.refresh();
+                        let mut text = if stopped {
+                            format!("Quality analysis stopped: {scored} of {total} photos scored")
+                        } else {
+                            format!("Quality analysis done: {scored} photos scored")
+                        };
+                        if skipped > 0 {
+                            text.push_str(&format!(", {skipped} without a preview skipped"));
+                        }
+                        if failed > 0 {
+                            text.push_str(&format!(", {failed} not saved (see the log)"));
+                        }
+                        match then.take() {
+                            Some(then) if !stopped => then(),
+                            _ => mw.toast(&text),
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
+        let db = self.db.clone();
+        let thumbs = photon_import::thumbnails::ThumbnailGenerator::new(self.cache_dir.clone());
+        std::thread::spawn(move || {
+            use rayon::prelude::*;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let (done, scored, skipped, failed) =
+                (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+            // One detector for all workers: inference takes ~5 ms, decoding
+            // the preview longer, so they rarely wait for it.
+            let detector = if faces_on {
+                let backend = photon_ai::openvino::OpenVinoBackend::new();
+                match photon_ai::faces::load_detector(&photon_ai::store::ModelStore::default_store(), &backend) {
+                    Ok(Some((detector, device))) => {
+                        log::info!("Face-aware quality analysis on {device}");
+                        Some(std::sync::Mutex::new(detector))
+                    }
+                    Ok(None) => None,
+                    Err(e) => {
+                        log::warn!("Face model unavailable; scoring without faces: {e:#}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            unscored.par_iter().for_each(|(id, _hash, _path)| {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let preview = db
+                    .conn()
+                    .map_err(|e| e.to_string())
+                    .and_then(|conn| queries::get_image(&conn, *id).map_err(|e| e.to_string()))
+                    .and_then(|img| img.ok_or_else(|| "no longer in the library".to_string()))
+                    .and_then(|img| {
+                        thumbs.ensure(&img, photon_import::thumbnails::ThumbSize::Large).map_err(|e| format!("{e:#}"))
+                    })
+                    .and_then(|path| image::open(&path).map(|d| d.to_rgb8()).map_err(|e| e.to_string()));
+                match preview {
+                    Ok(rgb) => {
+                        let score = photon_import::compute_quality(&rgb);
+                        let mut model = score.to_model(*id, chrono::Utc::now().timestamp());
+                        if let Some(detector) = &detector {
+                            let found = detector
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("face detector poisoned"))
+                                .and_then(|mut d| photon_ai::faces::largest_face_eyes(&mut d, &rgb));
+                            match found {
+                                Ok((faces, eyes)) => {
+                                    model.faces = Some(faces as i32);
+                                    model.eye_sharpness = eyes;
+                                }
+                                Err(e) => log::warn!("Face detection for photo {id}: {e:#}"),
+                            }
+                        }
+                        let saved = db
+                            .conn()
+                            .map_err(|e| e.to_string())
+                            .and_then(|conn| queries::save_image_quality(&conn, &model).map_err(|e| e.to_string()));
+                        match saved {
+                            Ok(()) => scored.fetch_add(1, Ordering::Relaxed),
+                            Err(e) => {
+                                log::warn!("Saving the quality score of photo {id}: {e}");
+                                failed.fetch_add(1, Ordering::Relaxed)
+                            }
+                        };
+                    }
+                    Err(e) => {
+                        log::info!("No quality score for photo {id}: {e}");
+                        skipped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if n % 10 == 0 {
+                    let _ = tx.send_blocking(Progress::Step(n));
+                }
+            });
+
+            let _ = tx.send_blocking(Progress::Done {
+                scored: scored.into_inner(),
+                skipped: skipped.into_inner(),
+                failed: failed.into_inner(),
+                stopped: cancel.load(Ordering::Relaxed),
+            });
+        });
     }
 }
 

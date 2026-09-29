@@ -13,7 +13,7 @@
 use gtk4::prelude::*;
 use gtk4::{
     gdk, gio, glib, Align, EventControllerMotion, EventControllerScroll, EventControllerScrollFlags,
-    GestureClick, GestureDrag, GestureZoom, Overlay, Picture, ScrolledWindow, Spinner,
+    GestureClick, GestureDrag, GestureZoom, Label, Overlay, Picture, ScrolledWindow, Spinner,
 };
 use photon_core::models::Image;
 use photon_import::thumbnails::{thumb_path, ThumbSize, ThumbnailGenerator};
@@ -47,6 +47,8 @@ pub struct PhotoView {
     scrolled: ScrolledWindow,
     picture: Picture,
     spinner: Spinner,
+    /// Says why the full-resolution render isn't shown, when it failed.
+    note: Label,
     image: Image,
     /// The photo's full-resolution size in pixels, upright. From the catalog
     /// until the render arrives; from a preview if the catalog has none.
@@ -61,6 +63,9 @@ pub struct PhotoView {
     pointer: Cell<Option<(f64, f64)>>,
     sync_queued: Cell<bool>,
     on_change: Rc<dyn Fn(&PhotoView)>,
+    /// Called whenever what is on screen moves: zoom or pan (for Compare,
+    /// which keeps two views in step).
+    on_moved: std::cell::RefCell<Option<Rc<dyn Fn(&Rc<PhotoView>)>>>,
 }
 
 impl PhotoView {
@@ -96,9 +101,21 @@ impl PhotoView {
         spinner.set_tooltip_text(Some("Rendering at full resolution…"));
         spinner.set_visible(false);
 
+        let note = Label::new(None);
+        note.add_css_class("osd");
+        note.add_css_class("photon-viewer-note");
+        note.set_halign(Align::Start);
+        note.set_valign(Align::End);
+        note.set_margin_start(12);
+        note.set_margin_bottom(12);
+        note.set_wrap(true);
+        note.set_max_width_chars(60);
+        note.set_visible(false);
+
         let root = Overlay::new();
         root.set_child(Some(&scrolled));
         root.add_overlay(&spinner);
+        root.add_overlay(&note);
 
         let size = match (image.width, image.height) {
             (Some(w), Some(h)) if w > 0 && h > 0 => {
@@ -119,6 +136,7 @@ impl PhotoView {
             scrolled,
             picture,
             spinner,
+            note,
             image: image.clone(),
             size: Cell::new(size),
             size_real: Cell::new(size.is_some()),
@@ -129,6 +147,7 @@ impl PhotoView {
             pointer: Cell::new(None),
             sync_queued: Cell::new(false),
             on_change,
+            on_moved: Default::default(),
         });
         view.connect_events();
         view.load_previews(cache_dir);
@@ -189,6 +208,37 @@ impl PhotoView {
         self.scroll_to(frac, anchor);
         self.ensure_detail();
         (self.on_change)(self);
+        self.moved();
+    }
+
+    /// Be told whenever the view zooms or pans.
+    pub fn connect_moved(&self, f: impl Fn(&Rc<PhotoView>) + 'static) {
+        *self.on_moved.borrow_mut() = Some(Rc::new(f));
+    }
+
+    fn moved(self: &Rc<Self>) {
+        let f = self.on_moved.borrow().clone();
+        if let Some(f) = f {
+            f(self);
+        }
+    }
+
+    /// Show the same part of the photo, at the same zoom, as `state` (from
+    /// another view's [`state`](Self::state)).
+    pub fn follow(self: &Rc<Self>, state: ViewState) {
+        if self.size.get().is_none() {
+            return;
+        }
+        if state.zoom != self.zoom.get() {
+            self.pending_center.set(None);
+            self.zoom.set(state.zoom);
+            self.apply_size();
+            self.ensure_detail();
+            (self.on_change)(self);
+        }
+        if let Zoom::Scale(_) = state.zoom {
+            self.scroll_to(state.center, self.viewport_center());
+        }
     }
 
     /// Multiply the zoom by `factor`.
@@ -311,6 +361,8 @@ impl PhotoView {
         for adj in [self.scrolled.hadjustment(), self.scrolled.vadjustment()] {
             let weak = Rc::downgrade(self);
             adj.connect_changed(move |_| with(&weak, |v| v.viewport_changed()));
+            let weak = Rc::downgrade(self);
+            adj.connect_value_changed(move |_| with(&weak, |v| v.moved()));
         }
         let weak = Rc::downgrade(self);
         self.scrolled.connect_scale_factor_notify(move |_| {
@@ -492,6 +544,22 @@ impl PhotoView {
     }
 }
 
+impl PhotoView {
+    /// The real pixels can't be had (e.g. a RAW variant the decoder doesn't
+    /// support): say so, rather than silently showing the preview enlarged.
+    fn show_render_failure(&self, reason: &str) {
+        self.spinner.set_visible(false);
+        let shown = if self.image.format.is_some_and(|f| f.is_raw()) {
+            "the camera's embedded preview"
+        } else {
+            "a preview"
+        };
+        self.note.set_text(&format!("Full resolution unavailable — showing {shown}"));
+        self.note.set_tooltip_text(Some(reason));
+        self.note.set_visible(true);
+    }
+}
+
 fn with(weak: &Weak<PhotoView>, f: impl FnOnce(&Rc<PhotoView>)) {
     if let Some(view) = weak.upgrade() {
         f(&view);
@@ -533,12 +601,14 @@ fn load_full_resolution(view: &Rc<PhotoView>) {
         let rgb = match rendered {
             Ok(Ok(rgb)) => rgb,
             Ok(Err(e)) => {
-                with(&weak, |v| v.spinner.set_visible(false));
-                return log::warn!("Full-resolution render failed: {e:#}");
+                log::warn!("Full-resolution render failed: {e:#}");
+                with(&weak, |v| v.show_render_failure(&format!("{e:#}")));
+                return;
             }
             Err(_) => {
-                with(&weak, |v| v.spinner.set_visible(false));
-                return log::warn!("Full-resolution render panicked");
+                log::warn!("Full-resolution render panicked");
+                with(&weak, |v| v.show_render_failure("the renderer crashed"));
+                return;
             }
         };
         let (w, h) = rgb.dimensions();

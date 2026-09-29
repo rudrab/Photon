@@ -61,6 +61,9 @@ pub struct Image {
     // the same shot (RAW+JPG pair, _modified edits, XMP sidecars).
     // Computed from blake3(parent_dir + "/" + base_stem).
     pub group_hash: Option<String>,
+    /// Colour label (R-6): Red, Yellow, Green, Blue, Purple.
+    #[serde(default)]
+    pub color_label: ColorLabel,
     /// Micro-preview representation (~25-30 bytes) for instant placeholder rendering.
     pub thumbhash: Option<Vec<u8>>,
 }
@@ -105,6 +108,34 @@ pub fn strip_edit_suffix(stem: &str) -> &str {
         .iter()
         .find_map(|suffix| stem.strip_suffix(suffix))
         .unwrap_or(stem)
+}
+
+// ---------------------------------------------------------------------------
+// ImageQuality (AI-7)
+// ---------------------------------------------------------------------------
+
+/// Classical (and learned) image quality scores.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageQuality {
+    pub image_id: i64,
+    /// Maximum sharpness across tiles (variance of the Laplacian of luma).
+    pub sharpness: f64,
+    /// Global sharpness across the whole image.
+    pub sharpness_global: f64,
+    /// Fraction of pixels in deep shadows (luma <= 2).
+    pub clip_shadows: f64,
+    /// Fraction of pixels in blown highlights (luma >= 253 or channel max).
+    pub clip_highlights: f64,
+    /// Mean luminance (0..255).
+    pub mean_luma: f64,
+    /// Version of scoring algorithm used.
+    pub quality_version: i32,
+    /// Unix timestamp when computed.
+    pub computed_at: i64,
+    /// Faces found; `None` = not checked for faces (no face model yet).
+    pub faces: Option<i32>,
+    /// Sharpness of the eyes of the largest face (`photon_ai::faces::eye_sharpness`).
+    pub eye_sharpness: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +307,104 @@ impl ImageFormat {
 }
 
 // ---------------------------------------------------------------------------
+// ColorLabel (R-6)
+// ---------------------------------------------------------------------------
+
+/// Colour label, matching the Lightroom/Bridge/darktable convention.
+/// Stored in the DB as an integer (0 = none, 1–5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(i32)]
+pub enum ColorLabel {
+    #[default]
+    None = 0,
+    Red = 1,
+    Yellow = 2,
+    Green = 3,
+    Blue = 4,
+    Purple = 5,
+}
+
+impl ColorLabel {
+    pub const ALL_COLORS: [ColorLabel; 5] = [
+        Self::Red, Self::Yellow, Self::Green, Self::Blue, Self::Purple,
+    ];
+
+    pub fn from_i32(v: i32) -> Self {
+        match v {
+            1 => Self::Red,
+            2 => Self::Yellow,
+            3 => Self::Green,
+            4 => Self::Blue,
+            5 => Self::Purple,
+            _ => Self::None,
+        }
+    }
+
+    pub fn as_i32(self) -> i32 {
+        self as i32
+    }
+
+    /// The `xmp:Label` string for this colour (Lightroom/Bridge/digiKam).
+    pub fn xmp_label(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Red => Some("Red"),
+            Self::Yellow => Some("Yellow"),
+            Self::Green => Some("Green"),
+            Self::Blue => Some("Blue"),
+            Self::Purple => Some("Purple"),
+        }
+    }
+
+    /// Parse from `xmp:Label` string.
+    pub fn from_xmp_label(s: &str) -> Option<Self> {
+        match s {
+            "Red" => Some(Self::Red),
+            "Yellow" => Some(Self::Yellow),
+            "Green" => Some(Self::Green),
+            "Blue" => Some(Self::Blue),
+            "Purple" => Some(Self::Purple),
+            _ => None,
+        }
+    }
+
+    /// darktable stores labels as a `rdf:Seq` of integers 0–4.
+    pub fn darktable_index(self) -> Option<u8> {
+        match self {
+            Self::None => None,
+            Self::Red => Some(0),
+            Self::Yellow => Some(1),
+            Self::Green => Some(2),
+            Self::Blue => Some(3),
+            Self::Purple => Some(4),
+        }
+    }
+
+    /// Parse from darktable's 0–4 index.
+    pub fn from_darktable_index(i: u8) -> Self {
+        match i {
+            0 => Self::Red,
+            1 => Self::Yellow,
+            2 => Self::Green,
+            3 => Self::Blue,
+            4 => Self::Purple,
+            _ => Self::None,
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Red => "Red",
+            Self::Yellow => "Yellow",
+            Self::Green => "Green",
+            Self::Blue => "Blue",
+            Self::Purple => "Purple",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tag
 // ---------------------------------------------------------------------------
 
@@ -362,7 +491,16 @@ pub struct TimelineItem {
     pub thumbhash: Option<Vec<u8>>,
     pub rating: i32,
     pub flagged: i32,
+    pub color_label: ColorLabel,
     pub missing: bool,
+    /// The shot's files share this (RAW + JPG, edits).
+    pub group_hash: Option<String>,
+    pub is_raw: bool,
+    /// Files of this shot in the listing; the timeline shows one tile per
+    /// shot ([`crate::db::queries::collapse_versions`]). 0 or 1: a single file.
+    pub versions: u32,
+    /// One of the other files is a RAW.
+    pub has_raw_version: bool,
 }
 
 impl TimelineItem {
@@ -385,15 +523,22 @@ impl TimelineItem {
 // LibraryQuery — flexible query builder input
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct LibraryQuery {
     pub year: Option<i32>,
     pub month: Option<u32>,
     pub day: Option<u32>,
     pub tags: Vec<String>,
+    pub not_tags: Vec<String>,
     pub search_text: Option<String>, // FTS5
     pub format_filter: Option<Vec<ImageFormat>>,
     pub date_range: Option<(i64, i64)>, // unix timestamps
+    pub min_rating: Option<i32>,
+    pub flag: Option<i32>,
+    pub color_label: Option<ColorLabel>,
+    pub exclude_rejected: bool,
+    pub camera_model: Option<String>,
+    pub lens_model: Option<String>,
     pub limit: Option<i32>,
     pub offset: Option<i32>,
 }
@@ -412,6 +557,7 @@ pub enum UIAction {
     FilterByTag(String),
     FilterByAlbum(i64),
     FilterByEvent(i64),
+    FilterBySmartCollection(i64),
     FilterMissing,
     /// View a single photo by index into the current photo list.
     ViewPhoto(usize),
@@ -582,6 +728,105 @@ pub struct Event {
     pub comment: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// SmartCollection (R-5)
+// ---------------------------------------------------------------------------
+
+/// A smart collection: a saved query that evaluates live.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SmartCollection {
+    pub id: i64,
+    pub name: String,
+    pub query_json: String,
+    pub created_at: i64,
+}
+
+impl SmartCollection {
+    pub fn parse_query(&self) -> Result<SmartQuery, serde_json::Error> {
+        serde_json::from_str(&self.query_json)
+    }
+}
+
+/// The query behind a smart collection. Every `None` field is unconstrained.
+/// Serialized as JSON and stored in `smart_collections.query_json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SmartQuery {
+    /// Minimum star rating (1–5). `None` = any rating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rating: Option<i32>,
+    /// Flag filter: 1 = picks only, -1 = rejects only, 0 = unflagged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flag: Option<i32>,
+    /// Photos must have all of these tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Photos must not have any of these tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_tags: Vec<String>,
+    /// Free-text search (FTS5 or filename substring).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_text: Option<String>,
+    /// Date range (unix timestamps, inclusive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_range: Option<(i64, i64)>,
+    /// Colour label filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_label: Option<ColorLabel>,
+    /// Exclude rejected photos (`flagged = -1`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exclude_rejected: bool,
+    /// Camera model substring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_model: Option<String>,
+    /// Lens model substring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lens_model: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool { !*b }
+
+impl SmartQuery {
+    /// A human-readable summary of this query for the sidebar tooltip.
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(r) = self.min_rating {
+            parts.push(format!("★ ≥ {r}"));
+        }
+        match self.flag {
+            Some(1) => parts.push("Picks".to_string()),
+            Some(-1) => parts.push("Rejects".to_string()),
+            Some(0) => parts.push("Unflagged".to_string()),
+            _ => {}
+        }
+        if !self.tags.is_empty() {
+            parts.push(format!("Tags: {}", self.tags.join(", ")));
+        }
+        if !self.not_tags.is_empty() {
+            parts.push(format!("Not: {}", self.not_tags.join(", ")));
+        }
+        if let Some(ref t) = self.search_text {
+            parts.push(format!("Search: {t}"));
+        }
+        if let Some(cl) = self.color_label {
+            parts.push(format!("Label: {}", cl.display_name()));
+        }
+        if self.exclude_rejected {
+            parts.push("No rejects".to_string());
+        }
+        if let Some(ref c) = self.camera_model {
+            parts.push(format!("Camera: {c}"));
+        }
+        if let Some(ref l) = self.lens_model {
+            parts.push(format!("Lens: {l}"));
+        }
+        if parts.is_empty() {
+            "All photos".to_string()
+        } else {
+            parts.join(" · ")
+        }
+    }
+}
+
 /// Compose an existing EXIF orientation (1–8) with a 90° clockwise (`cw == true`)
 /// or 90° counter-clockwise (`cw == false`) rotation.
 ///
@@ -629,6 +874,8 @@ pub struct XmpReadResult {
     pub title: Option<String>,
     pub description: Option<String>,
     pub orientation: Option<u8>,
+    /// Colour label from `xmp:Label` or `darktable:colorlabels`.
+    pub color_label: Option<ColorLabel>,
     /// Every keyword in `dc:subject` but darktable's internal ones: the
     /// photo's complete tag list (Photon writes all of a photo's tags).
     pub tags: Vec<String>,

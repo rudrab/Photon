@@ -1,6 +1,16 @@
 //! Sidecar handling: XMP files and grouping of files that belong to one shot.
+//!
+//! ### Picks in XMP (R-7 Decision)
+//! Picks remain database-only (`flagged = 1` in `images` table) and are NOT
+//! written to XMP sidecars. Unlike star ratings (`xmp:Rating`) and colour
+//! labels (`xmp:Label` / `darktable:colorlabels`), there is no industry-wide
+//! standard for pick status across Lightroom, Bridge, Darktable, and digiKam.
+//! While digiKam provides `digiKam:PickLabel`, writing non-standard schema
+//! tags risks sidecar pollution and interoperability defects when photos are
+//! opened in Adobe or Darktable workflows. Rejects, by contrast, use the
+//! universal `xmp:Rating="-1"` convention and ARE written to sidecars.
 
-use photon_core::models::strip_edit_suffix;
+use photon_core::models::{strip_edit_suffix, ColorLabel};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -71,6 +81,9 @@ pub struct XmpUpdate<'a> {
     /// Rejected photos are written as `xmp:Rating="-1"` (the convention of
     /// Lightroom, Bridge and darktable), overriding `rating`.
     pub rejected: Option<bool>,
+    /// Colour label (R-6): Red, Yellow, Green, Blue, Purple.
+    /// Written as `xmp:Label` and `darktable:colorlabels`.
+    pub color_label: Option<ColorLabel>,
     /// The photo's keywords (`dc:subject`), together with every keyword the
     /// library knows: keywords in the file that the library doesn't know
     /// (e.g. from Lightroom) are kept; known ones follow `tags`.
@@ -92,6 +105,7 @@ pub struct Keywords<'a> {
 const XMP_NS: &str = "http://ns.adobe.com/xap/1.0/";
 const DC_NS: &str = "http://purl.org/dc/elements/1.1/";
 const TIFF_NS: &str = "http://ns.adobe.com/tiff/1.0/";
+const DARKTABLE_NS: &str = "http://darktable.sf.net/";
 
 const EMPTY_XMP: &str = "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>
 <x:xmpmeta xmlns:x=\"adobe:ns:meta/\">
@@ -173,6 +187,28 @@ fn merge_xmp(doc: &str, update: &XmpUpdate) -> Option<String> {
         // tools show as a custom label. Real colour labels are left alone.
         if matches!(property(&doc, "xmp:Label").as_deref(), Some("Pick" | "Reject")) {
             remove_attribute(&mut doc, "xmp:Label");
+        }
+    }
+
+    if let Some(color_label) = update.color_label {
+        if color_label == ColorLabel::None {
+            if !matches!(property(&doc, "xmp:Label").as_deref(), Some("Pick" | "Reject")) {
+                remove_attribute(&mut doc, "xmp:Label");
+                remove_element(&mut doc, "xmp:Label");
+            }
+            remove_element(&mut doc, "darktable:colorlabels");
+        } else {
+            if let Some(lbl_str) = color_label.xmp_label() {
+                set_simple(&mut doc, "xmp:Label", lbl_str);
+                ensure_namespace(&mut doc, "xmp", XMP_NS);
+            }
+            if let Some(idx) = color_label.darktable_index() {
+                let dt_xml = format!(
+                    "   <darktable:colorlabels>\n    <rdf:Seq>\n     <rdf:li>{idx}</rdf:li>\n    </rdf:Seq>\n   </darktable:colorlabels>\n"
+                );
+                replace_or_insert(&mut doc, "darktable:colorlabels", &dt_xml);
+                ensure_namespace(&mut doc, "darktable", DARKTABLE_NS);
+            }
         }
     }
 
@@ -453,6 +489,25 @@ pub fn read_xmp_metadata(path: &Path) -> std::io::Result<XmpReadResult> {
         }
     }
 
+    if let Some(lbl) = property(&doc, "xmp:Label") {
+        if let Some(cl) = ColorLabel::from_xmp_label(&lbl) {
+            result.color_label = Some(cl);
+        }
+    }
+    if result.color_label.is_none() {
+        if let Some((s, e)) = element(&doc, "darktable:colorlabels") {
+            let items = list_items(&doc[s..e]);
+            if let Some(first) = items.first() {
+                if let Ok(idx) = first.trim().parse::<u8>() {
+                    let cl = ColorLabel::from_darktable_index(idx);
+                    if cl != ColorLabel::None {
+                        result.color_label = Some(cl);
+                    }
+                }
+            }
+        }
+    }
+
     if let Some((s, e)) = element(&doc, "dc:subject") {
         let items = list_items(&doc[s..e]);
         result.tags = items.into_iter().filter(|tag| !tag.starts_with("darktable|")).collect();
@@ -500,12 +555,209 @@ pub fn read_image_xmp(
     }
     let xmp = read_xmp_metadata(&xmp_path)?;
     photon_core::db::queries::update_from_xmp(conn, image_id, &xmp, mtime)?;
+    // Only what this sidecar says goes to the rest of the shot: a rating
+    // read from a JPG's sidecar must not clear a label set on the RAW.
+    let cull = xmp.rating.is_some() || xmp.rejected.is_some();
+    let color = xmp.color_label.is_some();
+    if cull || color {
+        spread_cull_to_shot(conn, image_id, cull, color)?;
+    }
     Ok(true)
+}
+
+/// Give the other files of `image_id`'s shot (RAW + JPG, edits) its rating
+/// and pick/reject (`cull`) and/or its colour label (`color`), in the library
+/// and in their sidecars: a shot has one of each, whichever file's sidecar it
+/// was set in (e.g. darktable writes the RAW's). Only the fields asked for
+/// are copied and written. Sidecars Photon writes aren't read back as outside
+/// changes, so this doesn't bounce. Returns how many files changed.
+pub fn spread_cull_to_shot(
+    conn: &mut rusqlite::Connection,
+    image_id: i64,
+    cull: bool,
+    color: bool,
+) -> anyhow::Result<usize> {
+    use photon_core::db::queries;
+    let Some(source) = queries::get_image(conn, image_id)? else { return Ok(0) };
+    let mut changed = 0;
+    for id in queries::shot_member_ids(conn, &[image_id])? {
+        if id == image_id {
+            continue;
+        }
+        let Some(other) = queries::get_image(conn, id)? else { continue };
+        let cull_differs = cull && (other.rating, other.flagged) != (source.rating, source.flagged);
+        let color_differs = color && other.color_label != source.color_label;
+        if !cull_differs && !color_differs {
+            continue;
+        }
+        let mut update = XmpUpdate::default();
+        if cull_differs {
+            queries::batch_set_rating(conn, &[id], source.rating)?;
+            queries::batch_set_flag(conn, &[id], source.flagged)?;
+            update.rating = Some(source.rating);
+            update.rejected = Some(source.flagged == -1);
+        }
+        if color_differs {
+            queries::batch_set_color_label(conn, &[id], source.color_label)?;
+            update.color_label = Some(source.color_label);
+        }
+        if let Err(e) = write_image_xmp(conn, id, &other.path, &update) {
+            log::warn!("Writing XMP for {}: {e}", other.path.display());
+        }
+        changed += 1;
+    }
+    Ok(changed)
+}
+
+/// Make every shot's files agree, for shots that don't (marked before
+/// culling applied to whole shots, or read back from one file's sidecar
+/// before that was spread):
+/// - the highest rating wins;
+/// - a pick or a reject applies to the whole shot — unless one file is
+///   picked and another rejected: which was meant can't be known, so the
+///   flags are left as they are;
+/// - a colour label applies to the whole shot — unless the files have
+///   different labels, which are then left as they are.
+///
+/// Each file gets only the fields it lacks written to its sidecar. Returns
+/// how many shots were changed.
+pub fn reconcile_shots(conn: &mut rusqlite::Connection) -> anyhow::Result<usize> {
+    use photon_core::db::queries;
+    let mut fixed = 0;
+    for group in queries::disagreeing_shots(conn)? {
+        let files = queries::get_images_in_group(conn, &group)?;
+        let rating = files.iter().map(|f| f.rating).max().unwrap_or(0);
+        let one = |values: std::collections::HashSet<i32>| (values.len() <= 1).then(|| values.into_iter().next().unwrap_or(0));
+        let flag = one(files.iter().map(|f| f.flagged).filter(|&f| f != 0).collect());
+        let color = one(files.iter().map(|f| f.color_label.as_i32()).filter(|&c| c != 0).collect()).map(ColorLabel::from_i32);
+
+        let mut shot_changed = false;
+        for file in &files {
+            let Some(id) = file.id else { continue };
+            let new_flag = flag.unwrap_or(file.flagged);
+            let cull_differs = (file.rating, file.flagged) != (rating, new_flag);
+            let color_differs = color.is_some_and(|c| c != file.color_label);
+            if !cull_differs && !color_differs {
+                continue;
+            }
+            let mut update = XmpUpdate::default();
+            if cull_differs {
+                queries::batch_set_rating(conn, &[id], rating)?;
+                queries::batch_set_flag(conn, &[id], new_flag)?;
+                update.rating = Some(rating);
+                update.rejected = Some(new_flag == -1);
+            }
+            if let Some(c) = color.filter(|_| color_differs) {
+                queries::batch_set_color_label(conn, &[id], c)?;
+                update.color_label = Some(c);
+            }
+            if let Err(e) = write_image_xmp(conn, id, &file.path, &update) {
+                log::warn!("Writing XMP for {}: {e}", file.path.display());
+            }
+            shot_changed = true;
+        }
+        fixed += shot_changed as usize;
+    }
+    Ok(fixed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An ORF and its JPG, one shot, with files on disk.
+    fn shot(dir: &Path) -> (photon_core::db::Database, i64, i64) {
+        use photon_core::db::queries;
+        let db = photon_core::db::Database::open_in_memory().unwrap();
+        let mut conn = db.conn().unwrap();
+        let mut ids = Vec::new();
+        for (name, hash) in [("P1.ORF", "h-orf"), ("P1.JPG", "h-jpg")] {
+            let path = dir.join(name);
+            std::fs::write(&path, b"x").unwrap();
+            let mut img = photon_core::models::Image::new(path, hash.into(), 1);
+            img.group_hash = Some("shot".into());
+            let tx = conn.transaction().unwrap();
+            ids.push(queries::insert_image(&tx, &img).unwrap().unwrap());
+            tx.commit().unwrap();
+        }
+        drop(conn);
+        (db, ids[0], ids[1])
+    }
+
+    #[test]
+    fn a_rating_read_from_one_sidecar_goes_to_the_whole_shot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, orf, jpg) = shot(dir.path());
+        let mut conn = db.conn().unwrap();
+        // darktable rates the RAW.
+        sync_xmp_metadata(&dir.path().join("P1.ORF"), &XmpUpdate { rating: Some(4), ..Default::default() }).unwrap();
+
+        assert!(read_image_xmp(&mut conn, orf, &dir.path().join("P1.ORF"), None).unwrap());
+        let jpg_row = photon_core::db::queries::get_image(&conn, jpg).unwrap().unwrap();
+        assert_eq!(jpg_row.rating, 4, "the JPG follows");
+        let jpg_xmp = find_xmp(&dir.path().join("P1.JPG")).expect("and gets a sidecar");
+        assert_eq!(read_xmp_metadata(&jpg_xmp).unwrap().rating, Some(4));
+        // Written by Photon: not read back as a change.
+        assert!(!read_image_xmp(&mut conn, jpg, &dir.path().join("P1.JPG"), jpg_row.xmp_mtime).unwrap());
+    }
+
+    #[test]
+    fn a_rating_from_the_jpg_keeps_the_raws_colour_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, orf, jpg) = shot(dir.path());
+        let mut conn = db.conn().unwrap();
+        let (orf_path, jpg_path) = (dir.path().join("P1.ORF"), dir.path().join("P1.JPG"));
+        // darktable labelled the RAW red; the library knows.
+        write_image_xmp(&conn, orf, &orf_path, &XmpUpdate { color_label: Some(ColorLabel::Red), ..Default::default() }).unwrap();
+        photon_core::db::queries::batch_set_color_label(&mut conn, &[orf], ColorLabel::Red).unwrap();
+        // Another tool rates the JPG, its sidecar has no label.
+        sync_xmp_metadata(&jpg_path, &XmpUpdate { rating: Some(3), ..Default::default() }).unwrap();
+
+        assert!(read_image_xmp(&mut conn, jpg, &jpg_path, None).unwrap());
+        let orf_row = photon_core::db::queries::get_image(&conn, orf).unwrap().unwrap();
+        assert_eq!((orf_row.rating, orf_row.color_label), (3, ColorLabel::Red), "rating follows, label stays");
+        let orf_xmp = read_xmp_metadata(&find_xmp(&orf_path).unwrap()).unwrap();
+        assert_eq!((orf_xmp.rating, orf_xmp.color_label), (Some(3), Some(ColorLabel::Red)));
+    }
+
+    #[test]
+    fn shot_colour_labels_are_spread_but_conflicts_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, orf, jpg) = shot(dir.path());
+        let mut conn = db.conn().unwrap();
+        photon_core::db::queries::batch_set_color_label(&mut conn, &[orf], ColorLabel::Green).unwrap();
+        assert_eq!(reconcile_shots(&mut conn).unwrap(), 1, "a label-only mismatch is repaired");
+        let jpg_row = photon_core::db::queries::get_image(&conn, jpg).unwrap().unwrap();
+        assert_eq!(jpg_row.color_label, ColorLabel::Green);
+
+        photon_core::db::queries::batch_set_color_label(&mut conn, &[jpg], ColorLabel::Blue).unwrap();
+        assert_eq!(reconcile_shots(&mut conn).unwrap(), 0, "green vs blue: left alone");
+        let labels: Vec<ColorLabel> = [orf, jpg]
+            .iter()
+            .map(|&id| photon_core::db::queries::get_image(&conn, id).unwrap().unwrap().color_label)
+            .collect();
+        assert_eq!(labels, [ColorLabel::Green, ColorLabel::Blue]);
+    }
+
+    #[test]
+    fn shots_that_disagree_are_made_to_agree() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, orf, jpg) = shot(dir.path());
+        let mut conn = db.conn().unwrap();
+        conn.execute("UPDATE images SET rating = 5 WHERE id = ?1", [jpg]).unwrap();
+        conn.execute("UPDATE images SET flagged = -1 WHERE id = ?1", [orf]).unwrap();
+
+        assert_eq!(reconcile_shots(&mut conn).unwrap(), 1);
+        for id in [orf, jpg] {
+            let row = photon_core::db::queries::get_image(&conn, id).unwrap().unwrap();
+            assert_eq!((row.rating, row.flagged), (5, -1));
+        }
+        assert_eq!(reconcile_shots(&mut conn).unwrap(), 0, "nothing left to do");
+
+        // A pick on one file and a reject on the other: left alone.
+        conn.execute("UPDATE images SET flagged = 1 WHERE id = ?1", [jpg]).unwrap();
+        assert_eq!(reconcile_shots(&mut conn).unwrap(), 0);
+    }
 
     #[test]
     fn groups_raw_jpeg_and_edits_but_not_strangers() {
@@ -843,10 +1095,67 @@ mod tests {
         std::fs::write(&xmp, doc).unwrap();
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
         std::fs::File::options().write(true).open(&xmp).unwrap().set_modified(later).unwrap();
-
         let seen = last(&conn);
         assert!(read_image_xmp(&mut conn, id, &img_path, seen).unwrap());
         let img = photon_core::db::queries::get_image(&conn, id).unwrap().unwrap();
         assert_eq!((img.rating, img.flagged), (3, 0));
+    }
+
+    #[test]
+    fn color_labels_write_and_read_xmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("color.jpg");
+        std::fs::write(&img, b"data").unwrap();
+
+        // 1. Write XMP with Red label
+        let update = XmpUpdate {
+            color_label: Some(ColorLabel::Red),
+            ..Default::default()
+        };
+        let xmp_path = sync_xmp_metadata(&img, &update).unwrap();
+        let doc = std::fs::read_to_string(&xmp_path).unwrap();
+        assert!(doc.contains(r#"xmp:Label="Red""#));
+        assert!(doc.contains("<darktable:colorlabels>"));
+        assert!(doc.contains("<rdf:li>0</rdf:li>")); // Red is index 0 in darktable
+
+        // 2. Read it back
+        let read = read_xmp_metadata(&xmp_path).unwrap();
+        assert_eq!(read.color_label, Some(ColorLabel::Red));
+
+        // 3. Update to Yellow label
+        let update_yellow = XmpUpdate {
+            color_label: Some(ColorLabel::Yellow),
+            ..Default::default()
+        };
+        sync_xmp_metadata(&img, &update_yellow).unwrap();
+        let doc_yellow = std::fs::read_to_string(&xmp_path).unwrap();
+        assert!(doc_yellow.contains(r#"xmp:Label="Yellow""#));
+        assert!(doc_yellow.contains("<rdf:li>1</rdf:li>")); // Yellow is index 1
+
+        let read_yellow = read_xmp_metadata(&xmp_path).unwrap();
+        assert_eq!(read_yellow.color_label, Some(ColorLabel::Yellow));
+
+        // 4. Clear label (None)
+        let update_none = XmpUpdate {
+            color_label: Some(ColorLabel::None),
+            ..Default::default()
+        };
+        sync_xmp_metadata(&img, &update_none).unwrap();
+        let doc_none = std::fs::read_to_string(&xmp_path).unwrap();
+        assert!(!doc_none.contains("xmp:Label"));
+        assert!(!doc_none.contains("darktable:colorlabels"));
+
+        // 5. Read darktable:colorlabels directly (e.g. Blue = 3)
+        let dt_only = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/">
+         <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:darktable="http://darktable.sf.net/">
+          <rdf:Description rdf:about="">
+           <darktable:colorlabels><rdf:Seq><rdf:li>3</rdf:li></rdf:Seq></darktable:colorlabels>
+          </rdf:Description>
+         </rdf:RDF>
+        </x:xmpmeta>"#;
+        let dt_xmp = dir.path().join("dt.xmp");
+        std::fs::write(&dt_xmp, dt_only).unwrap();
+        let dt_read = read_xmp_metadata(&dt_xmp).unwrap();
+        assert_eq!(dt_read.color_label, Some(ColorLabel::Blue));
     }
 }

@@ -9,7 +9,7 @@ pub mod models;
 
 pub use db::Database;
 pub use error::PhotonError;
-pub use models::{DesktopApp, EditRecord, Image, ImageFormat, LibraryQuery, Preferences, Tag};
+pub use models::{ColorLabel, DesktopApp, EditRecord, Image, ImageFormat, LibraryQuery, Preferences, SmartCollection, SmartQuery, Tag};
 
 /// Check if a path appears to be on a mount that is currently disconnected/offline
 /// (e.g. under /run/media, /media, /mnt whose parent mountpoint does not exist).

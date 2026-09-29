@@ -4,6 +4,7 @@ members = [
     "crates/photon-core",
     "crates/photon-import",
     "crates/photon-app",
+    "crates/photon-ai",
 ]
 
 [workspace.package]

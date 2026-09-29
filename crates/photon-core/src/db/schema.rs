@@ -38,6 +38,9 @@ pub fn run_migrations(conn: &Connection) -> Result<(), PhotonError> {
         (12, MIGRATION_012_EXPORT_PRESETS),
         (13, MIGRATION_013_XMP_REJECT_REPAIR),
         (14, MIGRATION_014_DEFAULT_EXPORT_PRESETS),
+        (15, MIGRATION_015_IMAGE_QUALITY),
+        (16, MIGRATION_016_FACE_SHARPNESS),
+        (17, MIGRATION_017_COLOR_LABELS_AND_SMART_COLLECTIONS),
     ];
 
     for (version, sql) in migrations {
@@ -328,6 +331,46 @@ INSERT OR IGNORE INTO export_presets (name, config_json) VALUES
  ('Print TIFF', '{"format":{"Tiff":{"bit_depth":16}},"resize":"Original","sharpening":"Print","color_space":"AdobeRgb"}');
 "#;
 
+// ---------------------------------------------------------------------------
+// Migration 015: Image quality scores (AI-7)
+// ---------------------------------------------------------------------------
+
+const MIGRATION_015_IMAGE_QUALITY: &str = "
+CREATE TABLE IF NOT EXISTS image_quality (
+    image_id INTEGER PRIMARY KEY REFERENCES images(id) ON DELETE CASCADE,
+    sharpness REAL,
+    sharpness_global REAL,
+    clip_shadows REAL,
+    clip_highlights REAL,
+    mean_luma REAL,
+    quality_version INTEGER,
+    computed_at INTEGER
+);
+";
+
+// ---------------------------------------------------------------------------
+// Migration 016: face-aware sharpness (AI-7 with the AI-3 face detector)
+// ---------------------------------------------------------------------------
+const MIGRATION_016_FACE_SHARPNESS: &str = "
+ALTER TABLE image_quality ADD COLUMN faces INTEGER;
+ALTER TABLE image_quality ADD COLUMN eye_sharpness REAL;
+";
+
+// ---------------------------------------------------------------------------
+// Migration 017: Colour labels (R-6) and smart collections (R-5)
+// ---------------------------------------------------------------------------
+const MIGRATION_017_COLOR_LABELS_AND_SMART_COLLECTIONS: &str = "
+ALTER TABLE images ADD COLUMN color_label INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_images_color_label ON images(color_label) WHERE color_label > 0;
+
+CREATE TABLE IF NOT EXISTS smart_collections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    query_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,5 +458,35 @@ mod tests {
 
         assert!(album_id > 0);
         assert!(event_id > 0);
+    }
+
+    #[test]
+    fn image_quality_table_exists() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO images (hash, path, filename, size_bytes, created_at, imported_at)
+             VALUES ('img1', '/tmp/img1.jpg', 'img1.jpg', 1024, 1718452800, 1718452800)",
+            [],
+        )
+        .unwrap();
+        let img_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO image_quality (image_id, sharpness, sharpness_global, clip_shadows, clip_highlights, mean_luma, quality_version, computed_at)
+             VALUES (?1, 42.5, 30.1, 0.01, 0.02, 128.0, 1, 1718452900)",
+            [img_id],
+        )
+        .unwrap();
+
+        let sharpness: f64 = conn
+            .query_row(
+                "SELECT sharpness FROM image_quality WHERE image_id = ?1",
+                [img_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!((sharpness - 42.5).abs() < f64::EPSILON);
     }
 }

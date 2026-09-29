@@ -23,6 +23,7 @@ auto-req = "yes"
 [dependencies]
 photon-core = { path = "../photon-core" }
 photon-import = { path = "../photon-import" }
+photon-ai = { path = "../photon-ai" }
 anyhow.workspace = true
 chrono.workspace = true
 log.workspace = true
@@ -39,3 +40,5 @@ libadwaita = { version = "0.7", features = ["v1_4"] }
 async-channel = "2.3"
 dirs = "5.0"
 thumbhash.workspace = true
+rayon.workspace = true
+image = { version = "0.24", features = ["jpeg", "png"] }

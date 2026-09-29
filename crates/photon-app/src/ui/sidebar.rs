@@ -15,14 +15,14 @@ use async_channel::Sender;
 use chrono::{DateTime, Datelike, NaiveDate};
 use gtk4::prelude::*;
 use gtk4::{
-    gdk, Align, Box, Button, Entry, Expander, GestureClick, Image, Label,
-    Orientation, Popover, ScrolledWindow, Separator,
+    gdk, Align, Box, Button, CheckButton, DropDown, Entry, Expander, GestureClick, Image, Label,
+    Orientation, Popover, ScrolledWindow, Separator, StringList,
 };
 use libadwaita as adw;
 use libadwaita::prelude::*;
 use photon_core::db::queries;
 use photon_core::db::Database;
-use photon_core::models::{Album, Event, UIAction};
+use photon_core::models::{Album, ColorLabel, Event, SmartCollection, SmartQuery, UIAction};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -35,6 +35,7 @@ pub struct Sidebar {
     pub missing_container: Box,
     pub events_container: Box,
     pub albums_container: Box,
+    pub smart_collections_container: Box,
     pub tags_container: Box,
     pub db: Database,
     pub sender: Sender<UIAction>,
@@ -145,7 +146,61 @@ impl Sidebar {
             this.rebuild(&tree);
         });
         self.refresh_albums();
+        self.refresh_smart_collections();
         self.refresh_tags();
+    }
+
+    /// Reload the smart collections list with live evaluated counts.
+    pub fn refresh_smart_collections(&self) {
+        let db = self.db.clone();
+        let (tx_colls, rx_colls) = async_channel::bounded::<Vec<(SmartCollection, u32)>>(1);
+        thread::spawn(move || {
+            if let Ok(conn) = db.conn() {
+                if let Ok(colls) = queries::get_all_smart_collections_with_counts(&conn) {
+                    let _ = tx_colls.send_blocking(colls);
+                }
+            }
+        });
+
+        let this = self.clone();
+        gtk4::glib::MainContext::default().spawn_local(async move {
+            let Ok(colls) = rx_colls.recv().await else { return };
+            while let Some(child) = this.smart_collections_container.first_child() {
+                this.smart_collections_container.remove(&child);
+            }
+
+            if colls.is_empty() {
+                let empty_lbl = Label::new(Some("No smart collections yet"));
+                empty_lbl.set_css_classes(&["caption", "dim-label"]);
+                empty_lbl.set_halign(Align::Start);
+                empty_lbl.set_margin_start(16);
+                empty_lbl.set_margin_top(4);
+                empty_lbl.set_margin_bottom(4);
+                this.smart_collections_container.append(&empty_lbl);
+            } else {
+                for (collection, count) in colls {
+                    let btn = make_row_with_count(&collection.name, "folder-saved-search-symbolic", Some(count));
+                    let tx = this.sender.clone();
+                    let coll_id = collection.id;
+                    btn.connect_clicked(move |_| {
+                        let _ = tx.send_blocking(UIAction::FilterBySmartCollection(coll_id));
+                    });
+
+                    // Context menu on secondary click
+                    let click = GestureClick::new();
+                    click.set_button(gdk::BUTTON_SECONDARY);
+                    let this_c = this.clone();
+                    let btn_c = btn.clone();
+                    let coll_c = collection.clone();
+                    click.connect_released(move |_, _, x, y| {
+                        show_smart_collection_context_menu(&this_c, &btn_c, &coll_c, x, y);
+                    });
+                    btn.add_controller(click);
+
+                    this.smart_collections_container.append(&btn);
+                }
+            }
+        });
     }
 
     /// Reload the albums list with photo counts.
@@ -416,7 +471,7 @@ impl Sidebar {
 pub fn create(db: Database, sender: Sender<UIAction>) -> Sidebar {
     let scrolled = ScrolledWindow::builder()
         .hscrollbar_policy(gtk4::PolicyType::Never)
-        .min_content_width(260)
+        .min_content_width(200)
         .build();
 
     let root = Box::new(Orientation::Vertical, 0);
@@ -473,6 +528,25 @@ pub fn create(db: Database, sender: Sender<UIAction>) -> Sidebar {
 
     root.append(&make_separator());
 
+    // ── Smart Collections header ────────────────────────
+    let smart_header_box = Box::new(Orientation::Horizontal, 4);
+    smart_header_box.set_hexpand(true);
+    let smart_label = make_caption("Smart Collections");
+    smart_label.set_hexpand(true);
+    smart_header_box.append(&smart_label);
+
+    let new_smart_btn = Button::from_icon_name("list-add-symbolic");
+    new_smart_btn.add_css_class("flat");
+    new_smart_btn.add_css_class("circular");
+    new_smart_btn.set_tooltip_text(Some("New Smart Collection"));
+    smart_header_box.append(&new_smart_btn);
+    root.append(&smart_header_box);
+
+    let smart_collections_container = Box::new(Orientation::Vertical, 2);
+    root.append(&smart_collections_container);
+
+    root.append(&make_separator());
+
     // ── Tags header ─────────────────────────────────────
     let tags_label = make_caption("Tags");
     root.append(&tags_label);
@@ -487,6 +561,7 @@ pub fn create(db: Database, sender: Sender<UIAction>) -> Sidebar {
         missing_container,
         events_container,
         albums_container,
+        smart_collections_container,
         tags_container,
         db: db.clone(),
         sender: sender.clone(),
@@ -515,9 +590,25 @@ pub fn create(db: Database, sender: Sender<UIAction>) -> Sidebar {
         );
     });
 
+    let sb_clone2 = sidebar.clone();
+    new_smart_btn.connect_clicked(move |_| {
+        let sb = sb_clone2.clone();
+        prompt_smart_collection_dialog(None, move |name, query| {
+            if let Ok(mut conn) = sb.db.conn() {
+                if let Ok(query_json) = serde_json::to_string(&query) {
+                    if let Ok(coll_id) = queries::create_smart_collection(&mut conn, &name, &query_json) {
+                        sb.refresh_smart_collections();
+                        let _ = sb.sender.send_blocking(UIAction::FilterBySmartCollection(coll_id));
+                    }
+                }
+            }
+        });
+    });
+
     // Initial load
     sidebar.refresh_events();
     sidebar.refresh_albums();
+    sidebar.refresh_smart_collections();
     sidebar.refresh_tags();
 
     sidebar
@@ -606,6 +697,385 @@ fn show_album_context_menu(
     menu_box.append(&delete_btn);
     popover.set_child(Some(&menu_box));
     popover.popup();
+}
+
+fn show_smart_collection_context_menu(
+    sidebar: &Sidebar,
+    target_btn: &Button,
+    collection: &SmartCollection,
+    x: f64,
+    y: f64,
+) {
+    let popover = Popover::new();
+    popover.set_parent(target_btn);
+    let rect = gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+    popover.set_pointing_to(Some(&rect));
+
+    let menu_box = Box::new(Orientation::Vertical, 4);
+    menu_box.set_margin_start(6);
+    menu_box.set_margin_end(6);
+    menu_box.set_margin_top(6);
+    menu_box.set_margin_bottom(6);
+
+    // Edit Rules
+    let edit_btn = Button::with_label("Edit Rules…");
+    edit_btn.add_css_class("flat");
+    edit_btn.set_halign(Align::Fill);
+    let pop_c = popover.clone();
+    let sb_c = sidebar.clone();
+    let coll_c = collection.clone();
+    edit_btn.connect_clicked(move |_| {
+        pop_c.popdown();
+        let sb = sb_c.clone();
+        let coll = coll_c.clone();
+        prompt_smart_collection_dialog(Some(&coll), move |new_name, new_query| {
+            if let Ok(mut conn) = sb.db.conn() {
+                if let Ok(query_json) = serde_json::to_string(&new_query) {
+                    if let Err(e) = queries::update_smart_collection(&mut conn, coll.id, &new_name, &query_json) {
+                        log::error!("update_smart_collection failed: {e}");
+                    }
+                }
+            }
+            sb.refresh_smart_collections();
+            let _ = sb.sender.send_blocking(UIAction::FilterBySmartCollection(coll.id));
+        });
+    });
+
+    // Rename
+    let rename_btn = Button::with_label("Rename…");
+    rename_btn.add_css_class("flat");
+    rename_btn.set_halign(Align::Fill);
+    let pop_c2 = popover.clone();
+    let sb_c2 = sidebar.clone();
+    let coll_id = collection.id;
+    let old_name = collection.name.clone();
+    rename_btn.connect_clicked(move |_| {
+        pop_c2.popdown();
+        let sb = sb_c2.clone();
+        let name_to_edit = old_name.clone();
+        prompt_text_dialog(
+            "Rename Smart Collection",
+            &format!("Enter a new name for '{name_to_edit}':"),
+            &name_to_edit,
+            "Rename",
+            move |new_name| {
+                if let Ok(mut conn) = sb.db.conn() {
+                    if let Err(e) = queries::rename_smart_collection(&mut conn, coll_id, &new_name) {
+                        log::error!("rename_smart_collection failed: {e}");
+                    }
+                }
+                sb.refresh_smart_collections();
+            },
+        );
+    });
+
+    // Delete
+    let delete_btn = Button::with_label("Delete Collection");
+    delete_btn.add_css_class("flat");
+    delete_btn.add_css_class("destructive-action");
+    delete_btn.set_halign(Align::Fill);
+    let pop_c3 = popover.clone();
+    let sb_c3 = sidebar.clone();
+    let name_del = collection.name.clone();
+    delete_btn.connect_clicked(move |_| {
+        pop_c3.popdown();
+        let sb = sb_c3.clone();
+        let name = name_del.clone();
+        let dialog = adw::MessageDialog::new(
+            None::<&gtk4::Window>,
+            Some(&format!("Delete smart collection '{}'?", name)),
+            Some("Photos matching this collection will remain in your library."),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        dialog.connect_response(None, move |_, resp| {
+            if resp == "delete" {
+                if let Ok(mut conn) = sb.db.conn() {
+                    if let Err(e) = queries::delete_smart_collection(&mut conn, coll_id) {
+                        log::error!("delete_smart_collection failed: {e}");
+                    }
+                }
+                sb.refresh_smart_collections();
+                let _ = sb.sender.send_blocking(UIAction::ShowAll);
+            }
+        });
+        dialog.present();
+    });
+
+    menu_box.append(&edit_btn);
+    menu_box.append(&rename_btn);
+    menu_box.append(&delete_btn);
+    popover.set_child(Some(&menu_box));
+    popover.popup();
+}
+
+pub fn prompt_smart_collection_dialog(
+    initial: Option<&SmartCollection>,
+    on_save: impl Fn(String, SmartQuery) + 'static,
+) {
+    let is_edit = initial.is_some();
+    let parsed_query = initial.and_then(|c| c.parse_query().ok()).unwrap_or_default();
+    let title = if is_edit { "Edit Smart Collection" } else { "New Smart Collection" };
+    let heading = if is_edit {
+        "Update the rules for this smart collection:"
+    } else {
+        "Photos matching these rules will update dynamically:"
+    };
+
+    let dialog = adw::MessageDialog::new(
+        None::<&gtk4::Window>,
+        Some(title),
+        Some(heading),
+    );
+
+    let scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .min_content_height(340)
+        .max_content_height(480)
+        .propagate_natural_height(true)
+        .build();
+
+    let vbox = Box::new(Orientation::Vertical, 8);
+    vbox.set_margin_start(8);
+    vbox.set_margin_end(8);
+    vbox.set_margin_top(8);
+    vbox.set_margin_bottom(8);
+
+    // Name
+    let name_lbl = Label::new(Some("Collection Name:"));
+    name_lbl.set_halign(Align::Start);
+    name_lbl.add_css_class("caption-heading");
+    vbox.append(&name_lbl);
+
+    let name_entry = Entry::new();
+    name_entry.set_placeholder_text(Some("e.g. 5-Star Landscapes"));
+    if let Some(c) = initial {
+        name_entry.set_text(&c.name);
+    }
+    vbox.append(&name_entry);
+
+    // Min Rating
+    let rating_lbl = Label::new(Some("Minimum Rating:"));
+    rating_lbl.set_halign(Align::Start);
+    rating_lbl.add_css_class("caption-heading");
+    vbox.append(&rating_lbl);
+
+    let rating_options = ["Any rating", "★ 1+", "★ 2+", "★ 3+", "★ 4+", "★ 5"];
+    let rating_list = StringList::new(&rating_options);
+    let rating_dropdown = DropDown::new(Some(rating_list), gtk4::Expression::NONE);
+    let initial_rating_idx = parsed_query
+        .min_rating
+        .map(|r| r.clamp(1, 5) as u32)
+        .unwrap_or(0);
+    rating_dropdown.set_selected(initial_rating_idx);
+    vbox.append(&rating_dropdown);
+
+    // Status / Flag
+    let flag_lbl = Label::new(Some("Status:"));
+    flag_lbl.set_halign(Align::Start);
+    flag_lbl.add_css_class("caption-heading");
+    vbox.append(&flag_lbl);
+
+    let flag_options = ["Any status", "Picks only", "Unflagged only", "Rejects only"];
+    let flag_list = StringList::new(&flag_options);
+    let flag_dropdown = DropDown::new(Some(flag_list), gtk4::Expression::NONE);
+    let initial_flag_idx = match parsed_query.flag {
+        Some(1) => 1,
+        Some(0) => 2,
+        Some(-1) => 3,
+        _ => 0,
+    };
+    flag_dropdown.set_selected(initial_flag_idx);
+    vbox.append(&flag_dropdown);
+
+    // Colour label
+    let color_lbl = Label::new(Some("Colour Label:"));
+    color_lbl.set_halign(Align::Start);
+    color_lbl.add_css_class("caption-heading");
+    vbox.append(&color_lbl);
+
+    let color_options = ["Any colour", "No colour", "Red", "Yellow", "Green", "Blue", "Purple"];
+    let color_list = StringList::new(&color_options);
+    let color_dropdown = DropDown::new(Some(color_list), gtk4::Expression::NONE);
+    let initial_color_idx = match parsed_query.color_label {
+        Some(ColorLabel::None) => 1,
+        Some(ColorLabel::Red) => 2,
+        Some(ColorLabel::Yellow) => 3,
+        Some(ColorLabel::Green) => 4,
+        Some(ColorLabel::Blue) => 5,
+        Some(ColorLabel::Purple) => 6,
+        None => 0,
+    };
+    color_dropdown.set_selected(initial_color_idx);
+    vbox.append(&color_dropdown);
+
+    // Search text / keyword
+    let search_lbl = Label::new(Some("Text Search / Keyword:"));
+    search_lbl.set_halign(Align::Start);
+    search_lbl.add_css_class("caption-heading");
+    vbox.append(&search_lbl);
+
+    let search_entry = Entry::new();
+    search_entry.set_placeholder_text(Some("Filename or text (e.g. sunset)"));
+    if let Some(ref s) = parsed_query.search_text {
+        search_entry.set_text(s);
+    }
+    vbox.append(&search_entry);
+
+    // Required Tags
+    let tags_lbl = Label::new(Some("Include Tags (comma separated):"));
+    tags_lbl.set_halign(Align::Start);
+    tags_lbl.add_css_class("caption-heading");
+    vbox.append(&tags_lbl);
+
+    let tags_entry = Entry::new();
+    tags_entry.set_placeholder_text(Some("nature, travel"));
+    if !parsed_query.tags.is_empty() {
+        tags_entry.set_text(&parsed_query.tags.join(", "));
+    }
+    vbox.append(&tags_entry);
+
+    // Excluded Tags
+    let not_tags_lbl = Label::new(Some("Exclude Tags (comma separated):"));
+    not_tags_lbl.set_halign(Align::Start);
+    not_tags_lbl.add_css_class("caption-heading");
+    vbox.append(&not_tags_lbl);
+
+    let not_tags_entry = Entry::new();
+    not_tags_entry.set_placeholder_text(Some("draft, private"));
+    if !parsed_query.not_tags.is_empty() {
+        not_tags_entry.set_text(&parsed_query.not_tags.join(", "));
+    }
+    vbox.append(&not_tags_entry);
+
+    // Camera Model
+    let camera_lbl = Label::new(Some("Camera Model:"));
+    camera_lbl.set_halign(Align::Start);
+    camera_lbl.add_css_class("caption-heading");
+    vbox.append(&camera_lbl);
+
+    let camera_entry = Entry::new();
+    camera_entry.set_placeholder_text(Some("e.g. Sony A7, Canon EOS"));
+    if let Some(ref cam) = parsed_query.camera_model {
+        camera_entry.set_text(cam);
+    }
+    vbox.append(&camera_entry);
+
+    // Lens Model
+    let lens_lbl = Label::new(Some("Lens Model:"));
+    lens_lbl.set_halign(Align::Start);
+    lens_lbl.add_css_class("caption-heading");
+    vbox.append(&lens_lbl);
+
+    let lens_entry = Entry::new();
+    lens_entry.set_placeholder_text(Some("e.g. 50mm, 24-70mm"));
+    if let Some(ref l) = parsed_query.lens_model {
+        lens_entry.set_text(l);
+    }
+    vbox.append(&lens_entry);
+
+    // Exclude rejected
+    let exclude_rejected_check = CheckButton::with_label("Exclude rejected photos");
+    if initial.is_some() {
+        exclude_rejected_check.set_active(parsed_query.exclude_rejected);
+    } else {
+        exclude_rejected_check.set_active(true);
+    }
+    vbox.append(&exclude_rejected_check);
+
+    scroll.set_child(Some(&vbox));
+    dialog.set_extra_child(Some(&scroll));
+
+    let confirm_btn_label = if is_edit { "Save Changes" } else { "Create Collection" };
+    dialog.add_responses(&[("cancel", "Cancel"), ("confirm", confirm_btn_label)]);
+    dialog.set_response_appearance("confirm", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("confirm"));
+    dialog.set_close_response("cancel");
+
+    dialog.connect_response(None, move |_, resp| {
+        if resp == "confirm" {
+            let name = name_entry.text().trim().to_string();
+            if name.is_empty() {
+                return;
+            }
+
+            let min_rating = match rating_dropdown.selected() {
+                1 => Some(1),
+                2 => Some(2),
+                3 => Some(3),
+                4 => Some(4),
+                5 => Some(5),
+                _ => None,
+            };
+
+            let flag = match flag_dropdown.selected() {
+                1 => Some(1),
+                2 => Some(0),
+                3 => Some(-1),
+                _ => None,
+            };
+
+            let color_label = match color_dropdown.selected() {
+                1 => Some(ColorLabel::None),
+                2 => Some(ColorLabel::Red),
+                3 => Some(ColorLabel::Yellow),
+                4 => Some(ColorLabel::Green),
+                5 => Some(ColorLabel::Blue),
+                6 => Some(ColorLabel::Purple),
+                _ => None,
+            };
+
+            let search_text = {
+                let s = search_entry.text().trim().to_string();
+                if s.is_empty() { None } else { Some(s) }
+            };
+
+            let tags: Vec<String> = tags_entry
+                .text()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            let not_tags: Vec<String> = not_tags_entry
+                .text()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            let camera_model = {
+                let s = camera_entry.text().trim().to_string();
+                if s.is_empty() { None } else { Some(s) }
+            };
+
+            let lens_model = {
+                let s = lens_entry.text().trim().to_string();
+                if s.is_empty() { None } else { Some(s) }
+            };
+
+            let exclude_rejected = exclude_rejected_check.is_active();
+
+            let query = SmartQuery {
+                min_rating,
+                flag,
+                tags,
+                not_tags,
+                search_text,
+                date_range: None,
+                color_label,
+                exclude_rejected,
+                camera_model,
+                lens_model,
+            };
+
+            on_save(name, query);
+        }
+    });
+
+    dialog.present();
 }
 
 pub fn prompt_text_dialog(

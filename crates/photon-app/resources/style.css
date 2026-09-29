@@ -269,6 +269,28 @@ button.destructive-action {
     padding: 6px 4px;
 }
 
+/* The sidebar/content divider: draggable, but not drawn (the theme draws
+   the line as a background image, a border or an inset shadow). */
+.photon-main-paned > separator {
+    background: none;
+    border: none;
+    box-shadow: none;
+    min-width: 1px;
+}
+
+/* A note over the photo, e.g. "Full resolution unavailable". */
+.photon-viewer-note {
+    padding: 6px 12px;
+    border-radius: 9999px;
+    font-size: 0.9em;
+}
+
+/* The 1-up viewer's photo area: darker than the sidebar, so the empty space
+   around a fitted photo reads as part of the viewer, not the sidebar. */
+.photon-photo-backdrop {
+    background-color: mix(@window_bg_color, black, 0.35);
+}
+
 .navigation-sidebar expander {
     margin-top: 2px;
     margin-bottom: 2px;
@@ -350,23 +372,6 @@ button.destructive-action {
 }
 
 /* Status floating card */
-.status-card {
-    border-radius: 12px;
-    background-color: @card_bg_color;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12), 0 1px 3px rgba(0, 0, 0, 0.06);
-    border: 1px solid alpha(currentColor, 0.08);
-}
-
-/* Progress bar styling */
-progressbar trough {
-    border-radius: 9999px;
-    min-height: 8px;
-}
-
-progressbar progress {
-    border-radius: 9999px;
-    background-color: @accent_bg_color;
-}
 
 /* ==========================================================================
    TIMELINE SCRUBBER & SELECTION BAR
@@ -410,54 +415,61 @@ actionbar.photon-bottom-bar, .photon-bottom-bar {
 
 actionbar.photon-bottom-bar > revealer > box {
     min-height: 50px;
-    padding: 6px 12px;
+    padding: 6px 0; /* horizontal: the bars set 8px margins themselves */
     background: transparent;
     border-top: none;
 }
 
-/* Title / photo counter capsule */
-.photon-viewer-title-box {
-    border-radius: 9999px;
-    padding: 4px 10px;
-    background-color: alpha(currentColor, 0.05);
-    border: 1px solid alpha(currentColor, 0.06);
-}
-
-.photon-viewer-title-box label.heading {
+.photon-bottom-bar .photon-bar-group label.heading {
     font-size: 0.9em;
     font-weight: 600;
 }
 
-/* Zoom control capsule (Material 3 pill container) */
-.photon-bottom-bar .zoom-slider-group {
-    background-color: alpha(currentColor, 0.05);
-    border-radius: 9999px;
-    padding: 2px 8px;
-    border: 1px solid alpha(currentColor, 0.06);
-    margin-left: 2px;
-    margin-right: 2px;
+/* Bottom-bar groups: every cluster of controls in the library and 1-up
+   bars is one of these. A Material 3 tonal container (surface-container:
+   a tone, no outline) with GNOME's 12px corner radius; one height; flat
+   buttons inside with concentric corners (12 − 3px padding = 9px); no
+   dividers inside, and spacing (not separators) between groups. */
+.photon-bottom-bar .photon-bar-group {
+    min-height: 36px;
+    padding: 3px;
+    border-radius: 12px;
+    border: none;
+    box-shadow: none;
+    background-color: alpha(currentColor, 0.07);
 }
 
-.photon-bottom-bar .zoom-slider-group button.flat {
-    min-width: 28px;
-    min-height: 28px;
-    padding: 0;
-    border-radius: 9999px;
+.photon-bottom-bar .photon-bar-group button {
+    min-width: 30px;
+    min-height: 30px;
+    padding: 0 6px;
+    margin: 0;
+    border-radius: 9px;
+    box-shadow: none;
 }
 
-.photon-bottom-bar .zoom-slider-group scale trough {
+/* Text inside a group (filename, counter, idle status) lines up with the buttons. */
+.photon-bottom-bar .photon-bar-group > label {
+    margin: 0 6px;
+}
+
+.photon-bottom-bar .photon-bar-group scale {
+    margin: 0 4px;
+}
+
+.photon-bottom-bar .photon-bar-group scale trough {
     min-height: 4px;
     border-radius: 9999px;
     background-color: alpha(currentColor, 0.12);
 }
 
-.photon-bottom-bar .zoom-slider-group scale highlight {
+.photon-bottom-bar .photon-bar-group scale highlight {
     min-height: 4px;
     border-radius: 9999px;
     background-color: @accent_bg_color;
 }
 
-.photon-bottom-bar .zoom-slider-group scale slider {
+.photon-bottom-bar .photon-bar-group scale slider {
     min-width: 14px;
     min-height: 14px;
     border-radius: 9999px;
@@ -525,7 +537,49 @@ actionbar.photon-bottom-bar > revealer > box {
     opacity: 0.7;
 }
 
-.photon-day-edit-btn:hover {
-    opacity: 1.0 !important;
+/* More specific than the header-hover rule above (GTK's CSS has no !important). */
+.photon-timeline-header-box:hover .photon-day-edit-btn:hover {
+    opacity: 1.0;
 }
 
+
+/* Colour labels (R-6): a dot in the theme's palette colour, hollow for none. */
+.photon-label-dot {
+    min-width: 12px;
+    min-height: 12px;
+    border-radius: 9999px;
+}
+.photon-label-dot.red { background-color: @red_3; }
+.photon-label-dot.yellow { background-color: @yellow_3; }
+.photon-label-dot.green { background-color: @green_3; }
+.photon-label-dot.blue { background-color: @blue_3; }
+.photon-label-dot.purple { background-color: @purple_3; }
+.photon-label-dot.none { box-shadow: inset 0 0 0 1.5px alpha(currentColor, 0.55); }
+
+
+/* Quality ring: green → yellow → orange → red (theme palette). */
+.photon-quality.good { color: @green_4; }
+.photon-quality.fair { color: @yellow_5; }
+.photon-quality.poor { color: @orange_4; }
+.photon-quality.bad { color: @red_3; }
+
+/* A badge inside a group (the photo counter) has the buttons' concentric corners. */
+.photon-bottom-bar .photon-bar-group .photon-badge {
+    border-radius: 9px;
+    padding: 3px 8px;
+}
+
+/* Compare panes and Survey cells: the same surface as the bar groups; the
+   active one (the one marks and keys apply to) outlined in the accent. */
+.photon-compare-pane {
+    border-radius: 12px;
+    padding: 4px;
+    background-color: alpha(currentColor, 0.04);
+    box-shadow: inset 0 0 0 2px transparent;
+}
+.photon-compare-pane.active {
+    box-shadow: inset 0 0 0 2px @accent_color;
+}
+.photon-compare-pane .photon-photo-backdrop {
+    border-radius: 9px;
+}

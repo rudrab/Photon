@@ -3,10 +3,12 @@
 //! Scans /usr/share/applications/*.desktop and ~/.local/share/applications/*.desktop
 //! for apps that handle image/* MIME types. Presents them in native Adwaita ComboRows.
 
+use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::StringList;
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use photon_ai::backend::InferenceBackend;
 use photon_core::db::queries;
 use photon_core::db::Database;
 use photon_core::models::{Versions, DesktopApp, Preferences};
@@ -189,7 +191,115 @@ pub fn show(
     group_import.add(&backup_row);
 
     page.add(&group_import);
+
+    // ── Library database ────────────────────────────────
+    let group_catalog = adw::PreferencesGroup::builder()
+        .title("Library Database")
+        .description(
+            "Ratings, tags, albums and events are in the library database, which is copied daily \
+             (and to the backup folder above, when set). Photo files are separate.",
+        )
+        .build();
+
+    let backup_now_row = adw::ActionRow::builder().title("Back Up Now").build();
+    let describe_last_backup = {
+        let row = backup_now_row.clone();
+        move || {
+            let last = photon_core::db::catalog_backups(&crate::catalog::backups_dir())
+                .ok()
+                .and_then(|list| list.into_iter().next());
+            row.set_subtitle(&match last {
+                Some(b) => format!("Last copy: {}", format_time(b.modified)),
+                None => "No copy yet".to_string(),
+            });
+        }
+    };
+    describe_last_backup();
+    let backup_now_btn = gtk4::Button::builder().label("Back Up Now").valign(gtk4::Align::Center).build();
+    backup_now_row.add_suffix(&backup_now_btn);
+    group_catalog.add(&backup_now_row);
+
+    let restore_row = adw::ActionRow::builder()
+        .title("Restore from Backup")
+        .subtitle("Replace the library database with an earlier copy")
+        .build();
+    let restore_btn = gtk4::Button::builder().label("Choose…").valign(gtk4::Align::Center).build();
+    restore_row.add_suffix(&restore_btn);
+    group_catalog.add(&restore_row);
+
+    page.add(&group_catalog);
     window.add(&page);
+
+    // ── AI Preferences Page ──────────────────────────────
+    let page_ai = adw::PreferencesPage::builder()
+        .title("AI")
+        .icon_name("applications-science-symbolic")
+        .build();
+
+    let group_devices = adw::PreferencesGroup::builder()
+        .title("Hardware Acceleration")
+        .description("Hardware accelerators detected for on-device inference (OpenVINO)")
+        .build();
+
+    // Asking OpenVINO loads its plugins (and may compile nothing, but can
+    // take a moment): off the UI thread.
+    let checking = adw::ActionRow::builder().title("Checking devices…").build();
+    group_devices.add(&checking);
+    glib::spawn_future_local(glib::clone!(
+        #[weak] group_devices,
+        async move {
+            let devices = gtk4::gio::spawn_blocking(|| {
+                photon_ai::openvino::OpenVinoBackend::new().devices()
+            })
+            .await
+            .unwrap_or_default();
+            group_devices.remove(&checking);
+            for dev in devices {
+                let subtitle = if dev.available {
+                    "Ready".to_string()
+                } else {
+                    dev.reason.clone().unwrap_or_else(|| "Unavailable".to_string())
+                };
+                let row = adw::ActionRow::builder()
+                    .title(format!("{}: {}", dev.device.as_str(), dev.name))
+                    .subtitle(subtitle)
+                    .build();
+                let icon = if dev.available { "emblem-ok-symbolic" } else { "dialog-information-symbolic" };
+                row.add_suffix(&gtk4::Image::from_icon_name(icon));
+                group_devices.add(&row);
+            }
+        }
+    ));
+    page_ai.add(&group_devices);
+
+    // ── AI Models Group ─────────────────────────────────
+    let manifest = photon_ai::manifest::ModelManifest::load_embedded();
+    let store = photon_ai::store::ModelStore::default_store();
+
+    let total_bytes = store.total_size(&manifest.models);
+    let group_models = adw::PreferencesGroup::builder()
+        .title("AI Models")
+        .description(&format!(
+            "Neural models for face detection and quality assessment. Stored in ~/.local/share/photon/models ({} downloaded)",
+            format_size(total_bytes)
+        ))
+        .build();
+
+    let win_weak = window.downgrade();
+    for spec in manifest.models.clone() {
+        let row = adw::ActionRow::builder()
+            .title(&format!("{} ({})", spec.id, spec.task))
+            .build();
+
+        let suffix = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        suffix.set_valign(gtk4::Align::Center);
+        row.add_suffix(&suffix);
+        setup_model_row(&row, &suffix, &store, &spec, &win_weak);
+        group_models.add(&row);
+    }
+
+    page_ai.add(&group_models);
+    window.add(&page_ai);
 
     // ── Live Save on changes ────────────────────────────
     let on_save = Rc::new(on_save);
@@ -286,7 +396,177 @@ pub fn show(
         });
     });
 
+    backup_now_btn.connect_clicked(glib::clone!(
+        #[weak] window,
+        #[strong] backup_dir,
+        #[strong(rename_to = db)] db_clone,
+        move |btn| {
+            btn.set_sensitive(false);
+            let db = db.clone();
+            let import_backup = backup_dir.borrow().clone();
+            let describe_last_backup = describe_last_backup.clone();
+            let btn = btn.clone();
+            glib::spawn_future_local(async move {
+                let result = gtk4::gio::spawn_blocking(move || {
+                    crate::catalog::back_up(&db, import_backup.as_deref(), std::time::Duration::ZERO)
+                })
+                .await
+                .unwrap_or_else(|_| Err("the backup worker crashed".into()));
+                btn.set_sensitive(true);
+                describe_last_backup();
+                let text = match result {
+                    Ok(report) => report.mirror_problem.unwrap_or_else(|| "Library database backed up".into()),
+                    Err(e) => format!("Backup failed: {e}"),
+                };
+                window.add_toast(adw::Toast::new(&text));
+            });
+        }
+    ));
+
+    restore_btn.connect_clicked(glib::clone!(
+        #[weak] window,
+        #[strong] backup_dir,
+        move |_| show_restore_dialog(&window, backup_dir.borrow().as_deref())
+    ));
+
     window.present();
+}
+
+// ═══════════════════════════════════════════════════════════
+// Restore from a backup
+// ═══════════════════════════════════════════════════════════
+
+fn format_time(t: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Local>::from(t).format("%a %-d %b %Y, %H:%M").to_string()
+}
+
+fn format_size(bytes: u64) -> String {
+    match bytes {
+        b if b < 1024 * 1024 => format!("{:.0} KB", b as f64 / 1024.0),
+        b => format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)),
+    }
+}
+
+/// List the backups — the local ones, and those on the import backup disk
+/// (the only ones left after losing the computer's disk) — to pick one.
+fn show_restore_dialog(parent: &adw::PreferencesWindow, import_backup: Option<&Path>) {
+    let mut backups: Vec<(photon_core::db::CatalogBackup, bool)> =
+        photon_core::db::catalog_backups(&crate::catalog::backups_dir())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|b| (b, false))
+            .collect();
+    if let Some(dir) = import_backup {
+        let local: std::collections::HashSet<_> =
+            backups.iter().filter_map(|(b, _)| b.path.file_name().map(|n| n.to_os_string())).collect();
+        let mirrored = photon_core::db::catalog_backups(&crate::catalog::mirror_dir(dir)).unwrap_or_default();
+        backups.extend(
+            mirrored
+                .into_iter()
+                .filter(|b| b.path.file_name().is_some_and(|n| !local.contains(n)))
+                .map(|b| (b, true)),
+        );
+        backups.sort_by(|a, b| b.0.path.file_name().cmp(&a.0.path.file_name()));
+    }
+
+    let dialog = adw::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title("Restore Library Database")
+        .default_width(480)
+        .default_height(480)
+        .build();
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    let page = adw::PreferencesPage::new();
+    let group = adw::PreferencesGroup::builder()
+        .description(
+            "Photon restarts with the chosen copy. Changes made since it was saved — ratings, tags, \
+             albums, imports — are lost from the library; photo files are not touched. The current \
+             database is kept next to the backups.",
+        )
+        .build();
+    if backups.is_empty() {
+        group.add(&adw::ActionRow::builder().title("No backups yet").build());
+    }
+    for (backup, on_backup_disk) in backups {
+        let where_ = if on_backup_disk { " · on the backup disk" } else { "" };
+        let subtitle = match backup.photos {
+            Some(n) => format!("{n} photos · {}{where_}", format_size(backup.size)),
+            None => format!("Can't be read — damaged?{where_}"),
+        };
+        let row = adw::ActionRow::builder().title(format_time(backup.modified)).subtitle(subtitle).build();
+        let btn = gtk4::Button::builder().label("Restore…").valign(gtk4::Align::Center).build();
+        btn.set_sensitive(backup.photos.is_some());
+        let dlg = dialog.clone();
+        btn.connect_clicked(move |_| confirm_restore(&dlg, &backup));
+        row.add_suffix(&btn);
+        group.add(&row);
+    }
+    page.add(&group);
+    toolbar.set_content(Some(&page));
+    dialog.set_content(Some(&toolbar));
+    dialog.present();
+}
+
+fn confirm_restore(parent: &adw::Window, backup: &photon_core::db::CatalogBackup) {
+    let confirm = adw::MessageDialog::new(
+        Some(parent),
+        Some("Restore This Copy?"),
+        Some(&format!(
+            "The library will be as it was on {} ({} photos).",
+            format_time(backup.modified),
+            backup.photos.unwrap_or(0)
+        )),
+    );
+    confirm.add_response("cancel", "Cancel");
+    confirm.add_response("restore", "Restore");
+    confirm.set_response_appearance("restore", adw::ResponseAppearance::Destructive);
+    confirm.set_default_response(Some("cancel"));
+    confirm.set_close_response("cancel");
+    let path = backup.path.clone();
+    let parent = parent.clone();
+    confirm.connect_response(None, move |_, response| {
+        if response != "restore" {
+            return;
+        }
+        let path = path.clone();
+        let parent = parent.clone();
+        glib::spawn_future_local(async move {
+            let staged = gtk4::gio::spawn_blocking(move || {
+                photon_core::db::stage_restore(&path, &crate::catalog::db_path()).map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap_or_else(|_| Err("the restore worker crashed".into()));
+            let ready = staged.is_ok();
+            let done = match staged {
+                Ok(()) => adw::MessageDialog::new(
+                    Some(&parent),
+                    Some("Restart to Finish"),
+                    Some(
+                        "The copy is checked and ready. It replaces the library database when Photon \
+                         next starts; changes made until then will be lost.",
+                    ),
+                ),
+                Err(e) => adw::MessageDialog::new(Some(&parent), Some("Can't Restore This Copy"), Some(&e)),
+            };
+            if ready {
+                done.add_response("later", "Later");
+                done.add_response("quit", "Quit Photon");
+                done.set_response_appearance("quit", adw::ResponseAppearance::Suggested);
+                done.set_default_response(Some("quit"));
+                done.connect_response(Some("quit"), |_, _| {
+                    if let Some(app) = gtk4::gio::Application::default() {
+                        app.quit();
+                    }
+                });
+            } else {
+                done.add_response("ok", "OK");
+            }
+            done.present();
+        });
+    });
+    confirm.present();
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -508,4 +788,152 @@ fn same_disk(a: &Path, b: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     let dev = |p: &Path| p.ancestors().find_map(|p| fs::metadata(p).ok()).map(|m| m.dev());
     matches!((dev(a), dev(b)), (Some(x), Some(y)) if x == y)
+}
+
+fn setup_model_row(
+    row: &adw::ActionRow,
+    suffix: &gtk4::Box,
+    store: &photon_ai::store::ModelStore,
+    spec: &photon_ai::manifest::ModelSpec,
+    win_weak: &glib::WeakRef<adw::PreferencesWindow>,
+) {
+    // The previous state's buttons.
+    while let Some(child) = suffix.first_child() {
+        suffix.remove(&child);
+    }
+
+    let status = store.status(spec);
+    match status {
+        photon_ai::store::ModelStatus::Ready { size_bytes } => {
+            row.set_subtitle(&format!(
+                "Ready · {} · {} · Licence: {}",
+                format_size(size_bytes),
+                spec.source,
+                spec.licence
+            ));
+            let del_btn = gtk4::Button::builder()
+                .icon_name("user-trash-symbolic")
+                .tooltip_text("Delete downloaded model")
+                .valign(gtk4::Align::Center)
+                .build();
+            del_btn.add_css_class("flat");
+            del_btn.add_css_class("destructive-action");
+
+            let store_del = store.clone();
+            let spec_del = spec.clone();
+            let row_del = row.clone();
+            let suffix_del = suffix.clone();
+            let win_weak = win_weak.clone();
+            del_btn.connect_clicked(move |_| {
+                if let Err(e) = store_del.delete(&spec_del) {
+                    if let Some(w) = win_weak.upgrade() {
+                        w.add_toast(adw::Toast::new(&format!("Failed to delete: {e}")));
+                    }
+                } else {
+                    if let Some(w) = win_weak.upgrade() {
+                        w.add_toast(adw::Toast::new(&format!("Deleted {}", spec_del.id)));
+                    }
+                    setup_model_row(&row_del, &suffix_del, &store_del, &spec_del, &win_weak);
+                }
+            });
+            suffix.append(&del_btn);
+        }
+        photon_ai::store::ModelStatus::NotDownloaded | photon_ai::store::ModelStatus::Corrupt { .. } => {
+            let status_str = if matches!(status, photon_ai::store::ModelStatus::Corrupt { .. }) {
+                "Corrupted"
+            } else {
+                "Not downloaded"
+            };
+            row.set_subtitle(&format!(
+                "{} · {} · {} · Licence: {}",
+                status_str,
+                format_size(spec.size_bytes),
+                spec.source,
+                spec.licence
+            ));
+            let dl_btn = gtk4::Button::builder()
+                .label("Download…")
+                .valign(gtk4::Align::Center)
+                .build();
+            dl_btn.add_css_class("suggested-action");
+
+            let spec_dl = spec.clone();
+            let store_dl = store.clone();
+            let row_dl = row.clone();
+            let suffix_dl = suffix.clone();
+            let win_weak = win_weak.clone();
+            dl_btn.connect_clicked(move |_| {
+                if let Some(win) = win_weak.upgrade() {
+                    let dialog = adw::MessageDialog::new(
+                        Some(&win),
+                        Some(&format!("Download {}?", spec_dl.id)),
+                        Some(&format!(
+                            "Task: {}\nFile size: {}\nSource: {}\nLicence: {}\n\nWeights URL:\n{}\n\nLicence text:\n{}",
+                            spec_dl.task,
+                            format_size(spec_dl.size_bytes),
+                            spec_dl.source,
+                            spec_dl.licence,
+                            spec_dl.url,
+                            spec_dl.licence_url
+                        )),
+                    );
+                    dialog.add_response("cancel", "Cancel");
+                    dialog.add_response("download", "Download");
+                    dialog.set_response_appearance("download", adw::ResponseAppearance::Suggested);
+                    dialog.set_default_response(Some("download"));
+                    dialog.set_close_response("cancel");
+
+                    let spec_start = spec_dl.clone();
+                    let store_start = store_dl.clone();
+                    let row_start = row_dl.clone();
+                    let suffix_start = suffix_dl.clone();
+                    let win_weak_start = win_weak.clone();
+
+                    dialog.connect_response(None, move |_, response| {
+                        if response == "download" {
+                            let spec_bg = spec_start.clone();
+                            let store_bg = store_start.clone();
+                            let row_bg = row_start.clone();
+                            let suffix_bg = suffix_start.clone();
+                            let win_weak_bg = win_weak_start.clone();
+
+                            if let Some(w) = win_weak_bg.upgrade() {
+                                w.add_toast(adw::Toast::new(&format!("Downloading {}...", spec_bg.id)));
+                            }
+
+                            let spec_finish = spec_bg.clone();
+                            let store_finish = store_bg.clone();
+                            glib::spawn_future_local(async move {
+                                let res = gtk4::gio::spawn_blocking(move || {
+                                    store_bg.download(&spec_bg, None, None)
+                                })
+                                .await;
+
+                                match res {
+                                    Ok(Ok(_)) => {
+                                        if let Some(w) = win_weak_bg.upgrade() {
+                                            w.add_toast(adw::Toast::new(&format!("Downloaded {}", spec_finish.id)));
+                                        }
+                                        setup_model_row(&row_bg, &suffix_bg, &store_finish, &spec_finish, &win_weak_bg);
+                                    }
+                                    Ok(Err(e)) => {
+                                        if let Some(w) = win_weak_bg.upgrade() {
+                                            w.add_toast(adw::Toast::new(&format!("Download failed: {e}")));
+                                        }
+                                    }
+                                    Err(_) => {
+                                        if let Some(w) = win_weak_bg.upgrade() {
+                                            w.add_toast(adw::Toast::new("Download worker crashed"));
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    });
+                    dialog.present();
+                }
+            });
+            suffix.append(&dl_btn);
+        }
+    }
 }

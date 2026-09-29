@@ -2,10 +2,11 @@
 
 use crate::error::PhotonError;
 use crate::models::{
-    Album, Event, Image, ImageFormat, ImportBatch, LibraryQuery, Tag, TimelineItem,
+    Album, ColorLabel, Event, Image, ImageFormat, ImageQuality, ImportBatch, LibraryQuery,
+    SmartCollection, SmartQuery, Tag, TimelineItem,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
@@ -22,14 +23,14 @@ pub fn insert_image(tx: &Transaction, img: &Image) -> Result<Option<i64>, Photon
             camera_make, camera_model, lens_model, focal_length, aperture, shutter_speed, iso,
             latitude, longitude, location_name,
             rating, flagged, hidden, title, description, group_hash, orientation, original_filename,
-            thumbhash
+            thumbhash, color_label
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6,
             ?7, ?8, ?9, ?10, ?11, ?12,
             ?13, ?14, ?15, ?16, ?17, ?18, ?19,
             ?20, ?21, ?22,
             ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-            ?31
+            ?31, ?32
         )",
     )?;
     let changed = stmt.execute(params![
@@ -64,6 +65,7 @@ pub fn insert_image(tx: &Transaction, img: &Image) -> Result<Option<i64>, Photon
             img.orientation,
             img.original_filename,
             img.thumbhash,
+            img.color_label.as_i32(),
     ])?;
 
     if changed > 0 {
@@ -83,14 +85,14 @@ pub fn restore_image(tx: &Transaction, img: &Image) -> Result<Option<i64>, Photo
                 camera_make, camera_model, lens_model, focal_length, aperture, shutter_speed, iso,
                 latitude, longitude, location_name,
                 rating, flagged, hidden, title, description, group_hash, orientation, original_filename,
-                thumbhash
+                thumbhash, color_label
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7,
                 ?8, ?9, ?10, ?11, ?12, ?13,
                 ?14, ?15, ?16, ?17, ?18, ?19, ?20,
                 ?21, ?22, ?23,
                 ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31,
-                ?32
+                ?32, ?33
             )",
         )?;
         let changed = stmt.execute(params![
@@ -126,6 +128,7 @@ pub fn restore_image(tx: &Transaction, img: &Image) -> Result<Option<i64>, Photo
             img.orientation,
             img.original_filename,
             img.thumbhash,
+            img.color_label.as_i32(),
         ])?;
         if changed > 0 {
             Ok(Some(id))
@@ -222,14 +225,15 @@ pub fn duplicate_keys(conn: &Connection) -> Result<HashSet<DuplicateKey>, Photon
 // 19: iso         20: latitude     21: longitude    22: location_name
 // 23: rating      24: flagged      25: hidden       26: title
 // 27: description 28: group_hash 29: orientation 30: original_filename
-// 31: thumbhash 32: xmp_mtime 33: missing
+// 31: thumbhash 32: xmp_mtime 33: missing 34: color_label
 
 const IMAGE_SELECT: &str = "SELECT id, hash, path, filename, size_bytes, width, height,
             created_at, imported_at, format, has_sidecar, metadata_json, thumbnail_hash,
             camera_make, camera_model, lens_model, focal_length, aperture, shutter_speed, iso,
             latitude, longitude, location_name,
             rating, flagged, hidden, title, description, group_hash, orientation,
-            original_filename, thumbhash, xmp_mtime, COALESCE(missing, 0) as missing
+            original_filename, thumbhash, xmp_mtime, COALESCE(missing, 0) as missing,
+            COALESCE(color_label, 0) as color_label
      FROM images";
 
 fn row_to_image(row: &rusqlite::Row) -> rusqlite::Result<Image> {
@@ -269,6 +273,7 @@ fn row_to_image(row: &rusqlite::Row) -> rusqlite::Result<Image> {
         thumbhash: row.get(31)?,
         xmp_mtime: row.get(32)?,
         missing: row.get::<_, i32>(33).unwrap_or(0) != 0,
+        color_label: crate::models::ColorLabel::from_i32(row.get::<_, i32>(34).unwrap_or(0)),
         is_video: false,
         duration: None,
     })
@@ -363,6 +368,18 @@ pub fn get_image(conn: &Connection, id: i64) -> Result<Option<Image>, PhotonErro
     Ok(conn.query_row(&sql, params![id], row_to_image).optional()?)
 }
 
+/// The photos from `camera` taken between `from` and `to` (Unix times,
+/// inclusive): a shooting session, for comparing a photo with its neighbours.
+pub fn images_in_session(conn: &Connection, camera: Option<&str>, from: i64, to: i64) -> Result<Vec<Image>, PhotonError> {
+    let sql = format!(
+        "{} WHERE hidden = 0 AND created_at BETWEEN ?1 AND ?2 AND camera_model IS ?3 ORDER BY created_at",
+        IMAGE_SELECT
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![from, to, camera], row_to_image)?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 /// Which photos a timeline shows.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TimelineFilter {
@@ -372,7 +389,10 @@ pub enum TimelineFilter {
     Tag(String),
     Album(i64),
     Event(i64),
+    SmartCollection(i64),
+    ColorLabel(ColorLabel),
     Missing,
+    Blurred(f64),
 }
 
 /// Which star ratings a timeline shows.
@@ -387,6 +407,60 @@ pub enum RatingFilter {
 }
 
 /// Timeline tiles for `filter`, newest first. Only the columns needed for layout.
+/// One tile per shot: the files of a shot (same `group_hash`: RAW + JPG,
+/// edits) collapse into one item, in the place of the first. The cover is a
+/// raster file (the camera's JPG) when there is one, else the first file.
+pub fn collapse_versions(items: Vec<TimelineItem>) -> Vec<TimelineItem> {
+    let mut out: Vec<TimelineItem> = Vec::with_capacity(items.len());
+    let mut slot: HashMap<String, usize> = HashMap::new();
+    for item in items {
+        let Some(group) = item.group_hash.clone() else {
+            out.push(item);
+            continue;
+        };
+        match slot.get(&group) {
+            None => {
+                slot.insert(group, out.len());
+                out.push(item);
+            }
+            Some(&i) => {
+                let kept = &mut out[i];
+                let versions = kept.versions.max(1) + 1;
+                let any_raw = kept.is_raw || kept.has_raw_version || item.is_raw;
+                if kept.is_raw && !item.is_raw {
+                    *kept = item;
+                }
+                kept.versions = versions;
+                kept.has_raw_version = any_raw && !kept.is_raw;
+            }
+        }
+    }
+    out
+}
+
+/// `ids` and every other file of the same shots (same `group_hash`).
+pub fn shot_member_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<i64>, PhotonError> {
+    let mut all: Vec<i64> = Vec::with_capacity(ids.len() * 2);
+    let mut seen = HashSet::new();
+    for chunk in ids.chunks(500) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id FROM images WHERE id IN ({placeholders}) OR group_hash IN
+                 (SELECT group_hash FROM images WHERE group_hash IS NOT NULL AND id IN ({placeholders}))"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            chunk.iter().chain(chunk.iter()).map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        for id in stmt.query_map(params.as_slice(), |r| r.get::<_, i64>(0))? {
+            let id = id?;
+            if seen.insert(id) {
+                all.push(id);
+            }
+        }
+    }
+    Ok(all)
+}
+
 pub fn timeline_items(
     conn: &Connection,
     filter: &TimelineFilter,
@@ -415,18 +489,28 @@ pub fn timeline_items_with_cull(
     rating: RatingFilter,
     flag: Option<i32>,
 ) -> Result<Vec<TimelineItem>, PhotonError> {
-    const COLS: &str = "SELECT id, hash, created_at, width, height, orientation, thumbhash, rating, flagged, format, metadata_json, COALESCE(missing, 0) FROM images";
+    timeline_items_with_filters(conn, filter, rating, flag, None)
+}
+
+/// Timeline tiles for `filter`, narrowed by star `rating`, flag, and color label.
+pub fn timeline_items_with_filters(
+    conn: &Connection,
+    filter: &TimelineFilter,
+    rating: RatingFilter,
+    flag: Option<i32>,
+    color: Option<ColorLabel>,
+) -> Result<Vec<TimelineItem>, PhotonError> {
+    const COLS: &str = "SELECT id, hash, created_at, width, height, orientation, thumbhash, rating, flagged, format, metadata_json, COALESCE(missing, 0), group_hash, COALESCE(color_label, 0) FROM images";
     const ORDER: &str = "ORDER BY COALESCE(created_at, imported_at) DESC, id DESC";
 
     let map = |r: &rusqlite::Row| -> rusqlite::Result<TimelineItem> {
         let format_str: Option<String> = r.get(9)?;
-        let is_video = format_str
-            .as_deref()
-            .map(ImageFormat::from_db_str)
-            .map_or(false, |f| f.is_video());
+        let format = format_str.as_deref().map(ImageFormat::from_db_str);
+        let is_video = format.map_or(false, |f| f.is_video());
         let meta_json: Option<String> = r.get(10)?;
         let duration = meta_json.as_deref().and_then(parse_duration_from_meta);
         let missing_val: i32 = r.get(11).unwrap_or(0);
+        let color_val: i32 = r.get(13).unwrap_or(0);
         Ok(TimelineItem {
             id: r.get(0)?,
             hash: r.get(1)?,
@@ -437,9 +521,14 @@ pub fn timeline_items_with_cull(
             thumbhash: r.get(6)?,
             rating: r.get::<_, i32>(7).unwrap_or(0),
             flagged: r.get::<_, i32>(8).unwrap_or(0),
+            color_label: ColorLabel::from_i32(color_val),
             is_video,
             duration,
             missing: missing_val != 0,
+            group_hash: r.get(12)?,
+            is_raw: format.map_or(false, |f| f.is_raw()),
+            versions: 1,
+            has_raw_version: false,
         })
     };
 
@@ -456,6 +545,12 @@ pub fn timeline_items_with_cull(
     if let Some(f) = flag {
         extra.push_str(" AND flagged = ?");
         extra_params.push(Box::new(f));
+    }
+    if let Some(c) = color {
+        if c != ColorLabel::None {
+            extra.push_str(" AND color_label = ?");
+            extra_params.push(Box::new(c.as_i32()));
+        }
     }
 
     let items = match filter {
@@ -558,6 +653,23 @@ pub fn timeline_items_with_cull(
                     all_params.iter().map(|p| p.as_ref()).collect();
                 let rows = stmt.query_map(params_refs.as_slice(), map)?;
                 rows.collect::<Result<Vec<_>, _>>()?
+            } else if let Some(color_query) = trimmed.strip_prefix("label:").or_else(|| trimmed.strip_prefix("color:")) {
+                let cl = match color_query.trim().to_lowercase().as_str() {
+                    "red" => ColorLabel::Red,
+                    "yellow" => ColorLabel::Yellow,
+                    "green" => ColorLabel::Green,
+                    "blue" => ColorLabel::Blue,
+                    "purple" => ColorLabel::Purple,
+                    _ => ColorLabel::None,
+                };
+                let sql = format!("{COLS} WHERE hidden = 0 AND color_label = ?1 {extra} {ORDER}");
+                let mut stmt = conn.prepare(&sql)?;
+                let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(cl.as_i32())];
+                all_params.extend(extra_params);
+                let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    all_params.iter().map(|p| p.as_ref()).collect();
+                let rows = stmt.query_map(params_refs.as_slice(), map)?;
+                rows.collect::<Result<Vec<_>, _>>()?
             } else {
                 let fts = fts_query(trimmed);
                 let tag_pattern = format!("%{}%", trimmed);
@@ -606,6 +718,36 @@ pub fn timeline_items_with_cull(
             let rows = stmt.query_map(params_refs.as_slice(), map)?;
             rows.collect::<Result<Vec<_>, _>>()?
         }
+        TimelineFilter::SmartCollection(coll_id) => {
+            if let Some(sc) = get_smart_collection(conn, *coll_id)? {
+                // An unreadable query must not fall back to "no conditions":
+                // that would show the whole library as the collection.
+                let sq: SmartQuery = serde_json::from_str(&sc.query_json).map_err(|e| {
+                    PhotonError::Other(format!("The smart collection “{}” can't be read: {e}", sc.name))
+                })?;
+                let (where_sql, query_params) = build_smart_query_sql(&sq);
+                let sql = format!("{COLS} WHERE {where_sql} {extra} {ORDER}");
+                let mut stmt = conn.prepare(&sql)?;
+                let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = query_params;
+                all_params.extend(extra_params);
+                let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    all_params.iter().map(|p| p.as_ref()).collect();
+                let rows = stmt.query_map(params_refs.as_slice(), map)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            } else {
+                Vec::new()
+            }
+        }
+        TimelineFilter::ColorLabel(color) => {
+            let sql = format!("{COLS} WHERE hidden = 0 AND color_label = ?1 {extra} {ORDER}");
+            let mut stmt = conn.prepare(&sql)?;
+            let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(color.as_i32())];
+            all_params.extend(extra_params);
+            let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                all_params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.query_map(params_refs.as_slice(), map)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        }
         TimelineFilter::Missing => {
             let sql = format!("{COLS} WHERE hidden = 0 AND missing = 1 {extra} {ORDER}");
             let mut stmt = conn.prepare(&sql)?;
@@ -614,8 +756,22 @@ pub fn timeline_items_with_cull(
             let rows = stmt.query_map(params_refs.as_slice(), map)?;
             rows.collect::<Result<Vec<_>, _>>()?
         }
+        TimelineFilter::Blurred(threshold) => {
+            let sql = format!(
+                "{COLS} WHERE hidden = 0 AND id IN (
+                    SELECT image_id FROM image_quality WHERE sharpness <= ?1
+                ) {extra} {ORDER}"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(*threshold)];
+            all_params.extend(extra_params);
+            let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                all_params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.query_map(params_refs.as_slice(), map)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        }
     };
-    Ok(items)
+    Ok(collapse_versions(items))
 }
 
 /// Update rating (0..=5) of an image.
@@ -658,6 +814,33 @@ pub fn batch_set_flag(conn: &mut Connection, ids: &[i64], flag: i32) -> Result<(
         let f = flag.clamp(-1, 1);
         for id in ids {
             stmt.execute(params![f, id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Update colour label of an image.
+pub fn set_color_label(conn: &Connection, id: i64, color: ColorLabel) -> Result<(), PhotonError> {
+    conn.execute(
+        "UPDATE images SET color_label = ?1 WHERE id = ?2",
+        params![color.as_i32(), id],
+    )?;
+    Ok(())
+}
+
+/// Batch update colour label for multiple photos in a single transaction.
+pub fn batch_set_color_label(
+    conn: &mut Connection,
+    ids: &[i64],
+    color: ColorLabel,
+) -> Result<(), PhotonError> {
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare_cached("UPDATE images SET color_label = ?1 WHERE id = ?2")?;
+        let c = color.as_i32();
+        for id in ids {
+            stmt.execute(params![c, id])?;
         }
     }
     tx.commit()?;
@@ -731,32 +914,74 @@ fn fts_query(text: &str) -> String {
 pub fn search_images(conn: &Connection, query: &LibraryQuery) -> Result<Vec<Image>, PhotonError> {
     let mut conditions = Vec::new();
     let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    let mut idx = 1;
 
     if let Some(year) = query.year {
-        conditions.push(format!("year = ?{}", idx));
+        conditions.push("year = ?".to_string());
         params_vec.push(Box::new(year));
-        idx += 1;
     }
     if let Some(month) = query.month {
-        conditions.push(format!("month = ?{}", idx));
+        conditions.push("month = ?".to_string());
         params_vec.push(Box::new(month as i32));
-        idx += 1;
     }
     if let Some(day) = query.day {
-        conditions.push(format!("day = ?{}", idx));
+        conditions.push("day = ?".to_string());
         params_vec.push(Box::new(day as i32));
-        idx += 1;
     }
     if let Some((start, end)) = query.date_range {
-        conditions.push(format!(
-            "created_at >= ?{} AND created_at <= ?{}",
-            idx,
-            idx + 1
-        ));
+        conditions.push("created_at >= ? AND created_at <= ?".to_string());
         params_vec.push(Box::new(start));
         params_vec.push(Box::new(end));
-        idx += 2;
+    }
+    if let Some(r) = query.min_rating {
+        conditions.push("rating >= ?".to_string());
+        params_vec.push(Box::new(r));
+    }
+    if let Some(f) = query.flag {
+        conditions.push("flagged = ?".to_string());
+        params_vec.push(Box::new(f));
+    }
+    if query.exclude_rejected {
+        conditions.push("flagged != -1".to_string());
+    }
+    if let Some(cl) = query.color_label {
+        if cl != ColorLabel::None {
+            conditions.push("color_label = ?".to_string());
+            params_vec.push(Box::new(cl.as_i32()));
+        }
+    }
+    if let Some(ref cam) = query.camera_model {
+        conditions.push("(camera_make LIKE ? OR camera_model LIKE ?)".to_string());
+        let pat = format!("%{}%", cam.trim());
+        params_vec.push(Box::new(pat.clone()));
+        params_vec.push(Box::new(pat));
+    }
+    if let Some(ref lens) = query.lens_model {
+        conditions.push("lens_model LIKE ?".to_string());
+        params_vec.push(Box::new(format!("%{}%", lens.trim())));
+    }
+    for tag in &query.tags {
+        conditions.push(
+            "id IN (SELECT it.image_id FROM image_tags it JOIN tags t ON t.id = it.tag_id WHERE t.name = ? COLLATE NOCASE)".to_string(),
+        );
+        params_vec.push(Box::new(tag.clone()));
+    }
+    for not_tag in &query.not_tags {
+        conditions.push(
+            "id NOT IN (SELECT it.image_id FROM image_tags it JOIN tags t ON t.id = it.tag_id WHERE t.name = ? COLLATE NOCASE)".to_string(),
+        );
+        params_vec.push(Box::new(not_tag.clone()));
+    }
+    if let Some(ref text) = query.search_text {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            let fts = fts_query(trimmed);
+            let tag_pattern = format!("%{}%", trimmed);
+            conditions.push(
+                "(id IN (SELECT rowid FROM images_fts WHERE images_fts MATCH ?) OR id IN (SELECT it.image_id FROM image_tags it JOIN tags t ON t.id = it.tag_id WHERE t.name LIKE ?))".to_string(),
+            );
+            params_vec.push(Box::new(fts));
+            params_vec.push(Box::new(tag_pattern));
+        }
     }
 
     let where_clause = if conditions.is_empty() {
@@ -771,12 +996,11 @@ pub fn search_images(conn: &Connection, query: &LibraryQuery) -> Result<Vec<Imag
     );
 
     if let Some(limit) = query.limit {
-        sql.push_str(&format!(" LIMIT ?{}", idx));
+        sql.push_str(" LIMIT ?");
         params_vec.push(Box::new(limit));
-        idx += 1;
     }
     if let Some(offset) = query.offset {
-        sql.push_str(&format!(" OFFSET ?{}", idx));
+        sql.push_str(" OFFSET ?");
         params_vec.push(Box::new(offset));
     }
 
@@ -807,6 +1031,18 @@ pub fn fts_search(
 // ---------------------------------------------------------------------------
 // Sidecar group queries
 // ---------------------------------------------------------------------------
+
+/// Shots (RAW + JPG, edits) whose files disagree on rating, pick/reject or colour label,
+/// as `group_hash`es.
+pub fn disagreeing_shots(conn: &Connection) -> Result<Vec<String>, PhotonError> {
+    let mut stmt = conn.prepare(
+        "SELECT group_hash FROM images WHERE group_hash IS NOT NULL
+         GROUP BY group_hash
+         HAVING COUNT(DISTINCT rating) > 1 OR COUNT(DISTINCT flagged) > 1 OR COUNT(DISTINCT color_label) > 1",
+    )?;
+    let groups = stmt.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+    Ok(groups)
+}
 
 /// Get all images in the same sidecar group (RAW+JPG pair, edits, etc.)
 pub fn get_images_in_group(
@@ -855,12 +1091,13 @@ pub fn shots_of(
 // Sidebar / Hierarchy
 // ---------------------------------------------------------------------------
 
-/// Photo counts per day for the whole library, newest first, in one query
+/// Photo counts per day for the whole library, newest first, in one query.
+/// A shot's files (RAW + JPG) count once, as the timeline shows one tile.
 /// (the `(year, month, day)` index makes this a single index scan).
 /// Rows are `(year, month, day, count)`.
 pub fn date_tree(conn: &Connection) -> Result<Vec<(i32, u32, u32, u32)>, PhotonError> {
     let mut stmt = conn.prepare(
-        "SELECT year, month, day, COUNT(*) FROM images
+        "SELECT year, month, day, COUNT(DISTINCT COALESCE(group_hash, 'id:' || id)) FROM images
          WHERE year IS NOT NULL AND year > 0 AND hidden = 0
          GROUP BY year, month, day
          ORDER BY year DESC, month DESC, day DESC",
@@ -871,7 +1108,7 @@ pub fn date_tree(conn: &Connection) -> Result<Vec<(i32, u32, u32, u32)>, PhotonE
 
 pub fn get_years(conn: &Connection) -> Result<Vec<(i32, u32)>, PhotonError> {
     let mut stmt = conn.prepare(
-        "SELECT year, COUNT(*) FROM images
+        "SELECT year, COUNT(DISTINCT COALESCE(group_hash, 'id:' || id)) FROM images
          WHERE year IS NOT NULL AND year > 0
          GROUP BY year ORDER BY year DESC",
     )?;
@@ -885,7 +1122,7 @@ pub fn get_years(conn: &Connection) -> Result<Vec<(i32, u32)>, PhotonError> {
 
 pub fn get_months_in_year(conn: &Connection, year: i32) -> Result<Vec<(u32, u32)>, PhotonError> {
     let mut stmt = conn.prepare(
-        "SELECT month, COUNT(*) FROM images
+        "SELECT month, COUNT(DISTINCT COALESCE(group_hash, 'id:' || id)) FROM images
          WHERE year = ?1
          GROUP BY month ORDER BY month DESC",
     )?;
@@ -903,7 +1140,7 @@ pub fn get_days_in_month(
     month: u32,
 ) -> Result<Vec<(u32, u32)>, PhotonError> {
     let mut stmt = conn.prepare(
-        "SELECT day, COUNT(*) FROM images
+        "SELECT day, COUNT(DISTINCT COALESCE(group_hash, 'id:' || id)) FROM images
          WHERE year = ?1 AND month = ?2
          GROUP BY day ORDER BY day DESC",
     )?;
@@ -1368,6 +1605,182 @@ pub fn set_album_cover(
 }
 
 // ---------------------------------------------------------------------------
+// Smart Collections (R-5)
+// ---------------------------------------------------------------------------
+
+pub fn build_smart_query_sql(query: &SmartQuery) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let mut conditions = vec!["hidden = 0".to_string()];
+    let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+    if let Some(r) = query.min_rating {
+        conditions.push("rating >= ?".to_string());
+        params_vec.push(Box::new(r));
+    }
+    if let Some(f) = query.flag {
+        conditions.push("flagged = ?".to_string());
+        params_vec.push(Box::new(f));
+    }
+    if query.exclude_rejected {
+        conditions.push("flagged != -1".to_string());
+    }
+    if let Some(cl) = query.color_label {
+        if cl != ColorLabel::None {
+            conditions.push("color_label = ?".to_string());
+            params_vec.push(Box::new(cl.as_i32()));
+        }
+    }
+    if let Some((start, end)) = query.date_range {
+        conditions.push("created_at >= ? AND created_at <= ?".to_string());
+        params_vec.push(Box::new(start));
+        params_vec.push(Box::new(end));
+    }
+    if let Some(ref cam) = query.camera_model {
+        conditions.push("(camera_make LIKE ? OR camera_model LIKE ?)".to_string());
+        let pat = format!("%{}%", cam.trim());
+        params_vec.push(Box::new(pat.clone()));
+        params_vec.push(Box::new(pat));
+    }
+    if let Some(ref lens) = query.lens_model {
+        conditions.push("lens_model LIKE ?".to_string());
+        params_vec.push(Box::new(format!("%{}%", lens.trim())));
+    }
+    for tag in &query.tags {
+        conditions.push(
+            "id IN (SELECT it.image_id FROM image_tags it JOIN tags t ON t.id = it.tag_id WHERE t.name = ? COLLATE NOCASE)".to_string(),
+        );
+        params_vec.push(Box::new(tag.clone()));
+    }
+    for not_tag in &query.not_tags {
+        conditions.push(
+            "id NOT IN (SELECT it.image_id FROM image_tags it JOIN tags t ON t.id = it.tag_id WHERE t.name = ? COLLATE NOCASE)".to_string(),
+        );
+        params_vec.push(Box::new(not_tag.clone()));
+    }
+    if let Some(ref text) = query.search_text {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            let fts = fts_query(trimmed);
+            let tag_pattern = format!("%{}%", trimmed);
+            conditions.push(
+                "(id IN (SELECT rowid FROM images_fts WHERE images_fts MATCH ?) OR id IN (SELECT it.image_id FROM image_tags it JOIN tags t ON t.id = it.tag_id WHERE t.name LIKE ?))".to_string()
+            );
+            params_vec.push(Box::new(fts));
+            params_vec.push(Box::new(tag_pattern));
+        }
+    }
+
+    (conditions.join(" AND "), params_vec)
+}
+
+pub fn create_smart_collection(
+    conn: &Connection,
+    name: &str,
+    query_json: &str,
+) -> Result<i64, PhotonError> {
+    conn.execute(
+        "INSERT INTO smart_collections (name, query_json) VALUES (?1, ?2)",
+        params![name, query_json],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn update_smart_collection(
+    conn: &Connection,
+    id: i64,
+    name: &str,
+    query_json: &str,
+) -> Result<(), PhotonError> {
+    conn.execute(
+        "UPDATE smart_collections SET name = ?1, query_json = ?2 WHERE id = ?3",
+        params![name, query_json, id],
+    )?;
+    Ok(())
+}
+
+pub fn rename_smart_collection(
+    conn: &Connection,
+    id: i64,
+    new_name: &str,
+) -> Result<(), PhotonError> {
+    conn.execute(
+        "UPDATE smart_collections SET name = ?1 WHERE id = ?2",
+        params![new_name, id],
+    )?;
+    Ok(())
+}
+
+pub fn delete_smart_collection(conn: &Connection, id: i64) -> Result<(), PhotonError> {
+    conn.execute("DELETE FROM smart_collections WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+pub fn get_smart_collection(
+    conn: &Connection,
+    id: i64,
+) -> Result<Option<SmartCollection>, PhotonError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, query_json, created_at FROM smart_collections WHERE id = ?1",
+    )?;
+    let coll = stmt
+        .query_row(params![id], |row| {
+            Ok(SmartCollection {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                query_json: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })
+        .optional()?;
+    Ok(coll)
+}
+
+pub fn get_all_smart_collections(conn: &Connection) -> Result<Vec<SmartCollection>, PhotonError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, query_json, created_at FROM smart_collections ORDER BY name COLLATE NOCASE ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(SmartCollection {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            query_json: row.get(2)?,
+            created_at: row.get(3)?,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn count_smart_collection(conn: &Connection, query: &SmartQuery) -> Result<u32, PhotonError> {
+    let (where_sql, query_params) = build_smart_query_sql(query);
+    let sql = format!(
+        "SELECT COUNT(DISTINCT COALESCE(group_hash, 'id:' || id)) FROM images WHERE {}",
+        where_sql
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+        query_params.iter().map(|p| p.as_ref()).collect();
+    let count: u32 = stmt.query_row(params_refs.as_slice(), |r| r.get(0))?;
+    Ok(count)
+}
+
+pub fn get_all_smart_collections_with_counts(
+    conn: &Connection,
+) -> Result<Vec<(SmartCollection, u32)>, PhotonError> {
+    let collections = get_all_smart_collections(conn)?;
+    let mut result = Vec::with_capacity(collections.len());
+    for coll in collections {
+        let count = match serde_json::from_str::<SmartQuery>(&coll.query_json) {
+            Ok(sq) => count_smart_collection(conn, &sq).unwrap_or(0),
+            Err(e) => {
+                log::warn!("Smart collection {} ({}) can't be read: {e}", coll.id, coll.name);
+                0
+            }
+        };
+        result.push((coll, count));
+    }
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
 // Named events
 // ---------------------------------------------------------------------------
 
@@ -1615,6 +2028,9 @@ pub fn update_from_xmp(
     if let Some(o) = orientation {
         tx.execute("UPDATE images SET orientation = ?1 WHERE id = ?2", params![o as u16, id])?;
     }
+    if let Some(cl) = xmp.color_label {
+        tx.execute("UPDATE images SET color_label = ?1 WHERE id = ?2", params![cl.as_i32(), id])?;
+    }
     tx.execute("UPDATE images SET xmp_mtime = ?1 WHERE id = ?2", params![xmp_mtime, id])?;
 
     // The sidecar has all of the photo's tags (every tag change in Photon is
@@ -1706,6 +2122,163 @@ pub fn get_export_presets(conn: &Connection) -> Result<Vec<(i64, String, String)
 pub fn delete_export_preset(conn: &Connection, id: i64) -> Result<(), PhotonError> {
     conn.execute("DELETE FROM export_presets WHERE id = ?1", params![id])?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Image Quality (AI-7)
+// ---------------------------------------------------------------------------
+
+/// Upsert quality scores for an image.
+pub fn save_image_quality(conn: &Connection, q: &ImageQuality) -> Result<(), PhotonError> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO image_quality (
+            image_id, sharpness, sharpness_global, clip_shadows, clip_highlights,
+            mean_luma, quality_version, computed_at, faces, eye_sharpness
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        ON CONFLICT(image_id) DO UPDATE SET
+            sharpness = excluded.sharpness,
+            sharpness_global = excluded.sharpness_global,
+            clip_shadows = excluded.clip_shadows,
+            clip_highlights = excluded.clip_highlights,
+            mean_luma = excluded.mean_luma,
+            quality_version = excluded.quality_version,
+            computed_at = excluded.computed_at,
+            faces = excluded.faces,
+            eye_sharpness = excluded.eye_sharpness",
+    )?;
+    stmt.execute(params![
+        q.image_id,
+        q.sharpness,
+        q.sharpness_global,
+        q.clip_shadows,
+        q.clip_highlights,
+        q.mean_luma,
+        q.quality_version,
+        q.computed_at,
+        q.faces,
+        q.eye_sharpness,
+    ])?;
+    Ok(())
+}
+
+/// An `image_quality` row selected as `image_id, sharpness, sharpness_global,
+/// clip_shadows, clip_highlights, mean_luma, quality_version, computed_at,
+/// faces, eye_sharpness`.
+fn quality_from_row(r: &rusqlite::Row) -> rusqlite::Result<ImageQuality> {
+    Ok(ImageQuality {
+        image_id: r.get(0)?,
+        sharpness: r.get(1)?,
+        sharpness_global: r.get(2)?,
+        clip_shadows: r.get(3)?,
+        clip_highlights: r.get(4)?,
+        mean_luma: r.get(5)?,
+        quality_version: r.get(6)?,
+        computed_at: r.get(7)?,
+        faces: r.get(8)?,
+        eye_sharpness: r.get(9)?,
+    })
+}
+
+/// Retrieve quality scores for a single image by id.
+pub fn get_image_quality(conn: &Connection, image_id: i64) -> Result<Option<ImageQuality>, PhotonError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT image_id, sharpness, sharpness_global, clip_shadows, clip_highlights,
+                mean_luma, quality_version, computed_at, faces, eye_sharpness
+         FROM image_quality WHERE image_id = ?1",
+    )?;
+    let q = stmt
+        .query_row(params![image_id], |r| {
+            quality_from_row(r)
+        })
+        .optional()?;
+    Ok(q)
+}
+
+/// The eye sharpness of every photo with a face scored with `version`.
+pub fn library_eye_sharpness(conn: &Connection, version: i32) -> Result<Vec<f64>, PhotonError> {
+    let mut stmt = conn.prepare(
+        "SELECT eye_sharpness FROM image_quality WHERE quality_version = ?1 AND eye_sharpness IS NOT NULL",
+    )?;
+    let values = stmt.query_map(params![version], |r| r.get(0))?.collect::<Result<Vec<f64>, _>>()?;
+    Ok(values)
+}
+
+/// The median sharpness of the library's photos scored with `version`, the
+/// reference for "blurred" outside bursts. `None` when nothing is scored.
+pub fn library_sharpness_median(conn: &Connection, version: i32) -> Result<Option<f64>, PhotonError> {
+    let result = conn.query_row(
+        "SELECT sharpness FROM image_quality WHERE quality_version = ?1 AND sharpness IS NOT NULL
+         ORDER BY sharpness
+         LIMIT 1 OFFSET (SELECT COUNT(*) FROM image_quality WHERE quality_version = ?1 AND sharpness IS NOT NULL) / 2",
+        params![version],
+        |r| r.get::<_, f64>(0),
+    );
+    match result {
+        Ok(v) => Ok(Some(v)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Retrieve quality scores for a batch of image IDs.
+pub fn get_image_quality_batch(
+    conn: &Connection,
+    image_ids: &[i64],
+) -> Result<std::collections::HashMap<i64, ImageQuality>, PhotonError> {
+    if image_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let mut map = std::collections::HashMap::with_capacity(image_ids.len());
+    for chunk in image_ids.chunks(500) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT image_id, sharpness, sharpness_global, clip_shadows, clip_highlights,
+                    mean_luma, quality_version, computed_at, faces, eye_sharpness
+             FROM image_quality WHERE image_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let rows = stmt.query_map(params_refs.as_slice(), |r| {
+            quality_from_row(r)
+        })?;
+        for row in rows {
+            let q = row?;
+            map.insert(q.image_id, q);
+        }
+    }
+    Ok(map)
+}
+
+/// Get images that lack quality scores or have scores older than `current_version`.
+/// Returns `(image_id, hash, path)`.
+/// Photos to (re)score: no score, or one older than `current_version`, or —
+/// with `need_faces`, once a face model is available — never checked for faces.
+pub fn get_unscored_images(
+    conn: &Connection,
+    current_version: i32,
+    need_faces: bool,
+) -> Result<Vec<(i64, String, PathBuf)>, PhotonError> {
+    let mut stmt = conn.prepare(
+        "SELECT i.id, i.hash, i.path
+         FROM images i
+         LEFT JOIN image_quality q ON i.id = q.image_id
+         WHERE i.hidden = 0
+           AND COALESCE(i.missing, 0) = 0
+           AND (q.quality_version IS NULL OR q.quality_version < ?1 OR (?2 AND q.faces IS NULL))
+           AND (i.format IS NULL OR i.format NOT LIKE 'VIDEO%')
+         ORDER BY COALESCE(i.created_at, i.imported_at) DESC, i.id DESC",
+    )?;
+    let rows = stmt.query_map(params![current_version, need_faces], |r| {
+        let id: i64 = r.get(0)?;
+        let hash: String = r.get(1)?;
+        let path_str: String = r.get(2)?;
+        Ok((id, hash, PathBuf::from(path_str)))
+    })?;
+    let mut res = Vec::new();
+    for row in rows {
+        res.push(row?);
+    }
+    Ok(res)
 }
 
 #[cfg(test)]
@@ -2149,5 +2722,208 @@ mod tests {
 
         delete_export_preset(&conn, id).unwrap();
         assert_eq!(names(&conn).len(), 3);
+    }
+
+    #[test]
+    fn a_shot_is_one_tile_with_its_jpg_as_cover() {
+        let t = |id: i64, group: Option<&str>, raw: bool| TimelineItem {
+            id,
+            group_hash: group.map(str::to_string),
+            is_raw: raw,
+            versions: 1,
+            ..Default::default()
+        };
+        // ORF listed first (same timestamp), then its JPG; a lone photo; an ORF-only shot.
+        let tiles = collapse_versions(vec![t(105, Some("b9df"), true), t(113, Some("b9df"), false), t(7, None, false), t(9, Some("c0"), true)]);
+        let ids: Vec<i64> = tiles.iter().map(|t| t.id).collect();
+        assert_eq!(ids, [113, 7, 9], "the JPG covers its shot, in the shot's place");
+        assert_eq!((tiles[0].versions, tiles[0].has_raw_version), (2, true));
+        assert_eq!(tiles[1].versions, 1);
+        assert_eq!((tiles[2].versions, tiles[2].has_raw_version), (1, false));
+    }
+
+    #[test]
+    fn image_quality_crud_and_unscored_queries() {
+        let db = Database::open_in_memory().unwrap();
+        let mut conn = db.pool.get().unwrap();
+        let img1 = Image::new(PathBuf::from("/p/test1.jpg"), "hash1".to_string(), 10);
+        let img2 = Image::new(PathBuf::from("/p/test2.jpg"), "hash2".to_string(), 10);
+        let (id1, id2) = {
+            let tx = conn.transaction().unwrap();
+            let id1 = insert_image(&tx, &img1).unwrap().unwrap();
+            let id2 = insert_image(&tx, &img2).unwrap().unwrap();
+            tx.commit().unwrap();
+            (id1, id2)
+        };
+
+        let unscored = get_unscored_images(&conn, 1, false).unwrap();
+        assert_eq!(unscored.len(), 2);
+
+        let q1 = ImageQuality {
+            image_id: id1,
+            sharpness: 120.5,
+            sharpness_global: 85.0,
+            clip_shadows: 0.01,
+            clip_highlights: 0.02,
+            mean_luma: 110.0,
+            quality_version: 1,
+            computed_at: 1700000000,
+            faces: Some(1),
+            eye_sharpness: Some(88.0),
+        };
+        save_image_quality(&conn, &q1).unwrap();
+
+        let fetched = get_image_quality(&conn, id1).unwrap();
+        assert_eq!(fetched, Some(q1.clone()));
+
+        let unscored_now = get_unscored_images(&conn, 1, false).unwrap();
+        assert_eq!(unscored_now.len(), 1);
+        assert_eq!(unscored_now[0].0, id2);
+
+        let batch = get_image_quality_batch(&conn, &[id1, id2]).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch.get(&id1), Some(&q1));
+
+        let blurred = timeline_items(&conn, &TimelineFilter::Blurred(50.0)).unwrap();
+        assert_eq!(blurred.len(), 0);
+
+        let sharp = timeline_items(&conn, &TimelineFilter::Blurred(150.0)).unwrap();
+        assert_eq!(sharp.len(), 1);
+        assert_eq!(sharp[0].id, id1);
+
+        // Median of the current version only: one score so far, then three.
+        assert_eq!(library_sharpness_median(&conn, 1).unwrap(), Some(120.5));
+        assert_eq!(library_sharpness_median(&conn, 2).unwrap(), None);
+        save_image_quality(&conn, &ImageQuality { image_id: id2, sharpness: 900.0, ..q1.clone() }).unwrap();
+        let img3 = Image::new(PathBuf::from("/p/test3.jpg"), "hash3".to_string(), 10);
+        let id3 = {
+            let tx = conn.transaction().unwrap();
+            let id = insert_image(&tx, &img3).unwrap().unwrap();
+            tx.commit().unwrap();
+            id
+        };
+        save_image_quality(&conn, &ImageQuality { image_id: id3, sharpness: 30.0, ..q1.clone() }).unwrap();
+        assert_eq!(library_sharpness_median(&conn, 1).unwrap(), Some(120.5));
+    }
+
+    #[test]
+    fn color_labels_crud_and_filters_work() {
+        let db = Database::open_in_memory().unwrap();
+        let mut conn = db.conn().unwrap();
+        insert(&mut conn, "img1.jpg", 1_700_000_000, (3, 2), 1);
+        insert(&mut conn, "img2.jpg", 1_700_000_100, (3, 2), 1);
+        insert(&mut conn, "img3.jpg", 1_700_000_200, (3, 2), 1);
+
+        let all = timeline_items(&conn, &TimelineFilter::All).unwrap();
+        let id1 = all.iter().find(|i| i.hash == "img1.jpg").unwrap().id;
+        let id2 = all.iter().find(|i| i.hash == "img2.jpg").unwrap().id;
+        let id3 = all.iter().find(|i| i.hash == "img3.jpg").unwrap().id;
+
+        // Set single color label
+        set_color_label(&conn, id1, ColorLabel::Red).unwrap();
+        let img1 = get_image(&conn, id1).unwrap().unwrap();
+        assert_eq!(img1.color_label, ColorLabel::Red);
+
+        // Batch set color labels
+        batch_set_color_label(&mut conn, &[id2, id3], ColorLabel::Yellow).unwrap();
+        let img2 = get_image(&conn, id2).unwrap().unwrap();
+        let img3 = get_image(&conn, id3).unwrap().unwrap();
+        assert_eq!(img2.color_label, ColorLabel::Yellow);
+        assert_eq!(img3.color_label, ColorLabel::Yellow);
+
+        // Filter timeline by ColorLabel
+        let red_items = timeline_items(&conn, &TimelineFilter::ColorLabel(ColorLabel::Red)).unwrap();
+        assert_eq!(red_items.len(), 1);
+        assert_eq!(red_items[0].id, id1);
+        assert_eq!(red_items[0].color_label, ColorLabel::Red);
+
+        let yellow_items = timeline_items(&conn, &TimelineFilter::ColorLabel(ColorLabel::Yellow)).unwrap();
+        assert_eq!(yellow_items.len(), 2);
+
+        // Smart search by label / color prefix
+        let search_red = timeline_items(&conn, &TimelineFilter::Search("label:red".into())).unwrap();
+        assert_eq!(search_red.len(), 1);
+        assert_eq!(search_red[0].id, id1);
+
+        let search_yellow = timeline_items(&conn, &TimelineFilter::Search("color:yellow".into())).unwrap();
+        assert_eq!(search_yellow.len(), 2);
+
+        // Timeline items with filters (color + rating)
+        set_rating(&conn, id2, 4).unwrap();
+        let rated_yellow = timeline_items_with_filters(
+            &conn,
+            &TimelineFilter::All,
+            RatingFilter::AtLeast(4),
+            None,
+            Some(ColorLabel::Yellow),
+        )
+        .unwrap();
+        assert_eq!(rated_yellow.len(), 1);
+        assert_eq!(rated_yellow[0].id, id2);
+    }
+
+    #[test]
+    fn smart_collections_crud_and_eval_work() {
+        let db = Database::open_in_memory().unwrap();
+        let mut conn = db.conn().unwrap();
+        insert(&mut conn, "c1.jpg", 1_700_000_000, (3, 2), 1);
+        insert(&mut conn, "c2.jpg", 1_700_000_100, (3, 2), 1);
+        insert(&mut conn, "c3.jpg", 1_700_000_200, (3, 2), 1);
+
+        let all = timeline_items(&conn, &TimelineFilter::All).unwrap();
+        let id1 = all.iter().find(|i| i.hash == "c1.jpg").unwrap().id;
+        let id2 = all.iter().find(|i| i.hash == "c2.jpg").unwrap().id;
+        let id3 = all.iter().find(|i| i.hash == "c3.jpg").unwrap().id;
+
+        // Tag c1 and c2 with 'nature'
+        let t_nature = create_tag(&conn, "nature", None).unwrap();
+        tag_image(&conn, id1, t_nature).unwrap();
+        tag_image(&conn, id2, t_nature).unwrap();
+
+        // Tag c2 with 'client-x'
+        let t_client = create_tag(&conn, "client-x", None).unwrap();
+        tag_image(&conn, id2, t_client).unwrap();
+
+        set_rating(&conn, id1, 5).unwrap();
+        set_rating(&conn, id2, 4).unwrap();
+        set_flag(&conn, id3, -1).unwrap(); // rejected
+
+        // Create smart query: min_rating >= 4, tag: nature, exclude_rejected
+        let query = SmartQuery {
+            min_rating: Some(4),
+            tags: vec!["nature".to_string()],
+            exclude_rejected: true,
+            ..Default::default()
+        };
+        let query_json = serde_json::to_string(&query).unwrap();
+
+        let sc_id = create_smart_collection(&conn, "Top Nature", &query_json).unwrap();
+        let sc = get_smart_collection(&conn, sc_id).unwrap().unwrap();
+        assert_eq!(sc.name, "Top Nature");
+
+        // Check evaluation via count
+        let count = count_smart_collection(&conn, &query).unwrap();
+        assert_eq!(count, 2);
+
+        // Check all smart collections with counts
+        let all_sc = get_all_smart_collections_with_counts(&conn).unwrap();
+        assert_eq!(all_sc.len(), 1);
+        assert_eq!(all_sc[0].1, 2);
+
+        // Test timeline filter by smart collection
+        let sc_items = timeline_items(&conn, &TimelineFilter::SmartCollection(sc_id)).unwrap();
+        assert_eq!(sc_items.len(), 2);
+        let sc_item_ids: Vec<i64> = sc_items.iter().map(|i| i.id).collect();
+        assert!(sc_item_ids.contains(&id1));
+        assert!(sc_item_ids.contains(&id2));
+        assert!(!sc_item_ids.contains(&id3));
+
+        // Rename
+        rename_smart_collection(&conn, sc_id, "Best Nature").unwrap();
+        assert_eq!(get_smart_collection(&conn, sc_id).unwrap().unwrap().name, "Best Nature");
+
+        // Delete
+        delete_smart_collection(&conn, sc_id).unwrap();
+        assert!(get_smart_collection(&conn, sc_id).unwrap().is_none());
     }
 }

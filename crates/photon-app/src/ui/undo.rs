@@ -26,6 +26,11 @@ pub enum UndoAction {
         previous: Vec<(i64, i32)>,
         new_flag: i32,
     },
+    ColorLabel {
+        /// (image_id, old_color_label)
+        previous: Vec<(i64, photon_core::models::ColorLabel)>,
+        new_color: photon_core::models::ColorLabel,
+    },
     Orientation {
         /// (image_id, old_orientation, image_hash)
         previous: Vec<(i64, Option<u16>, String)>,
@@ -103,6 +108,15 @@ impl UndoManager {
                     }
                     let n = previous.len();
                     Ok(format!("Undid: Flag change ({} photo{})", n, if n == 1 { "" } else { "s" }))
+                }
+                UndoAction::ColorLabel { previous, new_color: _ } => {
+                    let mut conn = db.conn()?;
+                    for &(id, old_c) in previous {
+                        queries::set_color_label(&mut conn, id, old_c)?;
+                        sync_color_label_xmp(&conn, id);
+                    }
+                    let n = previous.len();
+                    Ok(format!("Undid: Colour label change ({} photo{})", n, if n == 1 { "" } else { "s" }))
                 }
                 UndoAction::Orientation { previous, cw: _ } => {
                     let mut conn = db.conn()?;
@@ -231,6 +245,16 @@ impl UndoManager {
                     };
                     Ok(format!("Redid: Flag {} ({} photo{})", flag_name, n, if n == 1 { "" } else { "s" }))
                 }
+                UndoAction::ColorLabel { previous, new_color } => {
+                    let ids: Vec<i64> = previous.iter().map(|&(id, _)| id).collect();
+                    let mut conn = db.conn()?;
+                    queries::batch_set_color_label(&mut conn, &ids, *new_color)?;
+                    for &id in &ids {
+                        sync_color_label_xmp(&conn, id);
+                    }
+                    let n = ids.len();
+                    Ok(format!("Redid: Colour label {} ({} photo{})", new_color.display_name(), n, if n == 1 { "" } else { "s" }))
+                }
                 UndoAction::Orientation { previous, cw } => {
                     let mut conn = db.conn()?;
                     for &(id, old_o, ref hash) in previous {
@@ -326,6 +350,16 @@ fn sync_cull_xmp(conn: &rusqlite::Connection, id: i64) {
         let update = XmpUpdate {
             rating: Some(img.rating),
             rejected: Some(img.flagged == -1),
+            ..Default::default()
+        };
+        log_xmp_error(&img.path, write_image_xmp(conn, id, &img.path, &update));
+    }
+}
+
+fn sync_color_label_xmp(conn: &rusqlite::Connection, id: i64) {
+    if let Ok(Some(img)) = queries::get_image(conn, id) {
+        let update = XmpUpdate {
+            color_label: Some(img.color_label),
             ..Default::default()
         };
         log_xmp_error(&img.path, write_image_xmp(conn, id, &img.path, &update));

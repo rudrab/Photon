@@ -21,6 +21,11 @@ pub fn build_primary_menu() -> gio::MenuModel {
     view_section.append(Some("Refresh Library"), Some("win.refresh"));
     menu.append_section(None, &view_section);
 
+    // ── Tools Section (AI-7 Quality) ────────────────────
+    let tools_section = gio::Menu::new();
+    tools_section.append(Some("Analyse Photo Quality…"), Some("win.analyse_quality"));
+    menu.append_section(None, &tools_section);
+
     // ── Preferences & Shortcuts ─────────────────────────
     let prefs_section = gio::Menu::new();
     prefs_section.append(Some("Preferences"), Some("win.preferences"));

@@ -33,13 +33,12 @@ use gtk4::{
     PropagationPhase, Revealer, ScrolledWindow, SignalListItemFactory,
 };
 use photon_core::db::{queries, Database};
-use photon_core::models::{Image, TimelineItem};
+use photon_core::models::{ColorLabel, Image, TimelineItem};
 use photon_import::thumbnails::{thumb_path, ThumbSize};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
-use std::thread;
 use std::time::{Duration, Instant};
 
 /// Space between tiles and between rows, in logical pixels.
@@ -406,6 +405,16 @@ struct Inner {
     undo_manager: RefCell<Option<Rc<RefCell<crate::ui::undo::UndoManager>>>>,
     on_refresh: RefCell<Option<Rc<dyn Fn()>>>,
     on_start_slideshow: RefCell<Option<Rc<dyn Fn()>>>,
+    /// Tells the user something (a toast), e.g. that a change wasn't saved.
+    notify: RefCell<Option<Rc<dyn Fn(&str)>>>,
+}
+
+/// Which culling field a batch change sets, and to what.
+#[derive(Clone, Copy)]
+enum Cull {
+    Rating(i32),
+    Flag(i32),
+    Color(ColorLabel),
 }
 
 /// The virtualized timeline widget. Cheap to clone (shared handle).
@@ -544,6 +553,7 @@ impl Timeline {
             undo_manager: RefCell::new(None),
             on_refresh: RefCell::new(None),
             on_start_slideshow: RefCell::new(None),
+            notify: RefCell::new(None),
         });
 
         // Key controller for 2D keyboard navigation and multi-selection
@@ -751,7 +761,6 @@ impl Timeline {
     }
 
     /// Select all photos in the timeline.
-    #[allow(dead_code)]
     pub fn select_all(&self) {
         let n_items = self.inner.items.borrow().len();
         let mut sel = self.inner.selected_indices.borrow_mut();
@@ -827,6 +836,10 @@ impl Timeline {
         Inner::cull_flag(&self.inner, flag);
     }
 
+    pub fn cull_color_selected(&self, color: ColorLabel) {
+        Inner::cull_color(&self.inner, color);
+    }
+
     pub fn rotate_selected(&self, cw: bool) {
         Inner::rotate_selected(&self.inner, cw);
     }
@@ -853,6 +866,11 @@ impl Timeline {
 
     pub fn connect_start_slideshow(&self, f: impl Fn() + 'static) {
         *self.inner.on_start_slideshow.borrow_mut() = Some(Rc::new(f));
+    }
+
+    /// How to tell the user something (a toast).
+    pub fn set_notify(&self, f: impl Fn(&str) + 'static) {
+        *self.inner.notify.borrow_mut() = Some(Rc::new(f));
     }
 }
 
@@ -1027,7 +1045,7 @@ impl Inner {
 
                     if let Some(overlay) = frame.first_child().and_downcast::<Overlay>() {
                         if let Some(badges_box) = overlay.last_child().and_downcast::<GtkBox>() {
-                            rebuild_tile_badges(&badges_box, item.rating, item.flagged, item.is_video, item.duration.as_deref(), item.missing);
+                            rebuild_tile_badges(&badges_box, item);
                         }
                     }
                 }
@@ -1050,58 +1068,21 @@ impl Inner {
     }
 
     fn cull_rating(this: &Rc<Self>, rating: i32) {
-        let selected: Vec<usize> = {
-            let sel = this.selected_indices.borrow();
-            if sel.is_empty() {
-                if let Some(focus) = this.focused_index.get() {
-                    vec![focus]
-                } else {
-                    Vec::new()
-                }
-            } else {
-                sel.iter().copied().collect()
-            }
-        };
-        if selected.is_empty() {
-            return;
-        }
-
-        let mut ids = Vec::new();
-        let mut previous = Vec::new();
-        {
-            let mut items_clone = (**this.items.borrow()).clone();
-            for &idx in &selected {
-                if let Some(item) = items_clone.get_mut(idx) {
-                    previous.push((item.id, item.rating));
-                    item.rating = rating;
-                    ids.push(item.id);
-                }
-            }
-            *this.items.borrow_mut() = Rc::new(items_clone);
-        }
-
-        if let Some(um) = this.undo_manager.borrow().as_ref() {
-            um.borrow_mut().push(crate::ui::undo::UndoAction::Rating {
-                previous,
-                new_rating: rating,
-            });
-        }
-
-        Self::update_tile_styles(this);
-
-        if let Some(db) = this.db.borrow().as_ref() {
-            let db = db.clone();
-            thread::spawn(move || {
-                if let Ok(mut conn) = db.conn() {
-                    if queries::batch_set_rating(&mut conn, &ids, rating).is_ok() {
-                        sync_cull_to_xmp(&conn, &ids);
-                    }
-                }
-            });
-        }
+        Self::cull(this, Cull::Rating(rating));
     }
 
     fn cull_flag(this: &Rc<Self>, flag: i32) {
+        Self::cull(this, Cull::Flag(flag));
+    }
+
+    fn cull_color(this: &Rc<Self>, color: ColorLabel) {
+        Self::cull(this, Cull::Color(color));
+    }
+
+    /// Set the rating, flag, or colour label of the selection (or the focused photo). The
+    /// tiles change at once; if saving fails they change back and the user
+    /// is told, and nothing is added to the undo history.
+    fn cull(this: &Rc<Self>, change: Cull) {
         let selected: Vec<usize> = {
             let sel = this.selected_indices.borrow();
             if sel.is_empty() {
@@ -1118,39 +1099,101 @@ impl Inner {
             return;
         }
 
-        let mut ids = Vec::new();
+        // (photo id, old_rating, old_flag, old_color)
         let mut previous = Vec::new();
         {
             let mut items_clone = (**this.items.borrow()).clone();
             for &idx in &selected {
                 if let Some(item) = items_clone.get_mut(idx) {
-                    previous.push((item.id, item.flagged));
-                    item.flagged = flag;
-                    ids.push(item.id);
+                    let old_r = item.rating;
+                    let old_f = item.flagged;
+                    let old_c = item.color_label;
+                    match change {
+                        Cull::Rating(r) => item.rating = r,
+                        Cull::Flag(f) => item.flagged = f,
+                        Cull::Color(c) => item.color_label = c,
+                    };
+                    previous.push((item.id, old_r, old_f, old_c));
                 }
             }
             *this.items.borrow_mut() = Rc::new(items_clone);
         }
-
-        if let Some(um) = this.undo_manager.borrow().as_ref() {
-            um.borrow_mut().push(crate::ui::undo::UndoAction::Flag {
-                previous,
-                new_flag: flag,
-            });
-        }
-
         Self::update_tile_styles(this);
 
-        if let Some(db) = this.db.borrow().as_ref() {
-            let db = db.clone();
-            thread::spawn(move || {
-                if let Ok(mut conn) = db.conn() {
-                    if queries::batch_set_flag(&mut conn, &ids, flag).is_ok() {
-                        sync_cull_to_xmp(&conn, &ids);
+        let Some(db) = this.db.borrow().clone() else { return };
+        let ids: Vec<i64> = previous.iter().map(|&(id, _, _, _)| id).collect();
+        let weak = Rc::downgrade(this);
+        glib::spawn_future_local(async move {
+            // A tile is a shot: every file of it (RAW + JPG) gets the mark, so
+            // the hidden RAW isn't left unrated or unrejected. Undo restores
+            // each file's own previous value.
+            let saved = gio::spawn_blocking(move || -> Result<(Vec<(i64, i32)>, Vec<(i64, i32)>, Vec<(i64, ColorLabel)>), String> {
+                let mut conn = db.conn().map_err(|e| e.to_string())?;
+                let members = queries::shot_member_ids(&conn, &ids).map_err(|e| e.to_string())?;
+                let mut before_r = Vec::with_capacity(members.len());
+                let mut before_f = Vec::with_capacity(members.len());
+                let mut before_c = Vec::with_capacity(members.len());
+                for &id in &members {
+                    if let Some(img) = queries::get_image(&conn, id).map_err(|e| e.to_string())? {
+                        before_r.push((id, img.rating));
+                        before_f.push((id, img.flagged));
+                        before_c.push((id, img.color_label));
                     }
                 }
-            });
-        }
+                match change {
+                    Cull::Rating(r) => queries::batch_set_rating(&mut conn, &members, r),
+                    Cull::Flag(f) => queries::batch_set_flag(&mut conn, &members, f),
+                    Cull::Color(c) => queries::batch_set_color_label(&mut conn, &members, c),
+                }
+                .map_err(|e| e.to_string())?;
+                let fields = match change {
+                    Cull::Color(_) => XmpFields::COLOR,
+                    _ => XmpFields::CULL,
+                };
+                sync_cull_to_xmp(&conn, &members, fields);
+                Ok((before_r, before_f, before_c))
+            })
+            .await
+            .unwrap_or_else(|_| Err("the worker thread panicked".into()));
+
+            let Some(this) = weak.upgrade() else { return };
+            match saved {
+                Ok((before_r, before_f, before_c)) => {
+                    if let Some(um) = this.undo_manager.borrow().as_ref() {
+                        um.borrow_mut().push(match change {
+                            Cull::Rating(r) => crate::ui::undo::UndoAction::Rating { previous: before_r, new_rating: r },
+                            Cull::Flag(f) => crate::ui::undo::UndoAction::Flag { previous: before_f, new_flag: f },
+                            Cull::Color(c) => crate::ui::undo::UndoAction::ColorLabel { previous: before_c, new_color: c },
+                        });
+                    }
+                }
+                Err(e) => {
+                    let what = match change {
+                        Cull::Rating(_) => "rating",
+                        Cull::Flag(_) => "pick/reject flag",
+                        Cull::Color(_) => "colour label",
+                    };
+                    log::error!("Saving the {what} of {} photos: {e}", previous.len());
+                    let old: HashMap<i64, (i32, i32, ColorLabel)> =
+                        previous.into_iter().map(|(id, r, f, c)| (id, (r, f, c))).collect();
+                    let mut items = (**this.items.borrow()).clone();
+                    for item in items.iter_mut() {
+                        if let Some(&(r, f, c)) = old.get(&item.id) {
+                            match change {
+                                Cull::Rating(_) => item.rating = r,
+                                Cull::Flag(_) => item.flagged = f,
+                                Cull::Color(_) => item.color_label = c,
+                            }
+                        }
+                    }
+                    *this.items.borrow_mut() = Rc::new(items);
+                    Self::update_tile_styles(&this);
+                    if let Some(notify) = this.notify.borrow().as_ref() {
+                        notify(&format!("Couldn't save the {what}: {e}"));
+                    }
+                }
+            }
+        });
     }
 
     fn rotate_selected(this: &Rc<Self>, cw: bool) {
@@ -1605,6 +1648,34 @@ impl Inner {
                 }
                 glib::Propagation::Stop
             }
+            gdk::Key::_6 | gdk::Key::KP_6 | gdk::Key::asciicircum => {
+                Self::cull_color(this, ColorLabel::Red);
+                if is_shift {
+                    Self::advance_focus(this);
+                }
+                glib::Propagation::Stop
+            }
+            gdk::Key::_7 | gdk::Key::KP_7 | gdk::Key::ampersand => {
+                Self::cull_color(this, ColorLabel::Yellow);
+                if is_shift {
+                    Self::advance_focus(this);
+                }
+                glib::Propagation::Stop
+            }
+            gdk::Key::_8 | gdk::Key::KP_8 | gdk::Key::asterisk => {
+                Self::cull_color(this, ColorLabel::Green);
+                if is_shift {
+                    Self::advance_focus(this);
+                }
+                glib::Propagation::Stop
+            }
+            gdk::Key::_9 | gdk::Key::KP_9 | gdk::Key::parenleft => {
+                Self::cull_color(this, ColorLabel::Blue);
+                if is_shift {
+                    Self::advance_focus(this);
+                }
+                glib::Propagation::Stop
+            }
             gdk::Key::_0 | gdk::Key::KP_0 | gdk::Key::parenright | gdk::Key::grave | gdk::Key::asciitilde => {
                 Self::cull_rating(this, 0);
                 if is_shift {
@@ -1886,7 +1957,7 @@ impl Inner {
         badges_box.set_valign(Align::End);
         badges_box.set_halign(Align::Start);
         badges_box.set_can_target(false);
-        rebuild_tile_badges(&badges_box, item.rating, item.flagged, item.is_video, item.duration.as_deref(), item.missing);
+        rebuild_tile_badges(&badges_box, item);
         overlay.add_overlay(&badges_box);
 
         // Shown on hover, while selecting, and on selected tiles (CSS).
@@ -2057,15 +2128,18 @@ fn clear_children(container: &GtkBox) {
     }
 }
 
-fn rebuild_tile_badges(
-    badges_box: &GtkBox,
-    rating: i32,
-    flagged: i32,
-    is_video: bool,
-    duration: Option<&str>,
-    missing: bool,
-) {
+fn rebuild_tile_badges(badges_box: &GtkBox, item: &TimelineItem) {
+    let (rating, flagged, is_video, duration, missing) =
+        (item.rating, item.flagged, item.is_video, item.duration.as_deref(), item.missing);
     clear_children(badges_box);
+    if item.versions > 1 {
+        // One tile per shot: say what else is in it.
+        let text = if item.has_raw_version { "RAW+JPG".to_string() } else { format!("{} versions", item.versions) };
+        let label = Label::new(Some(&text));
+        label.add_css_class("photon-tile-badge");
+        label.set_tooltip_text(Some("One shot, several files: open it to switch between them"));
+        badges_box.append(&label);
+    }
     if missing {
         let missing_label = Label::new(Some("⚠ Offline"));
         missing_label.add_css_class("photon-tile-badge");
@@ -2081,6 +2155,12 @@ fn rebuild_tile_badges(
         video_label.add_css_class("photon-tile-badge");
         video_label.add_css_class("photon-tile-video-badge");
         badges_box.append(&video_label);
+    }
+    if item.color_label != ColorLabel::None {
+        let dot = crate::ui::selection_bar::label_dot(item.color_label);
+        dot.add_css_class("photon-tile-badge");
+        dot.set_tooltip_text(Some(item.color_label.display_name()));
+        badges_box.append(&dot);
     }
     if rating > 0 {
         let star_label = Label::new(Some(&format!("★ {}", rating)));
@@ -2312,20 +2392,42 @@ mod tests {
     }
 }
 
+/// Which culling fields a sidecar write carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct XmpFields {
+    /// Rating and reject.
+    pub cull: bool,
+    pub color: bool,
+}
+
+impl XmpFields {
+    pub const CULL: Self = Self { cull: true, color: false };
+    pub const COLOR: Self = Self { cull: false, color: true };
+}
+
 /// Write the rating and reject state of photos `ids`, as the library now has
 /// them, into their XMP sidecars, so darktable and others see grid culling too.
-fn sync_cull_to_xmp(conn: &rusqlite::Connection, ids: &[i64]) {
+/// Write the photos' rating and reject state to their XMP sidecars. Returns
+/// how many couldn't be written (each is logged).
+///
+/// Only the fields in `fields` are written: a rating change must not rewrite
+/// a colour label (the library may not know darktable's), nor the reverse.
+pub(crate) fn sync_cull_to_xmp(conn: &rusqlite::Connection, ids: &[i64], fields: XmpFields) -> usize {
+    let mut failed = 0;
     for &id in ids {
         let Ok(Some(image)) = queries::get_image(conn, id) else { continue };
         let update = photon_import::XmpUpdate {
-            rating: Some(image.rating),
-            rejected: Some(image.flagged == -1),
+            rating: fields.cull.then_some(image.rating),
+            rejected: fields.cull.then_some(image.flagged == -1),
+            color_label: fields.color.then_some(image.color_label),
             ..Default::default()
         };
         if let Err(e) = photon_import::write_image_xmp(conn, id, &image.path, &update) {
             log::warn!("Writing XMP for {}: {e}", image.path.display());
+            failed += 1;
         }
     }
+    failed
 }
 
 /// Write updated EXIF orientation of photos into their XMP sidecars.

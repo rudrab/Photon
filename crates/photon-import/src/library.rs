@@ -77,11 +77,17 @@ pub fn library_root(destination: Option<&Path>) -> PathBuf {
 /// The copy is always flushed to disk. With `verify`, it is also read back
 /// from the disk (not the page cache) and must match what was read from `src`.
 pub fn stage_copy(src: &Path, dest: &Path, verify: bool) -> io::Result<Staged> {
+    stage_with(dest, verify, |part| copy_hashing(src, part))
+}
+
+/// [`stage_copy`] with the copying step given: `copy` writes the part file
+/// and returns the content hash.
+fn stage_with(dest: &Path, verify: bool, copy: impl FnOnce(&Path) -> io::Result<String>) -> io::Result<Staged> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
     let part = partial_path(dest);
-    let result = copy_hashing(src, &part).and_then(|hash| {
+    let result = copy(&part).and_then(|hash| {
         if verify {
             verify_copy(&part, &hash)?;
         }
@@ -124,24 +130,35 @@ impl Drop for Staged {
 }
 
 fn copy_hashing(src: &Path, dest: &Path) -> io::Result<String> {
-    let mut reader = File::open(src)?;
+    let writer = copy_hashing_from(File::open(src)?, dest)?;
+    // Keep the camera's timestamps on the copy.
+    if let Ok(mtime) = fs::metadata(src).and_then(|m| m.modified()) {
+        let _ = writer.0.set_modified(mtime);
+    }
+    writer.0.sync_all()?;
+    Ok(writer.1)
+}
+
+/// Copy everything `reader` gives into a new file `dest`, hashing it on the
+/// way. A read error (a card pulled out) is returned as is; the caller
+/// removes the incomplete file.
+fn copy_hashing_from(mut reader: impl Read, dest: &Path) -> io::Result<(File, String)> {
     let mut writer = File::create(dest)?;
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; 1024 * 1024];
     loop {
-        let n = reader.read(&mut buf)?;
+        let n = match reader.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
         writer.write_all(&buf[..n])?;
     }
-    // Keep the camera's timestamps on the copy.
-    if let Ok(mtime) = fs::metadata(src).and_then(|m| m.modified()) {
-        let _ = writer.set_modified(mtime);
-    }
-    writer.sync_all()?;
-    Ok(hasher.finalize().to_hex().to_string())
+    Ok((writer, hasher.finalize().to_hex().to_string()))
 }
 
 /// Check that `path`, as stored on disk, has content hash `expected`.
@@ -266,6 +283,42 @@ pub fn back_up(file: &Path, hash: &str, library_root: &Path, backup_root: &Path)
         ));
     }
     staged.commit()
+}
+
+/// Delete `.photon-part` files left by an import that was killed mid-copy:
+/// under each of `roots` (walked recursively) and directly in each of
+/// `dirs`. Only files last written before `started` (this run's start) go,
+/// so a copy an import is making right now is never touched.
+///
+/// Safe because a part file is never the only copy of anything: a move
+/// deletes its source only after the copy was renamed to its final name.
+/// Returns the files removed.
+pub fn sweep_partial_files(roots: &[PathBuf], dirs: &[PathBuf], started: std::time::SystemTime) -> Vec<PathBuf> {
+    let walks = roots
+        .iter()
+        .map(|root| walkdir::WalkDir::new(root))
+        .chain(dirs.iter().map(|dir| walkdir::WalkDir::new(dir).max_depth(1)));
+    let mut removed = Vec::new();
+    for walk in walks {
+        for entry in walk.follow_links(false).into_iter().filter_map(Result::ok) {
+            let is_part = entry.file_type().is_file()
+                && entry.file_name().to_string_lossy().ends_with(".photon-part");
+            if !is_part {
+                continue;
+            }
+            let stale = entry.metadata().ok().and_then(|m| m.modified().ok()).is_some_and(|t| t < started);
+            if !stale {
+                continue;
+            }
+            match fs::remove_file(entry.path()) {
+                Ok(()) => removed.push(entry.path().to_path_buf()),
+                // Already gone: `roots` and `dirs` may overlap.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => log::warn!("Removing incomplete copy {}: {e}", entry.path().display()),
+            }
+        }
+    }
+    removed
 }
 
 fn partial_path(dest: &Path) -> PathBuf {
@@ -433,6 +486,72 @@ mod tests {
         fs::write(&file, b"changed").unwrap();
         assert!(back_up(&file, &hash, &lib, &backup).is_err());
         assert!(!copy.exists());
+    }
+
+    /// A card reader that gives `ok` bytes, then fails like a pulled card.
+    struct PulledCard {
+        ok: usize,
+    }
+
+    impl Read for PulledCard {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.ok == 0 {
+                return Err(io::Error::new(io::ErrorKind::Other, "No such device"));
+            }
+            let n = buf.len().min(self.ok);
+            buf[..n].fill(0xAB);
+            self.ok -= n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn card_pulled_mid_copy_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("lib/2024/05/01/IMG_1.ORF");
+
+        let result = stage_with(&dest, true, |part| {
+            copy_hashing_from(PulledCard { ok: 3 * 1024 * 1024 + 17 }, part).map(|(_, hash)| hash)
+        });
+
+        let err = result.err().expect("the copy must fail");
+        assert_eq!(err.to_string(), "No such device");
+        assert!(!dest.exists(), "no file under the final name");
+        let left: Vec<_> = fs::read_dir(dest.parent().unwrap()).unwrap().collect();
+        assert!(left.is_empty(), "no partial file either: {left:?}");
+    }
+
+    #[test]
+    fn sweep_removes_only_stale_part_files() {
+        use std::time::{Duration, SystemTime};
+        let dir = tempfile::tempdir().unwrap();
+        let (lib, backup, in_place) = (dir.path().join("lib"), dir.path().join("backup"), dir.path().join("pics"));
+        for d in [lib.join("2024/05/01"), backup.join("2024/05/01"), in_place.join("sub")] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let started = SystemTime::now();
+        let old = started - Duration::from_secs(3600);
+        let file = |path: PathBuf, mtime: SystemTime| {
+            File::create(&path).unwrap().set_modified(mtime).unwrap();
+            path
+        };
+
+        let stale_lib = file(lib.join("2024/05/01/IMG_1.ORF.photon-part"), old);
+        let stale_backup = file(backup.join("2024/05/01/IMG_1.ORF.photon-part"), old);
+        let stale_flat = file(in_place.join("IMG_2.jpg.photon-part"), old);
+        // Being written by an import running now.
+        let fresh = file(lib.join("2024/05/01/IMG_3.ORF.photon-part"), started + Duration::from_secs(1));
+        // A photo, and a part file below a folder that is only checked flat.
+        let photo = file(lib.join("2024/05/01/IMG_1.ORF"), old);
+        let nested = file(in_place.join("sub/IMG_4.jpg.photon-part"), old);
+
+        let mut removed = sweep_partial_files(&[lib, backup], &[in_place], started);
+        removed.sort();
+        let mut expected = vec![stale_lib, stale_backup, stale_flat];
+        expected.sort();
+        assert_eq!(removed, expected);
+        assert!(expected.iter().all(|p| !p.exists()));
+        assert!(fresh.exists() && photo.exists() && nested.exists());
     }
 
     #[test]

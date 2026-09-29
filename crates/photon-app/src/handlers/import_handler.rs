@@ -737,9 +737,8 @@ fn run_import(
                     current_file,
                 } => {
                     mw.progress_bar.set_fraction(processed as f64 / total.max(1) as f64);
-                    mw.progress_bar.set_text(Some(&format!("{processed} / {total}")));
                     mw.status_label.set_text(&format!(
-                        "Importing — {imported} new so far · {current_file}"
+                        "Importing {processed} of {total} — {imported} new so far · {current_file}"
                     ));
                 }
                 ImportProgress::Committed { imported: n } => {

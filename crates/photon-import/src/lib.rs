@@ -12,13 +12,19 @@ pub mod export;
 pub mod sidecar;
 pub mod sources;
 pub mod thumbnails;
+pub mod quality;
 
 #[cfg(test)]
 mod testutil;
 
 pub use engine::{ImportConfig, ImportEngine};
 pub use export::{batch_export, export_single, ExportConfig, ExportFormat, ExportReport, ExportResize};
-pub use sidecar::{read_image_xmp, sync_xmp_metadata, write_image_xmp, Keywords, XmpUpdate};
+pub use quality::{
+    compute_quality, find_bursts, suggest_rejects, Burst, BurstItem, QualityScore, RejectSuggestion,
+    BLUR_SHARPNESS_FLOOR, BURST_SHARPNESS_REJECT_RATIO, HIGHLIGHT_CLIP_REJECT_THRESHOLD,
+    QUALITY_LONG_EDGE, QUALITY_VERSION,
+};
+pub use sidecar::{read_image_xmp, reconcile_shots, sync_xmp_metadata, write_image_xmp, Keywords, XmpUpdate};
 pub use sources::{DiskSource, ImportSource};
 pub use thumbnails::{compute_histogram, HistogramData};
 pub mod icc;

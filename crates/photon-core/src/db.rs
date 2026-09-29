@@ -111,14 +111,167 @@ impl Database {
         std::fs::rename(&part, &dest)?;
 
         backups.push((dest.clone(), SystemTime::now()));
-        let excess = backups.len().saturating_sub(keep.max(1));
-        for (old, _) in backups.drain(..excess) {
-            if let Err(e) = std::fs::remove_file(&old) {
-                log::warn!("Removing old backup {}: {e}", old.display());
-            }
-        }
+        rotate(backups, keep);
         Ok(BackupOutcome::Saved(dest))
     }
+}
+
+/// Remove the oldest of `backups` (oldest first) beyond `keep`.
+fn rotate(mut backups: Vec<(PathBuf, SystemTime)>, keep: usize) {
+    let excess = backups.len().saturating_sub(keep.max(1));
+    for (old, _) in backups.drain(..excess) {
+        if let Err(e) = std::fs::remove_file(&old) {
+            log::warn!("Removing old backup {}: {e}", old.display());
+        }
+    }
+}
+
+/// A saved copy of the library database, as listed for a restore.
+#[derive(Debug, Clone)]
+pub struct CatalogBackup {
+    pub path: PathBuf,
+    pub modified: SystemTime,
+    pub size: u64,
+    /// How many photos it holds; `None` if it can't be read (damaged, or
+    /// not a Photon library).
+    pub photos: Option<i64>,
+}
+
+/// The backups in `dir`, newest first.
+pub fn catalog_backups(dir: &Path) -> Result<Vec<CatalogBackup>, PhotonError> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut list: Vec<CatalogBackup> = list_backups(dir)?
+        .into_iter()
+        .map(|(path, modified)| CatalogBackup {
+            size: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+            photos: count_photos(&path).ok(),
+            path,
+            modified,
+        })
+        .collect();
+    list.reverse();
+    Ok(list)
+}
+
+/// Open a backup for reading only, without creating `-wal`/`-shm` files
+/// next to it (it may be on a read-only or slow disk).
+fn open_backup(path: &Path) -> Result<Connection, PhotonError> {
+    let escaped = path.to_string_lossy().replace('%', "%25").replace('?', "%3f").replace('#', "%23");
+    Ok(Connection::open_with_flags(
+        format!("file:{escaped}?immutable=1"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?)
+}
+
+fn count_photos(path: &Path) -> Result<i64, PhotonError> {
+    Ok(open_backup(path)?.query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))?)
+}
+
+/// Copy the newest backup in `dir` to `mirror` (meant to be another disk),
+/// unless it is already there, and keep the newest `keep` copies there.
+/// Returns the copy made, if one was.
+pub fn mirror_newest_backup(dir: &Path, mirror: &Path, keep: usize) -> Result<Option<PathBuf>, PhotonError> {
+    let Some((newest, _)) = list_backups(dir)?.pop() else { return Ok(None) };
+    let name = newest.file_name().unwrap_or_default().to_os_string();
+    std::fs::create_dir_all(mirror)?;
+    let dest = mirror.join(&name);
+    if dest.exists() {
+        return Ok(None);
+    }
+    let mut part = dest.clone().into_os_string();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    std::fs::copy(&newest, &part)?;
+    std::fs::File::open(&part)?.sync_all()?;
+    std::fs::rename(&part, &dest)?;
+    rotate(list_backups(mirror)?, keep);
+    Ok(Some(dest))
+}
+
+/// Where a restore waits for the next start.
+fn staged_restore_path(db_path: &Path) -> PathBuf {
+    let mut p = db_path.as_os_str().to_owned();
+    p.push(".restore");
+    PathBuf::from(p)
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(suffix);
+    PathBuf::from(p)
+}
+
+/// Check `backup` and place a copy of it next to the library database
+/// `db_path`, to replace it at the next start ([`apply_staged_restore`]).
+/// Done this way because the running app's open connections can't safely
+/// have the file swapped under them.
+pub fn stage_restore(backup: &Path, db_path: &Path) -> Result<(), PhotonError> {
+    let staged = staged_restore_path(db_path);
+    let part = with_suffix(&staged, ".part");
+    std::fs::copy(backup, &part)?;
+    // Check the copy that will be used, not the original. (Read-write: the
+    // check of the full-text index needs it.)
+    let checked = check_library_file(&part).and_then(|()| Ok(std::fs::File::open(&part)?.sync_all()?));
+    if let Err(e) = checked {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
+    std::fs::rename(&part, &staged)?;
+    Ok(())
+}
+
+/// SQLite's integrity check passes and the file is a Photon library.
+fn check_library_file(path: &Path) -> Result<(), PhotonError> {
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    let problems: Vec<String> = conn
+        .prepare("PRAGMA quick_check")
+        .and_then(|mut stmt| stmt.query_map([], |r| r.get(0))?.collect())
+        .map_err(|e| PhotonError::Other(format!("The backup can't be read: {e}")))?;
+    if problems != ["ok"] {
+        return Err(PhotonError::Other(format!("The backup is damaged: {}", problems.join("; "))));
+    }
+    conn.query_row("SELECT COUNT(*) FROM images", [], |r| r.get::<_, i64>(0))
+        .map_err(|e| PhotonError::Other(format!("Not a Photon library: {e}")))?;
+    // Leave no -wal/-shm behind (the file is renamed next).
+    conn.execute_batch("PRAGMA journal_mode = DELETE;")?;
+    Ok(())
+}
+
+/// Whether a restore is waiting for the next start.
+pub fn restore_pending(db_path: &Path) -> bool {
+    staged_restore_path(db_path).exists()
+}
+
+/// At startup, before [`Database::open`]: if a restore was staged, put it in
+/// place of the library database `db_path`. The current database — with
+/// its `-wal` and `-shm` files, which hold its latest changes — is first
+/// copied to a new `before-restore-…` folder in `keep_dir`, and nothing is
+/// replaced unless that copy succeeded. Returns that folder.
+pub fn apply_staged_restore(db_path: &Path, keep_dir: &Path) -> Result<Option<PathBuf>, PhotonError> {
+    let staged = staged_restore_path(db_path);
+    if !staged.exists() {
+        return Ok(None);
+    }
+    let kept = keep_dir.join(chrono::Local::now().format("before-restore-%Y%m%d-%H%M%S").to_string());
+    std::fs::create_dir_all(&kept)?;
+    let files: Vec<PathBuf> =
+        ["", "-wal", "-shm"].iter().map(|s| with_suffix(db_path, s)).filter(|f| f.exists()).collect();
+    for file in &files {
+        let copy = kept.join(file.file_name().unwrap_or_default());
+        std::fs::copy(file, &copy)?;
+        std::fs::File::open(&copy)?.sync_all()?;
+    }
+    // The old WAL must not be replayed into the restored database.
+    for suffix in ["-wal", "-shm"] {
+        let f = with_suffix(db_path, suffix);
+        if f.exists() {
+            std::fs::remove_file(&f)?;
+        }
+    }
+    std::fs::rename(&staged, db_path)?;
+    Ok(Some(kept))
 }
 
 /// What [`Database::back_up`] did.
@@ -164,6 +317,70 @@ mod tests {
                 assert_eq!(fk, 1);
             }
         }
+    }
+
+    #[test]
+    fn newest_backup_is_mirrored_once_and_rotated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("photon.db")).unwrap();
+        let (backups, mirror) = (dir.path().join("backups"), dir.path().join("other disk/Photon Catalog Backups"));
+
+        assert_eq!(mirror_newest_backup(&backups, &mirror, 2).ok(), None, "no backups dir yet");
+        let BackupOutcome::Saved(first) = db.back_up(&backups, 5, Duration::ZERO).unwrap() else { panic!() };
+        let copy = mirror_newest_backup(&backups, &mirror, 2).unwrap().expect("mirrored");
+        assert_eq!(std::fs::read(&copy).unwrap(), std::fs::read(&first).unwrap());
+        assert_eq!(mirror_newest_backup(&backups, &mirror, 2).unwrap(), None, "already there");
+
+        for stamp in ["20200101-000000", "20210101-000000"] {
+            std::fs::write(mirror.join(format!("photon-{stamp}.db")), b"old").unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(1100));
+        db.back_up(&backups, 5, Duration::ZERO).unwrap();
+        mirror_newest_backup(&backups, &mirror, 2).unwrap().expect("the new one");
+        let listed = catalog_backups(&mirror).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|b| b.photos == Some(0)), "{listed:?}");
+        assert!(listed[0].path > listed[1].path, "newest first");
+    }
+
+    #[test]
+    fn a_staged_restore_replaces_the_database_at_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("photon.db");
+        let backups = dir.path().join("backups");
+        let tags = |db: &Database| -> Vec<String> {
+            let conn = db.conn().unwrap();
+            let mut stmt = conn.prepare("SELECT name FROM tags ORDER BY name").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+        };
+
+        let db = Database::open(&db_path).unwrap();
+        db.conn().unwrap().execute("INSERT INTO tags (name) VALUES ('before')", []).unwrap();
+        let BackupOutcome::Saved(backup) = db.back_up(&backups, 5, Duration::ZERO).unwrap() else { panic!() };
+        db.conn().unwrap().execute("INSERT INTO tags (name) VALUES ('after')", []).unwrap();
+
+        // Garbage is refused, and nothing is staged.
+        let junk = dir.path().join("photon-20200101-000000.db");
+        std::fs::write(&junk, b"not a database").unwrap();
+        assert!(stage_restore(&junk, &db_path).is_err());
+        assert!(!restore_pending(&db_path));
+
+        stage_restore(&backup, &db_path).unwrap();
+        assert!(restore_pending(&db_path));
+        assert_eq!(tags(&db), ["after", "before"], "nothing changes while running");
+        drop(db);
+
+        let kept = apply_staged_restore(&db_path, &backups).unwrap().expect("applied");
+        assert!(!restore_pending(&db_path));
+        let db = Database::open(&db_path).unwrap();
+        assert_eq!(tags(&db), ["before"]);
+
+        // The replaced database is kept, with its latest change.
+        let old = Database::open(&kept.join("photon.db")).unwrap();
+        assert_eq!(tags(&old), ["after", "before"]);
+        // Not listed as a backup to restore.
+        assert_eq!(catalog_backups(&backups).unwrap().len(), 1);
+        assert_eq!(apply_staged_restore(&db_path, &backups).unwrap(), None);
     }
 
     #[test]
