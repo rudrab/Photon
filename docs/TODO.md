@@ -44,6 +44,12 @@ Useful tools installed on the dev machine: `xmllint`, `exiv2`, `darktable-cli`,
 - UI changes can't be fully verified headless: say so in the report, and list
   what the user should click through.
 - The maintainer commits. Don't commit unless asked.
+- **Open source only.** Every dependency, runtime and ML model must be under an
+  OSI-approved licence (MIT, Apache-2.0, BSD, GPL/LGPL, MPL…). Model *weights*
+  count: "research only", "non-commercial" or custom-restricted weights are out,
+  even when the code is MIT. No proprietary GPU stacks (CUDA, TensorRT) by
+  default (see AI-0). Hardware firmware from linux-firmware (GPU GuC/HuC, NPU)
+  is accepted: it is needed to run the hardware at all.
 - Schema changes go in a new numbered migration in `db/schema.rs` (never edit
   an applied one). New `Preferences` fields need `#[serde(default)]`.
 - When you finish or start a task, update its status marker (see the legend below).
@@ -77,6 +83,9 @@ Useful tools installed on the dev machine: `xmllint`, `exiv2`, `darktable-cli`,
    id when the tag already exists).
 
 ### Done (2026-09-29) — don't redo
+
+- Phase 1 (harden): PART 3 bugs, R-13, R-14. See those tasks for what and where.
+  P-0's hand checks are the user's.
 
 - Continuous zoom in the 1-up viewer (`ui/photo_view.rs`, see R-16). The viewer's
   hidden info-panel revealer must keep `hexpand(false)`: its entries expand, and
@@ -346,26 +355,31 @@ Ordered by importance. R-1 to R-4 are the minimum before recommending Photon for
 - 🟢 Show `ExportReport.errors` to the user via UI dialog, including "RAW fell back to embedded preview" warnings.
 - 🟢 Don't overwrite an existing export silently: add a suffix (`_2`, `_3`).
 
-### 🔴 R-5 · Collections and smart collections · M — builds on P-4
+### 🟢 R-5 · Collections and smart collections · M — builds on P-4
 
-- Smart collection = a saved `LibraryQuery` (`models.rs`), e.g. "★≥4 AND tag:client-x AND not rejected AND date in 2026".
-- Store the query as JSON, and evaluate it live in the sidebar with a count.
+- Smart collection = a saved `LibraryQuery` / `SmartQuery` (`models.rs`), e.g. "★≥4 AND tag:client-x AND not rejected AND date in 2026".
+- Store the query as JSON in `smart_collections` table (migration 017), and evaluate it live in the sidebar with a dynamic count badge.
+- Full UI: Smart Collections section in sidebar with "+" creation dialog, context menu (Edit Rules, Rename, Delete), and timeline filtering via `TimelineFilter::SmartCollection(id)`.
 
-### 🔴 R-6 · Colour labels · S
+### 🟢 R-6 · Colour labels · S
 
-- Red, yellow, green, blue, purple; keys 6–9 (as in Lightroom and Bridge).
-- DB column `color_label`.
-- XMP: `xmp:Label="Red"` (Lightroom/Bridge/digiKam) **and** `darktable:colorlabels` (a `rdf:Seq` of 0–4).
-- Note that the merge code currently deletes `xmp:Label` only when it's "Pick" or "Reject" (legacy Photon values): keep that.
-- Read labels back from XMP (moved here from R-1): `XmpReadResult` + `queries::update_from_xmp`.
-- Add a filter in the header's filter popover.
+- Red, Yellow, Green, Blue, Purple; keys 6–9 = Red/Yellow/Green/Blue (as in Lightroom and
+  Bridge; Purple and "no label" from the label menu). 0 clears the *rating* only. Shown as a
+  dot in the theme's palette colour (grid tile, 1-up, menus, filter).
+- Sidecar writes carry only the fields that changed (rating/reject vs label), and a label
+  read from one file's sidecar is spread to the shot without touching its rating (and the
+  reverse): a rating change never removes a label set in darktable. Files of a shot with
+  different labels are left alone; a label-only mismatch is repaired.
+- DB column `color_label INTEGER NOT NULL DEFAULT 0` (migration 017).
+- XMP two-way sync: writes `xmp:Label="Red"` (Lightroom/Bridge/digiKam) **and** `darktable:colorlabels` (`rdf:Seq` of 0–4), removes when None.
+- Preserved legacy Pick/Reject deletion in XMP.
+- Read labels back from XMP (`XmpReadResult` + `queries::update_from_xmp`).
+- Colour label filter in header filter popover, timeline grid, viewer toolbar, selection bar, and undo/redo manager (`UndoAction::ColorLabel`).
 
-### 🟡 R-7 · Picks in XMP · S — decide first
+### 🟢 R-7 · Picks in XMP · S — decide first
 
-- No standard field exists. Options:
-  - keep them DB-only (the current state)
-  - use digiKam's `digiKam:PickLabel` (verify the exact name and values against digiKam source before using it)
-- Document the decision in `sidecar.rs`.
+- Decided to keep picks database-only (`flagged = 1`), as there is no universal industry XMP standard (digiKam's `digiKam:PickLabel` is non-standard and rejected by darktable/Lightroom).
+- Documented in `crates/photon-import/src/sidecar.rs`.
 
 ### 🔴 R-8 · Hierarchical keywords · M
 
@@ -408,18 +422,18 @@ Build a synthetic library generator (a test or bench) with 200k image rows plus 
 - Disk usage of the thumbnail cache (add a cap and eviction for `Large`); memory of `FULL_RES` (3 × ~60 MB at 20 MP; make it size-aware for 60 MP bodies).
 - `quick_check` time on a large DB: if too slow for startup, move to idle time.
 
-### 🔴 R-13 · Robustness tests · M
+### 🟢 R-13 · Robustness tests · M
 
-- 🔴 Truncated, zero-byte, permission-denied and wrong-extension files in an import: the import continues and each error is reported.
-- 🔴 A card pulled mid-import (simulate a reader that errors mid-stream): no partial file under a final name, the source untouched, and the hash released.
-- 🔴 Kill during import: on the next start, delete stale `*.photon-part` files under the library root. **Not implemented yet**: add a startup sweep.
-- 🔴 Unsupported RAW (rawler can't decode, e.g. some CR3 or compressed variants): the viewer falls back to the embedded preview with a visible note, instead of only a log line.
+- 🟢 Truncated, zero-byte, permission-denied and wrong-extension files in an import: the import continues and each error is reported (`engine.rs` test `damaged_and_unreadable_files_…`). Empty files are refused; files that import but can't be previewed are reported.
+- 🟢 A card pulled mid-import: no partial file under a final name (`library.rs` test `card_pulled_mid_copy_…`, a reader that fails mid-stream). The source is only read; the hash is claimed only after a successful copy (Copy) or released on error (Move).
+- 🟢 Kill during import: a startup sweep (`library::sweep_partial_files`, called from `main.rs`) deletes `*.photon-part` files older than the app's start in the default library, the import backup folder and every folder holding library photos. A custom import destination's *new* day folder (no photo committed yet) isn't covered.
+- 🟢 Unsupported RAW: the viewer shows "Full resolution unavailable — showing the camera's embedded preview" over the photo (reason in the tooltip).
 
-### 🔴 R-14 · Catalog backup hardening · S
+### 🟢 R-14 · Catalog backup hardening · S
 
-- 🔴 Also copy the newest catalog backup into the import backup folder (a different disk).
-- 🔴 "Restore from backup…" in Preferences: list backups with dates and photo counts; restore = copy over the DB after closing the pool, with a restart prompt.
-- 🔴 A "Back up now" button.
+- 🟢 The newest catalog backup is mirrored to `<import backup folder>/Photon Catalog Backups/` (`db::mirror_newest_backup`, rotated to 14); an unplugged backup disk is skipped quietly and caught up next time.
+- 🟢 Preferences → Library Database → "Restore from Backup": lists local and mirrored backups with date, photo count and size. Restore is **staged** (`db::stage_restore` checks the copy with `quick_check`), then applied at the next start before the DB opens (`db::apply_staged_restore`); the replaced DB and its `-wal`/`-shm` are kept in `backups/before-restore-…/`. The app offers "Quit Photon" to finish.
+- 🟢 "Back Up Now" in the same group, with the last backup's time.
 
 ### 🔴 R-15 · darktable round trip in the grid · M
 
@@ -430,36 +444,45 @@ Build a synthetic library generator (a test or bench) with 200k image rows plus 
 
 ### 🔴 R-16 · Culling power features · M
 
-- 🔴 Compare mode (`detail.rs::render_compare`) uses the Large previews: use full resolution, with synchronized 1:1 pan and zoom.
+- 🟢 Compare (`ui/compare.rs`, 2 selected): full-resolution panes with zoom and pan in step;
+  select vs candidate (← → step the candidate through the timeline, ↑ / "Make Select" keeps
+  it); click or Tab picks the active pane that marks and keys apply to.
+- 🟢 Survey (`ui/survey.rs`, 3–9 selected): a grid with marks and quality rings per photo;
+  ✕ / Backspace drops a photo from the survey, Enter opens it in 1-up. The bar's Compare
+  button opens Compare for 2, Survey for 3–9.
 - 🔴 Preload the next and previous full-res renders while zoomed (a background task into `FULL_RES`).
 - 🟢 Continuous zoom in the 1-up viewer (`ui/photo_view.rs`): log slider, Fit / 1:1 buttons, Ctrl+wheel and pinch anchored at the pointer, +/−, drag to pan, double-click toggles Fit ↔ 1:1 at the clicked point. Full resolution loads only once the zoom needs more pixels than the Large preview.
-- 🟡 Optional: sort or filter a burst by a sharpness score (variance of the Laplacian on the Large preview) to find the sharpest frame.
+- 🟢 Sharpness score & burst rejects: variance of the Laplacian (4×4 tile max + global), exposure clipping, burst detection (≤ 2 s), "Photo Quality" results dialog with grouped bursts, XMP Rating="-1" sync, viewer info panel sharpness, timeline "Possibly blurred" filter, and parallel rayon quality backfill (see AI-7).
 
-### 🔴 R-17 · Stacks · S–M
+### 🟠 R-17 · Stacks · S–M
 
-`group_hash` already groups RAW+JPG+edits. Add a UI to:
+`group_hash` groups RAW+JPG+edits.
 
-- collapse a group into one tile with a count badge
-- expand it
-- choose which version is the cover
+- 🟢 One tile per shot (`queries::collapse_versions`): the JPG is the cover; a "RAW+JPG"
+  (or "N versions") badge. Sidebar/date counts count shots. The 1-up viewer steps
+  shot by shot; a button (and **V**) switches to the shot's other files.
+- 🟢 Ratings, picks and rejects apply to every file of the shot (grid and viewer),
+  with undo restoring each file's own value; each file's XMP is written.
+- 🔴 Rotation still applies to the file on screen only; make it shot-wide.
+- 🔴 Choose which version is the cover; expand a stack in the grid.
 
 ### 🟡 R-18 · Nice to have for pros · L
 
 - 🟡 Tethered shooting: a `gphoto2` capture into a watched folder (R-11).
 - 🟡 Client proofing: a static HTML gallery export with a pick/comment form (or a contact-sheet PDF).
 - 🟡 Map view and geotagging from GPX.
-- 🟡 Faces (import from digiKam at least; `sources/digikam.rs` already reads the digiKam DB).
+- Faces: moved to AI-3 / AI-4 (PART 5).
 
 ---
 
 ## PART 3 — Known bugs (small, fix when nearby)
 
 - 🟢 WebP export writes JPEG data (fixed in R-4).
-- 🔴 `timeline.rs` `cull_rating`/`cull_flag`: DB errors are ignored (`if … .is_ok()`); on failure the UI shows a rating that wasn't saved. Log it and show a toast.
+- 🟢 `timeline.rs` culling: a failed save now reverts the tiles, logs, and shows a toast; the undo entry is added only once saved.
 - 🟢 `export.rs`: copying the source XMP next to the export ignores errors (now reported in the export report).
-- 🔴 `detail.rs` `open_in_editor`: a spawn failure (editor not installed) is ignored; show a toast.
-- 🔴 Move import: the XMP sidecar is moved even when its photo's source is kept because the backup failed (harmless, but inconsistent).
-- 🔴 Compare mode shows Large previews, not real pixels (see R-16).
+- 🟢 `detail.rs` `open_in_editor`: a spawn failure (editor not installed) shows a toast.
+- 🟢 Move import: when a photo stays on the card (backup failed), its XMP sidecar is now copied, not moved.
+- 🟢 Compare mode shows real pixels now (R-16).
 - 🟢 HEIC/AVIF/GIF are accepted but can't be decoded (fixed by P-3).
 
 ---
@@ -475,9 +498,7 @@ Several already have tasks above.
   length, ISO, date range, rating, label, tag, path) with saved searches.
 - 🔴 **Map and geolocation:** a map view of GPS photos (libshumate), geotag from
   GPX tracks, reverse geocoding to place names as searchable tags (R-18).
-- 🔴 **Faces:** detection, then recognition and naming, written to XMP
-  `mwg-rs:Regions` (the digiKam/Lightroom format). Import digiKam's existing face
-  tags first (`sources/digikam.rs`), since that is cheap. ONNX models (e.g. YuNet + SFace).
+- 🔴 **Faces:** see AI-3 (detection, digiKam import) and AI-4 (recognition).
 - 🔴 **Similarity and duplicates:** a perceptual hash per photo for near-duplicate
   finding and "find similar" (digiKam's fuzzy search). Exact duplicates by BLAKE3 exist.
 - 🔴 **Metadata editor:** edit EXIF/IPTC/XMP fields (capture date shift for a
@@ -489,15 +510,235 @@ Several already have tasks above.
 - 🔴 **Scale:** digiKam users have 100k–500k photos. R-12 targets; a background
   maintenance task (rebuild thumbnails, re-read metadata, find missing, DB vacuum).
 - 🟡 **Light table:** compare more than two photos (R-16's compare is two).
-- 🟡 **Image quality sorter:** auto-reject blurred/under-/over-exposed frames
-  (the R-16 sharpness score is the first step).
-- 🟡 **Auto-tagging:** object/scene classification to suggest tags.
+- 🟡 **Image quality sorter:** see AI-7 (the R-16 sharpness score is the classical first step).
+- 🟡 **Auto-tagging and "search by description":** see AI-6.
 - 🟡 **Versioning:** track derivatives of an original (R-17 stacks are the basis).
 - 🟡 Deliberately out of scope: an image editor (darktable/GIMP handoff), a
   plugin system, a MySQL backend, web-service uploaders beyond the share portal.
 
+## PART 5 — AI features (AI-*)
+
+**Implementing AI-0 or AI-7? Read `docs/AI-0_AI-7_BRIEF.md` first** (detailed
+instructions, preflight checks, acceptance criteria).
+
+All AI runs **locally**; no photo, face or embedding ever leaves the machine.
+Open-source models only (see "Rules for agents"). AI results never overwrite an
+original or rewrite a sidecar: they are either **metadata** (faces, tags, scores)
+merged into the DB/XMP like any other change, or **derivative files** (denoised,
+enhanced) stored next to the original and grouped with it (R-17 stacks).
+
+Dependency chain:
+
+```
+AI-0 runtime ──┬── AI-1 denoise ─────┐
+               ├── AI-3 face detect ── AI-4 face recognition
+               ├── AI-5 segmentation ── AI-8 darktable mask handoff (spike)
+               ├── AI-6 tags + semantic search
+               └── AI-7 quality sorter
+AI-2 auto-enhance (classical first, no AI-0 needed) ─┘   AI-1/AI-2 need R-17 (versions)
+```
+
+### 🟢 AI-0 · Inference runtime and model manager · M
+
+Done 2026-09-29 (implemented by another agent, reviewed and corrected). `crates/photon-ai`.
+
+- **Backend:** OpenVINO 2026.0 through the `openvino` crate 0.11 with runtime linking:
+  Photon runs normally without OpenVINO, and AI shows as unavailable with the reason.
+  Needs Fedora's `tbb` (`libtbb.so.12`); the `openvino` package doesn't pull it in.
+- **Devices** come from OpenVINO itself (`available_devices`, `FULL_DEVICE_NAME`);
+  `devices.rs` only explains missing ones (device node, permission, missing plugin or
+  driver, or which library OpenVINO couldn't load). Checked off the UI thread in Preferences.
+- **NPU:** the driver (`intel-npu-driver` 1.32, firmware) is installed, but Fedora's
+  OpenVINO has **no NPU plugin** (`libopenvino_intel_npu_plugin.so`), so the NPU is
+  unavailable. Revisit when Fedora packages it.
+- **Models:** `models.toml` (embedded). YuNet 2023mar: hash verified against the file,
+  licence **MIT** (the model folder's own LICENSE; the opencv_zoo repo's Apache-2.0
+  doesn't apply to it). Downloads only after the user confirms; SHA-256 checked before
+  rename and before every load. Preferences → AI: devices, models, download/delete.
+- **Tiling** helper with an identity-model round-trip test.
+- **Job queue: not built yet** — no AI job exists until AI-3. The first version was
+  unused code and was removed with its GPU/NPU switches; build the queue with AI-3.
+
+**Benchmark** (2026-09-29, Core Ultra 5 125H, Fedora 45, kernel 7.2.8, OpenVINO 2026.0,
+`cargo run -p photon-ai --release --example bench -- --model <id|path> --image <jpg>`,
+3 warm-up + 10 timed runs):
+
+| Model (input) | Device | First compile | Cached load | Median | Max |
+|---|---|---|---|---|---|
+| YuNet (1×3×640×640) | CPU | 112 ms | 51 ms | 4.6 ms | 5.1 ms |
+| YuNet (1×3×640×640) | Arc GPU | 792 ms | 58 ms | 2.8 ms | 3.0 ms |
+| YuNet | NPU | — | — | — | no OpenVINO NPU plugin |
+
+The GPU run added ~460 MB to the process. For YuNet the CPU is the default (decoding a
+preview costs more than either inference); NPU first once available. No denoise model
+was benchmarked: none with verified OSI-licensed ONNX weights was chosen yet (AI-1).
+
+**Not verified by hand in the GUI:** Preferences → AI device rows, model download/delete.
+
+### 🔴 AI-1 · Neural denoise (derivative file) · M–L — needs AI-0, R-17
+
+- **Why:** the biggest AI win for Micro Four Thirds / high-ISO RAW; classical
+  denoise (including darktable's profiled denoise) is clearly behind learned models.
+- **Where in the pipeline:** on linear, demosaiced data from `raw::develop`,
+  before the tone curve; for JPEGs, on the decoded image (weaker results).
+- **Output:** a new 16-bit TIFF (later linear DNG, so darktable can still
+  develop it) next to the original, e.g. `P6030189-denoised.tif`, imported and
+  grouped with it; the XMP metadata (rating, tags) copied to it.
+- **Candidate models (verify licence and weights before use):** NAFNet (MIT),
+  SCUNet (Apache-2.0). Prefer a model trained on real camera noise (SIDD).
+- **UI:** "Denoise…" on a selection, with strength, and a before/after in compare mode.
+
+### 🔴 AI-2 · Auto-enhance (derivative file) · S–M — needs R-17
+
+- Google Photos–style one-click enhance. **Start classical, no model needed:**
+  auto levels / white balance, an S-curve, local contrast (CLAHE), vibrance.
+  Instant, and most of the visible effect.
+- Later, optionally a small learned tone-curve model (e.g. Zero-DCE, check
+  its licence) behind AI-0.
+- Output as a derivative like AI-1. **No render-time (non-destructive) enhance:**
+  that needs a develop pipeline, and darktable is that pipeline.
+
+### 🟠 AI-3 · Face detection · M — needs AI-0 (first user of it)
+
+- 🟢 Detector: `photon-ai::faces` (YuNet decoding as OpenCV's `FaceDetectorYN`, letterbox,
+  NMS, `MIN_SCORE` 0.6), used by AI-7 for eye sharpness; found the face in all 16 files of
+  a test session. Faces aren't stored as regions yet (only a count per photo).
+
+- **First, no AI:** import existing face regions from digiKam
+  (`sources/digikam.rs`, its `ImageTagProperties` "tagRegion") and from XMP
+  `mwg-rs:Regions` (written by digiKam, Lightroom, Picasa).
+- Schema: `faces` (image id, rectangle in upright normalized coords, person id,
+  source = detected/imported/manual, confidence). A new migration.
+- Detection model: **YuNet** (OpenCV Zoo, MIT). *Not* InsightFace/SCRFD weights
+  (non-commercial licence).
+- Run over the Large preview (2560 px is enough), in the AI-0 queue, on import
+  and as a library-wide scan.
+- XMP: write `mwg-rs:Regions` through `sidecar::write_image_xmp` (merge, as ever).
+- UI: face boxes toggle in the viewer; draw/delete a box by hand.
+
+### 🔴 AI-4 · Face recognition and People · M–L — needs AI-3
+
+- Embedding model: **SFace** (OpenCV Zoo, Apache-2.0). Store embeddings in the DB.
+- Cluster unnamed faces (e.g. DBSCAN on cosine distance); "Who is this?" to
+  name a cluster; suggest matches for new faces, confirmed by the user.
+- A "People" sidebar section; a person is also a tag (hierarchical under
+  `People|`, with R-8).
+- Privacy: an option to exclude a person, and "delete all face data".
+
+### 🔴 AI-5 · Segmentation (subject / sky / click-to-select) · M — needs AI-0
+
+- Models: **SAM / SAM 2 / MobileSAM** (all Apache-2.0); MobileSAM for
+  interactive speed on CPU. Click a point → mask; or "subject", "sky" with a
+  text-free heuristic (largest salient object) first.
+- Masks are kept as PNG files in the cache keyed by hash (like thumbnails), not in XMP.
+- Uses on their own: export with transparent background, handoff to GIMP as a
+  layer mask (easy: a TIFF with alpha, or the mask as a second file).
+
+### 🟡 AI-6 · Auto-tagging and semantic search · M — needs AI-0
+
+- CLIP-style image/text embeddings (OpenAI CLIP code and weights are MIT; for
+  OpenCLIP check each checkpoint's licence) for "search by description"
+  ("beach at sunset", "kids at a table") and suggested tags.
+- Suggested tags are shown for confirmation, never applied silently (tags go to XMP).
+- Store embeddings in the DB; a vector search over 100k photos must stay < 200 ms (R-12).
+- Also gives AI-quality "find similar", on top of PART 4's perceptual hash.
+
+### 🟢 AI-7 · Image quality sorter (classical) · S–M
+### 🟡 AI-7 · Learned score · S–M (deferred until OSI-licensed technical quality weights are verified)
+
+Done 2026-09-29 (implemented by another agent, reviewed and corrected). Menu: "Analyse
+Photo Quality…" (scores what isn't scored in the selection/view, then shows the
+blurred and badly exposed photos to reject, with Analyse Again); filter "Possibly blurred"; sharpness in the info panel.
+
+- `photon-import::quality`: from the **Large preview only** (made if missing), scaled to
+  1024 px: sharpness = variance of the 3×3 Laplacian, max over a 4×4 tile grid (plus
+  global); shadows (luma ≤ 2) and highlights (luma ≥ 253 — a saturated colour isn't
+  clipping); mean luma. `QUALITY_VERSION` 2 (1 mixed thumbnail/original sources and
+  counted saturated colours as clipped; bumping it re-scores everything).
+- Migration 015 `image_quality`. Analysis runs in the background with progress, Stop,
+  and counts of skipped/unsaved photos, on **the selection, else the current view**
+  (day, event, album, tag, search); the year/month overviews mean the whole library.
+  One command: offers the face model if missing, scores, then always shows the results.
+- Judged per **shot** (the files sharing `group_hash`, e.g. RAW + JPG, count once and
+  are suggested together — a JPG+ORF pair used to look like a two-frame burst, which hid
+  blurred shots). Bursts: ≥ 2 shots, same camera, ≤ 2 s apart; suggest < 60 % of the
+  burst's sharpest. Outside bursts: < 8 % of the **library's** median sharpness
+  (`BLUR_RATIO_OF_LIBRARY_MEDIAN`; tuned on this library: median ≈ 1350, motion-blurred
+  shots 22–35), also used by the "Possibly blurred" filter. Clipping > 25 % highlights /
+  > 35 % shadows. Never picks, never already-rejected shots, never a burst's best.
+- **Faces** (when YuNet is downloaded): the eyes of the largest face are measured
+  (`faces::eye_sharpness`: Laplacian variance around both eyes, scaled to 160 px wide).
+  A shot is "eyes blurred" below 50 % of its **session's** 80th-percentile eye
+  sharpness (same camera, ±30 min, ≥ 3 face shots), else of the library's; in a burst
+  of faces, below 60 % of the sharpest eyes. This catches a blurred subject in front of
+  a sharp, detailed background, which the whole-frame score can't (P1010651: frame
+  2390, eyes 62 vs 128–151 for the sharp shots). Migration 016 (`faces`,
+  `eye_sharpness`); photos scored before the model was downloaded get their faces
+  checked on the next analysis.
+- Confirmed rejects go through the same DB write + XMP sync as manual culling, off the
+  UI thread; undoable; sidecars that couldn't be written are reported.
+- Not done: scoring during import (not measured whether it would slow imports).
+  Motion blur that leaves sharp specular highlights can score higher than it looks;
+  a learned score (below) would catch those.
+
+**Not verified by hand in the GUI:** the analysis run and its results on a real burst,
+undo restoring the sidecars. Check on a copy of the library.
+
+### 🟡 AI-8 · AI masks handed over to darktable · spike, then M–L — needs AI-5; decide first
+
+- **Feasibility (to verify in a spike):** darktable can't import a bitmap mask
+  from outside (check the installed version first; if upstream gains native AI
+  masks, use that instead and drop this task). The route that works with
+  today's darktable:
+  1. Vectorise the AI-5 mask into polygons (contour tracing + simplification),
+     then into darktable **path** shapes (points with bezier control points and a feather border).
+  2. Write them to the XMP `darktable:masks_history` (`mask_id`, `mask_type`,
+     `mask_name`, `mask_version`, `mask_points` hex blob, `mask_nb`, …) as a
+     mask group the user can pick in any module's drawn-mask blending.
+  3. Coordinates are normalized to darktable's input image space; check how
+     this interacts with lens correction/crop (distortion back-transform).
+- **Risks:** the binary layouts (`dt_masks_point_path_t`, blend params) are
+  darktable-internal and versioned; get them from darktable's source
+  (`src/develop/masks.h`, `src/develop/blend.h`) for the supported version,
+  refuse unknown versions, and test with `darktable-cli`.
+- **Safety:** never edit the user's existing darktable history; write to a
+  **new duplicate** sidecar (`IMG.ORF_01.xmp`, darktable's duplicate naming) so
+  the original edit is untouched. This is the only place Photon writes
+  darktable-specific XMP: document it in the invariants when it lands.
+- Decide after the spike: go, or GIMP-only handoff (AI-5).
+
 ## Suggested order
 
 - **Personal:** P-0 → P-1 → P-2 → P-3 → P-4 → P-5 → rest.
-- **Professional (after personal P-0…P-3):** R-1 → R-3 → R-4 (WebP bug first) → R-2 → R-6 → R-9 → R-10 → R-12/R-13 → R-5/R-8 → R-15/R-16 → rest.
-- **digiKam parity (PART 4):** R-6/R-8/R-5 + search builder → metadata editor (with R-9) → folder view + R-11 → map/GPX → similarity → faces → R-12 at 200k.
+- **Professional, digiKam parity and AI — the plan from 2026-09-29.** Phases in
+  order; within a phase, left to right. Grouped so each area of code
+  (`sidecar.rs`, the schema, the viewer) is opened once, and so every task's
+  prerequisites land before it.
+
+  1. **Harden (≈1–1.5 wk):** P-0 hand checks → PART 3 bugs → R-14 → R-13
+     (incl. the stale `.photon-part` sweep). *Why first:* everything after this
+     writes more metadata; make failures loud and backups restorable before that.
+  2. **Metadata model (≈2–3 wk):** R-6 colour labels → R-7 decide picks → R-8
+     hierarchical keywords → R-9 copyright template → metadata editor (PART 4:
+     date shift, GPS, creator). *Why together:* all of them are schema +
+     `sidecar.rs` + XMP read-back work. R-8 is also needed by AI-4 (`People|…`)
+     and AI-6 (suggested tags).
+  3. **Find (≈1.5 wk):** R-5 smart collections + the search builder (PART 4).
+     *Why here:* labels and keywords now exist to search on.
+  4. **Cull and versions (≈2 wk):** R-16 rest (full-res compare with synced
+     zoom, preload) + AI-7's classical sharpness score → R-17 stacks → R-15
+     darktable round trip. *Why:* R-17 is the home for AI-1/AI-2's derivative
+     files; the viewer code is fresh from the zoom work.
+  5. **AI foundation + faces (≈3 wk):** AI-3 part 1 (import digiKam/XMP face
+     regions, no model) → AI-0 with the benchmark → AI-3 detection → AI-4
+     recognition and People.
+  6. **Library at scale (≈2 wk):** R-12 (200k rows) → R-11 watch for changes →
+     folder view (PART 4). *Why before AI-6:* vector search and library-wide
+     background jobs need the performance baseline; R-11 feeds new files to the AI queue.
+  7. **Image AI (≈3–4 wk):** AI-2 classical enhance → AI-1 denoise (GPU) →
+     AI-5 segmentation → AI-8 spike and go/no-go.
+  8. **Search AI and extras:** AI-6 semantic search and tag suggestions → AI-7
+     learned score → map/GPX (PART 4) → R-18 and the other 🟡 items.
+
+  Rough total: 4–5 months of focused work. Phases 1–3 alone make Photon a
+  credible digiKam alternative for people who don't need faces or maps.
