@@ -4,8 +4,8 @@ title: "Photon: a non-destructive photo culling and asset manager for GNOME"
 type: software
 version: 0.1.0
 license: GPL-3.0-or-later
-repository-code: "https://github.com/mavensgroup/photon"
-url: "https://mavensgroup.github.io/photon/"
+repository-code: "https://github.com/rudrab/Photon"
+url: "https://rudrab.github.io/Photon/"
 authors:
   - family-names: Banerjee
     given-names: Rudra

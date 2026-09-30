@@ -68,8 +68,8 @@ sudo pacman -S --needed \
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/mavensgroup/photon.git
-cd photon
+git clone https://github.com/rudrab/Photon.git
+cd Photon
 
 # 2. Run the test suite
 cargo test --release

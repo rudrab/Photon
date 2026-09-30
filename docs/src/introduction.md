@@ -85,7 +85,7 @@ Photon is free software under the GPL-3.0-or-later licence. If you use Photon, o
   title   = {Photon: a non-destructive photo culling and asset manager for GNOME},
   year    = {2026},
   version = {0.1.0},
-  url     = {https://github.com/mavensgroup/photon},
+  url     = {https://github.com/rudrab/Photon},
   license = {GPL-3.0-or-later}
 }
 ```

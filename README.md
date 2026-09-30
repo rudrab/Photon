@@ -123,7 +123,7 @@ Unlike legacy managers that lock edits into proprietary catalogs or freeze under
 sudo dnf install openvino tbb
 ```
 
-Then download the face model in **Preferences → AI**. See the [AI guide](https://mavensgroup.github.io/photon/guide/ai_quality.html) for GPU and NPU notes.
+Then download the face model in **Preferences → AI**. See the [AI guide](https://rudrab.github.io/Photon/guide/ai_quality.html) for GPU and NPU notes.
 
 #### Fedora / RHEL:
 ```bash
@@ -148,8 +148,8 @@ sudo pacman -S base-devel gtk4 libadwaita sqlite lcms2 libheif gstreamer gst-plu
 
 ```bash
 # Clone repository
-git clone https://github.com/mavensgroup/photon.git
-cd photon
+git clone https://github.com/rudrab/Photon.git
+cd Photon
 
 # Run test suite
 cargo test --release
@@ -162,13 +162,13 @@ cargo run --release -p photon-app
 
 ## 📖 Documentation
 
-Full documentation is available in the **[Photon Online Documentation](https://mavensgroup.github.io/photon/)**:
-* **[Ingestion & Mirror Safety Guide](https://mavensgroup.github.io/photon/guide/import_safety.html)**
-* **[Keyboard Culling & Triage](https://mavensgroup.github.io/photon/guide/culling_triage.html)**
-* **[Darktable Two-Way Synchronization](https://mavensgroup.github.io/photon/guide/darktable_interop.html)**
-* **[AI Quality & Facial Focus Scoring](https://mavensgroup.github.io/photon/guide/ai_quality.html)**
-* **[Smart Collections & SQL Rules](https://mavensgroup.github.io/photon/guide/smart_collections.html)**
-* **[Color Management & 16-Bit Pipeline](https://mavensgroup.github.io/photon/guide/color_management.html)**
+Full documentation is available in the **[Photon Online Documentation](https://rudrab.github.io/Photon/)**:
+* **[Ingestion & Mirror Safety Guide](https://rudrab.github.io/Photon/guide/import_safety.html)**
+* **[Keyboard Culling & Triage](https://rudrab.github.io/Photon/guide/culling_triage.html)**
+* **[Darktable Two-Way Synchronization](https://rudrab.github.io/Photon/guide/darktable_interop.html)**
+* **[AI Quality & Facial Focus Scoring](https://rudrab.github.io/Photon/guide/ai_quality.html)**
+* **[Smart Collections & SQL Rules](https://rudrab.github.io/Photon/guide/smart_collections.html)**
+* **[Color Management & 16-Bit Pipeline](https://rudrab.github.io/Photon/guide/color_management.html)**
 
 ---
 
@@ -197,7 +197,7 @@ Photon is free software under the GPL-3.0-or-later licence. If you use Photon, o
   title   = {Photon: a non-destructive photo culling and asset manager for GNOME},
   year    = {2026},
   version = {0.1.0},
-  url     = {https://github.com/mavensgroup/photon},
+  url     = {https://github.com/rudrab/Photon},
   license = {GPL-3.0-or-later}
 }
 ```
