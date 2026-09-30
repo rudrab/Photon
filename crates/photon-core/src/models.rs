@@ -878,7 +878,10 @@ pub struct XmpReadResult {
     pub color_label: Option<ColorLabel>,
     /// Every keyword in `dc:subject` but darktable's internal ones: the
     /// photo's complete tag list (Photon writes all of a photo's tags).
-    pub tags: Vec<String>,
+    /// `None` when the sidecar has no `dc:subject` at all: that says nothing
+    /// about the photo's tags (darktable writes sidecars without one), so
+    /// the library's tags must be left alone.
+    pub tags: Option<Vec<String>>,
 }
 
 #[cfg(test)]

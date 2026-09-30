@@ -409,7 +409,7 @@ mod tests {
         // Also in the sidecar, so reading it back keeps them.
         let xmp = crate::sidecar::find_xmp(&root.join("a.jpg")).expect("sidecar written");
         let read = crate::sidecar::read_xmp_metadata(&xmp).unwrap();
-        assert_eq!((read.rating, read.tags), (Some(4), vec!["Paris".to_string()]));
+        assert_eq!((read.rating, read.tags), (Some(4), Some(vec!["Paris".to_string()])));
         assert!(!crate::sidecar::read_image_xmp(&mut conn, id, &root.join("a.jpg"), stored.xmp_mtime).unwrap());
     }
 

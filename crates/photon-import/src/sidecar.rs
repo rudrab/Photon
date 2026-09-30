@@ -232,8 +232,12 @@ fn set_keywords(doc: &mut String, keywords: Keywords) {
     let existing = element(doc, "dc:subject")
         .map(|(s, e)| list_items(&doc[s..e]))
         .unwrap_or_default();
+    // darktable's own keywords are its business, even if a library tag has
+    // the same name.
+    let internal = darktable_keywords(doc);
     let is_known = |k: &str| {
-        keywords.known.iter().chain(keywords.tags).any(|t| t.eq_ignore_ascii_case(k))
+        !is_darktable_keyword(k, &internal)
+            && keywords.known.iter().chain(keywords.tags).any(|t| t.eq_ignore_ascii_case(k))
     };
 
     let mut merged: Vec<String> = existing.iter().filter(|k| !is_known(k)).cloned().collect();
@@ -255,6 +259,79 @@ fn set_keywords(doc: &mut String, keywords: Keywords) {
         .map(|k| format!("     <rdf:li>{}</rdf:li>\n", xml_escape(k)))
         .collect();
     replace_or_insert(doc, "dc:subject", &format!("   <dc:subject>\n    <rdf:Bag>\n{items}    </rdf:Bag>\n   </dc:subject>\n"));
+}
+
+/// The parts of darktable's own hierarchical keywords in `doc`, lowercase.
+///
+/// darktable tags every photo itself (`darktable|format|orf`,
+/// `darktable|changed`, …) in `lr:hierarchicalSubject`, and may list the
+/// parts as separate keywords in `dc:subject` ("darktable", "format",
+/// "orf"). Those aren't the user's tags. A part that is also in one of the
+/// user's own hierarchical keywords is.
+fn darktable_keywords(doc: &str) -> std::collections::HashSet<String> {
+    let mut paths = Vec::new();
+    for name in ["lr:hierarchicalSubject", "dc:subject"] {
+        if let Some((s, e)) = element(doc, name) {
+            paths.extend(list_items(&doc[s..e]).into_iter().filter(|k| k.contains('|')));
+        }
+    }
+    let parts = |darktable: bool| -> std::collections::HashSet<String> {
+        paths
+            .iter()
+            .filter(|p| p.to_lowercase().starts_with("darktable|") == darktable)
+            .flat_map(|p| p.split('|').map(|part| part.trim().to_lowercase()))
+            .collect()
+    };
+    let users = parts(false);
+    let mut internal: std::collections::HashSet<String> =
+        parts(true).into_iter().filter(|p| !users.contains(p)).collect();
+    internal.insert("darktable".to_string());
+    internal
+}
+
+fn is_darktable_keyword(keyword: &str, internal: &std::collections::HashSet<String>) -> bool {
+    let keyword = keyword.trim().to_lowercase();
+    keyword.starts_with("darktable|") || internal.contains(&keyword)
+}
+
+/// Remove the tags that darktable's own keywords became on photos (a bug
+/// in versions from 2026-09-29 read "darktable", "format", "orf" … from
+/// sidecars as tags), and delete such tags left on no photo. Runs once per
+/// library. Returns how many photos were fixed.
+pub fn repair_darktable_keyword_tags(conn: &rusqlite::Connection) -> anyhow::Result<usize> {
+    use photon_core::db::queries;
+    const DONE: &str = "repaired_darktable_keyword_tags";
+    if queries::get_meta(conn, DONE)?.is_some() {
+        return Ok(0);
+    }
+    let mut fixed = 0;
+    let mut removed = std::collections::HashSet::new();
+    // Every such photo got "darktable", the root of all of them.
+    for (id, path) in queries::images_with_tag(conn, "darktable")? {
+        let Some(xmp) = find_xmp(&path) else { continue };
+        let doc = match std::fs::read_to_string(&xmp) {
+            Ok(doc) => doc,
+            Err(e) => {
+                log::warn!("Not repairing tags of {}: {e}", path.display());
+                continue;
+            }
+        };
+        let internal = darktable_keywords(&doc);
+        let names: Vec<String> = queries::get_tags_for_image(conn, id)?
+            .into_iter()
+            .map(|t| t.name)
+            .filter(|name| is_darktable_keyword(name, &internal))
+            .collect();
+        if !names.is_empty() {
+            queries::untag_image_by_names(conn, id, &names)?;
+            removed.extend(names);
+            fixed += 1;
+        }
+    }
+    let removed: Vec<String> = removed.into_iter().collect();
+    queries::delete_unused_tags(conn, &removed)?;
+    queries::set_meta(conn, DONE, "1")?;
+    Ok(fixed)
 }
 
 /// Set a language-alternative property (title, description) to `text` in the
@@ -509,8 +586,9 @@ pub fn read_xmp_metadata(path: &Path) -> std::io::Result<XmpReadResult> {
     }
 
     if let Some((s, e)) = element(&doc, "dc:subject") {
+        let internal = darktable_keywords(&doc);
         let items = list_items(&doc[s..e]);
-        result.tags = items.into_iter().filter(|tag| !tag.starts_with("darktable|")).collect();
+        result.tags = Some(items.into_iter().filter(|tag| !is_darktable_keyword(tag, &internal)).collect());
     }
 
     Ok(result)
@@ -1050,7 +1128,116 @@ mod tests {
         let res = read_xmp_metadata(&xmp).unwrap();
         assert_eq!(res.rating, Some(4));
         assert_eq!(res.title, Some("My Title".to_string()));
-        assert_eq!(res.tags, vec!["vacation".to_string()]);
+        assert_eq!(res.tags, Some(vec!["vacation".to_string()]));
+    }
+
+    /// darktable 4.x/5.x: its own hierarchy in `lr:hierarchicalSubject`, and
+    /// the parts as keywords.
+    const DARKTABLE_TAGGED: &str = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:lr="http://ns.adobe.com/lightroom/1.0/" xmp:Rating="3">
+   <dc:subject>
+    <rdf:Bag>
+     <rdf:li>darktable</rdf:li>
+     <rdf:li>format</rdf:li>
+     <rdf:li>orf</rdf:li>
+     <rdf:li>changed</rdf:li>
+     <rdf:li>wedding</rdf:li>
+     <rdf:li>places</rdf:li>
+    </rdf:Bag>
+   </dc:subject>
+   <lr:hierarchicalSubject>
+    <rdf:Bag>
+     <rdf:li>darktable|format|orf</rdf:li>
+     <rdf:li>darktable|changed</rdf:li>
+     <rdf:li>places|format</rdf:li>
+    </rdf:Bag>
+   </lr:hierarchicalSubject>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+"#;
+
+    #[test]
+    fn darktables_own_keywords_are_not_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let xmp = dir.path().join("P1.ORF.xmp");
+        std::fs::write(&xmp, DARKTABLE_TAGGED).unwrap();
+        let tags = read_xmp_metadata(&xmp).unwrap().tags.unwrap();
+        // "format" is also part of the user's own "places|format".
+        assert_eq!(tags, strings(&["format", "wedding", "places"]));
+    }
+
+    #[test]
+    fn a_sidecar_without_keywords_says_nothing_about_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let xmp = dir.path().join("P1.ORF.xmp");
+        std::fs::write(&xmp, DARKTABLE_XMP.replace("dc:subject>", "dc:other>")).unwrap();
+        assert_eq!(read_xmp_metadata(&xmp).unwrap().tags, None);
+    }
+
+    #[test]
+    fn library_tags_survive_a_darktable_sidecar_without_keywords() {
+        use photon_core::db::queries;
+        let dir = tempfile::tempdir().unwrap();
+        let (db, orf, _) = shot(dir.path());
+        let mut conn = db.conn().unwrap();
+        // Only the library has this tag (e.g. the sidecar write failed).
+        queries::tag_image(&conn, orf, queries::ensure_tag(&conn, "wedding").unwrap()).unwrap();
+        std::fs::write(dir.path().join("P1.ORF.xmp"), DARKTABLE_XMP.replace("dc:subject>", "dc:other>")).unwrap();
+
+        assert!(read_image_xmp(&mut conn, orf, &dir.path().join("P1.ORF"), None).unwrap());
+        let tags: Vec<String> = queries::get_tags_for_image(&conn, orf).unwrap().into_iter().map(|t| t.name).collect();
+        assert_eq!(tags, ["wedding"]);
+        assert_eq!(queries::get_image(&conn, orf).unwrap().unwrap().rating, 1, "the rest is still read");
+    }
+
+    #[test]
+    fn writing_tags_never_removes_darktables_keywords() {
+        // The library has tags named like darktable's parts (from the old bug).
+        let known = strings(&["darktable", "orf", "changed", "wedding"]);
+        let tags = strings(&["wedding", "family"]);
+        let merged = merge_xmp(
+            DARKTABLE_TAGGED,
+            &XmpUpdate { keywords: Some(Keywords { tags: &tags, known: &known }), ..Default::default() },
+        )
+        .unwrap();
+        let (s, e) = element(&merged, "dc:subject").unwrap();
+        let items = list_items(&merged[s..e]);
+        for kept in ["darktable", "format", "orf", "changed", "wedding", "family"] {
+            assert!(items.iter().any(|i| i == kept), "{kept} in {items:?}");
+        }
+    }
+
+    #[test]
+    fn leaked_darktable_tags_are_repaired_once() {
+        use photon_core::db::queries;
+        let dir = tempfile::tempdir().unwrap();
+        let (db, orf, jpg) = shot(dir.path());
+        let conn = db.conn().unwrap();
+        std::fs::write(dir.path().join("P1.ORF.xmp"), DARKTABLE_TAGGED).unwrap();
+        for name in ["darktable", "orf", "changed", "wedding"] {
+            queries::tag_image(&conn, orf, queries::ensure_tag(&conn, name).unwrap()).unwrap();
+        }
+        // Another photo really tagged "orf" by the user keeps it.
+        queries::tag_image(&conn, jpg, queries::ensure_tag(&conn, "orf").unwrap()).unwrap();
+
+        assert_eq!(repair_darktable_keyword_tags(&conn).unwrap(), 1);
+        let names = |id| -> Vec<String> {
+            let mut n: Vec<String> = queries::get_tags_for_image(&conn, id).unwrap().into_iter().map(|t| t.name).collect();
+            n.sort();
+            n
+        };
+        assert_eq!(names(orf), ["wedding"]);
+        assert_eq!(names(jpg), ["orf"]);
+        let all: Vec<String> = queries::get_all_tags(&conn).unwrap().into_iter().map(|t| t.name).collect();
+        assert!(!all.iter().any(|t| t == "darktable" || t == "changed"), "{all:?}");
+        assert!(all.iter().any(|t| t == "orf"));
+
+        // Only once.
+        queries::tag_image(&conn, orf, queries::ensure_tag(&conn, "darktable").unwrap()).unwrap();
+        assert_eq!(repair_darktable_keyword_tags(&conn).unwrap(), 0);
     }
 
     #[test]

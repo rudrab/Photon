@@ -1999,6 +1999,40 @@ pub fn get_images_with_stale_xmp(conn: &Connection, paths: &[&str]) -> Result<Ve
 
 /// Apply what an XMP sidecar says (`xmp`) to image `id`, and record the
 /// sidecar's mtime so it isn't read again until something else changes it.
+/// Photos tagged `name` (any case), with their paths.
+pub fn images_with_tag(conn: &Connection, name: &str) -> Result<Vec<(i64, PathBuf)>, PhotonError> {
+    let mut stmt = conn.prepare(
+        "SELECT i.id, i.path FROM images i
+         JOIN image_tags it ON it.image_id = i.id
+         JOIN tags t ON t.id = it.tag_id
+         WHERE t.name = ?1",
+    )?;
+    let rows = stmt.query_map(params![name], |r| Ok((r.get(0)?, PathBuf::from(r.get::<_, String>(1)?))))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Remove the tags called `names` (any case) from photo `image_id`.
+pub fn untag_image_by_names(conn: &Connection, image_id: i64, names: &[String]) -> Result<(), PhotonError> {
+    for name in names {
+        conn.execute(
+            "DELETE FROM image_tags WHERE image_id = ?1 AND tag_id IN (SELECT id FROM tags WHERE name = ?2)",
+            params![image_id, name],
+        )?;
+    }
+    Ok(())
+}
+
+/// Delete the tags called `names` that are on no photo.
+pub fn delete_unused_tags(conn: &Connection, names: &[String]) -> Result<(), PhotonError> {
+    for name in names {
+        conn.execute(
+            "DELETE FROM tags WHERE name = ?1 AND id NOT IN (SELECT tag_id FROM image_tags)",
+            params![name],
+        )?;
+    }
+    Ok(())
+}
+
 pub fn update_from_xmp(
     conn: &mut Connection,
     id: i64,
@@ -2033,22 +2067,25 @@ pub fn update_from_xmp(
     }
     tx.execute("UPDATE images SET xmp_mtime = ?1 WHERE id = ?2", params![xmp_mtime, id])?;
 
-    // The sidecar has all of the photo's tags (every tag change in Photon is
-    // written to it), so a tag missing from it was removed in another tool.
-    let mut keep = Vec::with_capacity(xmp.tags.len());
-    for t in &xmp.tags {
-        let tag_id = ensure_tag(&tx, t)?;
+    // A sidecar with keywords has all of the photo's tags (every tag change
+    // in Photon is written to it), so a tag missing from it was removed in
+    // another tool. One without any says nothing about them.
+    if let Some(tags) = &xmp.tags {
+        let mut keep = Vec::with_capacity(tags.len());
+        for t in tags {
+            let tag_id = ensure_tag(&tx, t)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO image_tags (image_id, tag_id) VALUES (?1, ?2)",
+                params![id, tag_id],
+            )?;
+            keep.push(tag_id);
+        }
+        let keep = serde_json::to_string(&keep).map_err(|e| PhotonError::Other(e.to_string()))?;
         tx.execute(
-            "INSERT OR IGNORE INTO image_tags (image_id, tag_id) VALUES (?1, ?2)",
-            params![id, tag_id],
+            "DELETE FROM image_tags WHERE image_id = ?1 AND tag_id NOT IN (SELECT value FROM json_each(?2))",
+            params![id, keep],
         )?;
-        keep.push(tag_id);
     }
-    let keep = serde_json::to_string(&keep).map_err(|e| PhotonError::Other(e.to_string()))?;
-    tx.execute(
-        "DELETE FROM image_tags WHERE image_id = ?1 AND tag_id NOT IN (SELECT value FROM json_each(?2))",
-        params![id, keep],
-    )?;
 
     tx.commit()?;
     Ok(())
@@ -2593,7 +2630,7 @@ mod tests {
         let xmp = crate::models::XmpReadResult {
             rating: Some(3),
             rejected: Some(false),
-            tags: vec!["holiday".to_string()],
+            tags: Some(vec!["holiday".to_string()]),
             ..Default::default()
         };
         update_from_xmp(&mut conn, id, &xmp, 12345).unwrap();
@@ -2624,15 +2661,19 @@ mod tests {
             names.sort();
             names
         };
-        let with = |names: &[&str]| XmpReadResult { tags: names.iter().map(|n| n.to_string()).collect(), ..Default::default() };
+        let with = |names: &[&str]| XmpReadResult { tags: Some(names.iter().map(|n| n.to_string()).collect()), ..Default::default() };
 
         update_from_xmp(&mut conn, id, &with(&["a", "b", "c"]), 1).unwrap();
         assert_eq!(tags(&conn), ["a", "b", "c"]);
         // "b" removed in darktable, "d" added.
         update_from_xmp(&mut conn, id, &with(&["a", "c", "d"]), 2).unwrap();
         assert_eq!(tags(&conn), ["a", "c", "d"]);
+        // A sidecar without keywords (darktable writes those) leaves them alone.
+        let rated = XmpReadResult { rating: Some(2), ..Default::default() };
+        update_from_xmp(&mut conn, id, &rated, 3).unwrap();
+        assert_eq!(tags(&conn), ["a", "c", "d"]);
         // All removed.
-        update_from_xmp(&mut conn, id, &with(&[]), 3).unwrap();
+        update_from_xmp(&mut conn, id, &with(&[]), 4).unwrap();
         assert!(tags(&conn).is_empty());
         // The tags themselves stay in the library.
         assert!(get_all_tags(&conn).unwrap().iter().any(|t| t.name == "b"));

@@ -719,11 +719,19 @@ impl MainWindow {
         std::thread::spawn(move || {
             let changed = (|| {
                 let mut conn = db_bg.conn().ok()?;
+                let mut changed = false;
+                match photon_import::repair_darktable_keyword_tags(&conn) {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        log::info!("Removed darktable's own keywords from the tags of {n} photos");
+                        changed = true;
+                    }
+                    Err(e) => log::warn!("Repairing darktable keyword tags: {e:#}"),
+                }
                 let images_to_check = queries::get_all_images_for_integrity_check(&conn).ok()?;
 
                 let mut to_mark_missing = Vec::new();
                 let mut to_mark_found = Vec::new();
-                let mut changed = false;
 
                 for (id, path, xmp_mtime, was_missing) in images_to_check {
                     let exists = path.exists();
