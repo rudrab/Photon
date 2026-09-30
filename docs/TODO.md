@@ -421,6 +421,16 @@ Build a synthetic library generator (a test or bench) with 200k image rows plus 
 - Import of 2,000 JPEG+RAW from a USB 3 card: throughput and CPU/IO.
 - Disk usage of the thumbnail cache (add a cap and eviction for `Large`); memory of `FULL_RES` (3 × ~60 MB at 20 MP; make it size-aware for 60 MP bodies).
 - `quick_check` time on a large DB: if too slow for startup, move to idle time.
+- 🔴 **The library check polls every file** (found 2026-09-30). `window.rs::check_library` runs at
+  startup and on every window focus (throttled to 30 s): for each photo, one thread stats the
+  file, looks for a sidecar (`find_xmp`, up to 2 more stats) and reads it if changed, then
+  `reconcile_shots` scans the shots. Instant at 600 photos; at 100k on an external HDD it's
+  ~300k stats per focus, keeping the disk busy (and spinning up sleeping drives). Fix:
+  - list each folder once (`read_dir`) instead of stat'ing each photo and sidecar;
+  - skip folders on offline mounts (R-10 already tells offline from missing);
+  - check the whole library at startup only, in batches off the UI thread; on focus, only
+    recently viewed folders; later, replace polling with R-11's file monitor;
+  - measure it in the R-12 benchmark (target: < 1 s at 100k on SSD, no work on focus beyond that).
 
 ### 🟢 R-13 · Robustness tests · M
 
@@ -470,7 +480,34 @@ Build a synthetic library generator (a test or bench) with 200k image rows plus 
 - 🟢 Ratings, picks and rejects apply to every file of the shot (grid and viewer),
   with undo restoring each file's own value; each file's XMP is written.
 - 🔴 Rotation still applies to the file on screen only; make it shot-wide.
+- 🔴 Tags too (found 2026-09-30): a tag added in the info panel goes to the file on screen,
+  the shot's JPG cover, so the RAW's sidecar — the one darktable reads — never gets the
+  keyword, and a RAW export carries none. Make tagging shot-wide like ratings (every file's
+  tags and sidecar; undo per file), and repair shots whose files disagree the way
+  `reconcile_shots` does for ratings (union of the files' tags). See R-19.
 - 🔴 Choose which version is the cover; expand a stack in the grid.
+
+### 🔴 R-19 · Batch keywording · S–M
+
+Found 2026-09-30. Tags can only be added or removed one photo at a time, in the 1-up info
+panel (`detail.rs`, the tag entry and chips). Keywording a 300-photo shoot that way isn't workable.
+
+- **Where:** `selection_bar.rs` (a "Tags…" action), `timeline.rs` (a key, e.g. **Ctrl+T** —
+  check `shortcuts.rs` for conflicts), `queries.rs` (batch tag/untag in one transaction),
+  `undo.rs` (one undo entry for the whole batch).
+- **UI:** a popover for the selection: entry with autocomplete from `get_all_tags`, the
+  selection's tags as chips with counts ("wedding · 120 of 300"); adding applies to all,
+  removing a chip removes from all.
+- **Shot-wide** (see R-17): every file of each selected shot gets the tag.
+- **Sidecars:** one `sidecar::write_image_xmp` per file with `XmpChange::Tags`-style
+  keywords (the photo's full tag list + the library's known tags), off the UI thread, with
+  progress for large selections; failed writes reported (a toast with the count, details in
+  the log) — never silently dropped: a tag that only the library has is fragile (see the
+  PART 3 read-back fixes).
+- **Acceptance:** tag 300 photos in one action; the tags show in darktable after "reload
+  selected XMP files" (on the RAWs too); Ctrl+Z removes them from all 300 and their sidecars.
+- **Tests:** batch query; shot-wide application; undo round trip; XMP of both RAW and JPG.
+- Later with R-8: hierarchical keywords in the same popover.
 
 ### 🟡 R-18 · Nice to have for pros · L
 
@@ -490,6 +527,16 @@ Build a synthetic library generator (a test or bench) with 200k image rows plus 
 - 🟢 Move import: when a photo stays on the card (backup failed), its XMP sidecar is now copied, not moved.
 - 🟢 Compare mode shows real pixels now (R-16).
 - 🟢 HEIC/AVIF/GIF are accepted but can't be decoded (fixed by P-3).
+- 🟢 XMP read-back deleted all of a photo's library tags when its sidecar had no `dc:subject`
+  (darktable writes such sidecars), e.g. for tags whose sidecar write had failed. Now
+  `XmpReadResult.tags` is an `Option`: no `dc:subject` leaves the tags alone (2026-09-30).
+- 🟢 XMP read-back imported darktable's own keywords as tags: darktable lists the parts of
+  `darktable|format|orf`, `darktable|changed` … in `dc:subject` as "darktable", "format",
+  "orf", "changed". `sidecar::darktable_keywords` now recognises them from
+  `lr:hierarchicalSubject` (a part also in one of the user's own hierarchies stays a tag);
+  they're never imported, and writing tags never removes them from a sidecar. Libraries that
+  got them are repaired once (`sidecar::repair_darktable_keyword_tags`, run by the library
+  check; `library_meta.repaired_darktable_keyword_tags`) (2026-09-30).
 
 ---
 
@@ -724,8 +771,8 @@ undo restoring the sidecars. Check on a copy of the library.
   1. **Harden (≈1–1.5 wk):** P-0 hand checks → PART 3 bugs → R-14 → R-13
      (incl. the stale `.photon-part` sweep). *Why first:* everything after this
      writes more metadata; make failures loud and backups restorable before that.
-  2. **Metadata model (≈2–3 wk):** R-6 colour labels → R-7 decide picks → R-8
-     hierarchical keywords → R-9 copyright template → metadata editor (PART 4:
+  2. **Metadata model (≈2–3 wk):** R-6 colour labels → R-7 decide picks → R-19
+     batch keywording with shot-wide tags (R-17) → R-8 hierarchical keywords → R-9 copyright template → metadata editor (PART 4:
      date shift, GPS, creator). *Why together:* all of them are schema +
      `sidecar.rs` + XMP read-back work. R-8 is also needed by AI-4 (`People|…`)
      and AI-6 (suggested tags).
