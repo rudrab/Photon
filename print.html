@@ -1,0 +1,918 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Photon</title>
+        <meta name="robots" content="noindex">
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-0392ca55.css">
+        <link rel="stylesheet" href="css/chrome-fc474251.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="src/custom-6ac2dfa5.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-54cfd295.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-0c2e6eb5.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Photon</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/rudrab/Photon" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="photon"><a href="#photon" class="header">Photon</a></h1>
+<div id="cover-page">
+<img src="images/photon.svg" class="cover-logo" alt="Photon Logo">
+<h1 class="cover-title">Photon</h1>
+
+<p class="cover-subtitle">Photo Culling &amp; Asset Management for GNOME</p>
+
+<div class="cover-divider"></div>
+
+<div class="cover-meta">
+<p><a href="https://mavens-group.github.io/author/rudra-banerjee/"><strong>Rudra Banerjee</strong></a></p>
+
+<p><a href="https://mavens-group.github.io/">The Mavens Group</a></p>
+
+<p class="version">v0.1.0 (2026)</p>
+
+</div>
+
+<a href="#introduction-to-photon" class="cover-button">Get Started</a>
+</div>
+
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="introduction-to-photon"><a class="header" href="#introduction-to-photon">Introduction to Photon</a></h1>
+<p>Photon is engineered to solve a long-standing challenge on the Linux desktop: providing a digital asset manager (DAM) that matches the speed, reliability, and ergonomics of commercial tools like Photo Mechanic and Lightroom Classic while remaining fully open-source and respecting local file ownership.</p>
+<blockquote class="blockquote-tag blockquote-tag-warning">
+<p class="blockquote-tag-title"><svg viewbox="0 0 16 16" width="18" height="18"><path d="M6.457 1.047c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0 1 14.082 15H1.918a1.75 1.75 0 0 1-1.543-2.575Zm1.763.707a.25.25 0 0 0-.44 0L1.698 13.132a.25.25 0 0 0 .22.368h12.164a.25.25 0 0 0 .22-.368Zm.53 3.996v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z"></path></svg>Warning</p>
+<p>This is a beta release. Core features work, but Photon may contain bugs or unfinished features. It never overwrites originals, but keep backups of your photos and catalogue, and try new features on a copy of your library first.</p>
+</blockquote>
+<hr>
+<h2 id="why-photon"><a class="header" href="#why-photon">Why Photon?</a></h2>
+<p>Traditional Linux photo management forced a difficult trade-off:</p>
+<ol>
+<li><strong>Shotwell:</strong> Lightweight and GNOME-native, but single-threaded, lacks pro culling controls, fails to handle RAW+JPEG pairs properly, and does not support <code>.xmp</code> sidecar workflows.</li>
+<li><strong>digiKam:</strong> Extremely feature-dense, but heavy, complex, slower to startup, and prone to metadata namespace conflicts with Darktable.</li>
+</ol>
+<p>Photon takes a focused, modular approach:</p>
+<ul>
+<li><strong>Ingestion and Triage Station:</strong> Rapidly import, deduplicate, backup, cull, rate, and organize large volumes of raw and raster assets.</li>
+<li><strong>Darktable Companion:</strong> Delegates raw pixel development to specialized tools like Darktable while maintaining bidirectional XMP metadata synchronization.</li>
+<li><strong>Modern GNOME Architecture:</strong> Built in pure Rust on GTK4 and Libadwaita with smooth Wayland rendering, native responsive layouts, and zero bloat.</li>
+</ul>
+<hr>
+<h2 id="optional-local-ai"><a class="header" href="#optional-local-ai">Optional Local AI</a></h2>
+<p>Photon can score eye focus and suggest rejects using YuNet face detection through OpenVINO (CPU or Intel GPU). It is optional: the model is a small one-time download you approve, and nothing leaves your computer. See <a href="#ai-focus--quality-analysis">AI Focus &amp; Quality Analysis</a> and the <a href="#1-dependencies">dependency table</a>.</p>
+<hr>
+<h2 id="crate-architecture"><a class="header" href="#crate-architecture">Crate Architecture</a></h2>
+<p>Photon is organized into four modular workspace crates:</p>
+<pre><code>crates/
+├── photon-core/     # Core domain models, SQLite schema migrations (001-017), queries, FTS5
+├── photon-import/   # Ingest engine, XMP sidecar engine, LittleCMS2 ICC, thumbnailing, export
+├── photon-ai/       # OpenVINO runtime, model manager, YuNet face detection, eye sharpness
+└── photon-app/      # GTK4/Libadwaita UI, PhotoView canvas, timeline, undo stack, detail viewer
+</code></pre>
+<h3 id="1-photon-core"><a class="header" href="#1-photon-core">1. <code>photon-core</code></a></h3>
+<p>Manages data integrity and database access.</p>
+<ul>
+<li><strong>Database:</strong> SQLite in WAL (Write-Ahead Logging) mode with strict foreign key constraints.</li>
+<li><strong>Migrations:</strong> 17 incremental migrations managing tables for <code>images</code>, <code>tags</code>, <code>albums</code>, <code>events</code>, <code>smart_collections</code>, <code>image_quality</code>, and FTS5 search.</li>
+<li><strong>Domain Models:</strong> Strongly typed Rust structs for shots, timeline items, color labels, ratings, and queries.</li>
+</ul>
+<h3 id="2-photon-import"><a class="header" href="#2-photon-import">2. <code>photon-import</code></a></h3>
+<p>Handles heavy file I/O, format decoding, and metadata transformations.</p>
+<ul>
+<li><strong>Atomic Ingestion:</strong> Staged imports with <code>.part</code> file commit pipelines.</li>
+<li><strong>XMP Engine:</strong> Bidirectional parser/writer preserving Darktable edit history.</li>
+<li><strong>Color Engine:</strong> LittleCMS2 profile extraction and transform pipeline.</li>
+<li><strong>Thumbnail Pipeline:</strong> Atomic thumbnail generation and compact 28-byte ThumbHash storage.</li>
+</ul>
+<h3 id="3-photon-ai"><a class="header" href="#3-photon-ai">3. <code>photon-ai</code></a></h3>
+<p>Local machine learning and quality analysis.</p>
+<ul>
+<li><strong>Inference runtime:</strong> OpenVINO, loaded at run time, so Photon starts and works without it.</li>
+<li><strong>Model manager:</strong> Verified download, storage, and deletion of models (YuNet face detection today).</li>
+<li><strong>Focus Assessment:</strong> Isolates eye crops and computes high-frequency Laplacian variance.</li>
+</ul>
+<h3 id="4-photon-app"><a class="header" href="#4-photon-app">4. <code>photon-app</code></a></h3>
+<p>The desktop application frontend.</p>
+<ul>
+<li><strong>Libadwaita Controls:</strong> HeaderBar, Popovers, Toasts, and responsive Navigation Sidebar.</li>
+<li><strong>PhotoView:</strong> Custom continuous sub-pixel pan/zoom rendering canvas.</li>
+<li><strong>Undo Engine:</strong> 50-step in-memory undo/redo manager with sidecar synchronization.</li>
+</ul>
+<hr>
+<h2 id="licensing-support-and-commercial-use"><a class="header" href="#licensing-support-and-commercial-use">Licensing, Support and Commercial Use</a></h2>
+<p>Photon is and will remain free software under the <strong>GPL-3.0-or-later</strong> licence. You can use, study, modify and share it freely under those terms. The project is sustained in these ways:</p>
+<ul>
+<li><strong>Paid convenience builds:</strong> signed binaries, installers, and store or Flathub listings, offered for a fee or with a donation option. The source code always stays free, and you can build it yourself.</li>
+<li><strong>Sponsorship and donations:</strong> GitHub Sponsors, Open Collective, or grants.</li>
+<li><strong>Dual licensing:</strong> organisations that cannot accept the GPL can obtain a separate proprietary licence from the copyright holder.</li>
+</ul>
+<p>To make dual licensing possible, outside contributions are accepted only under a contributor licence agreement (CLA) or copyright assignment. See <code>CONTRIBUTING.md</code> in the repository. For commercial licensing enquiries, contact <a href="https://mavens-group.github.io/">The Mavens Group</a>.</p>
+<h2 id="citation-and-attribution"><a class="header" href="#citation-and-attribution">Citation and Attribution</a></h2>
+<p>Photon is free software under the GPL-3.0-or-later licence. If you use Photon, or parts of its code, in your work, please cite it. GitHub’s <strong>Cite this repository</strong> button uses <code>CITATION.cff</code> in the repository; in BibTeX:</p>
+<pre><code class="language-bibtex">@software{banerjee_photon,
+  author  = {Banerjee, Rudra},
+  title   = {Photon: a non-destructive photo culling and asset manager for GNOME},
+  year    = {2026},
+  version = {0.1.0},
+  url     = {https://github.com/rudrab/Photon},
+  license = {GPL-3.0-or-later}
+}
+</code></pre>
+<p>If you reuse code, the GPL also requires that you keep the copyright and licence notices, mark your changes, and release your derived work under the same licence.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="installation--build-guide"><a class="header" href="#installation--build-guide">Installation &amp; Build Guide</a></h1>
+<h2 id="system-requirements"><a class="header" href="#system-requirements">System Requirements</a></h2>
+<ul>
+<li><strong>Operating System:</strong> Linux (Kernel 5.15+), Wayland or X11 session.</li>
+<li><strong>Rust Toolchain:</strong> Rust 1.75 or newer (<code>rustup default stable</code>).</li>
+<li><strong>Hardware:</strong> Any modern x86_64 or aarch64 CPU, 4 GB+ RAM.</li>
+</ul>
+<hr>
+<h2 id="1-dependencies"><a class="header" href="#1-dependencies">1. Dependencies</a></h2>
+<h3 id="what-each-one-is-for"><a class="header" href="#what-each-one-is-for">What each one is for</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th style="text-align: left">Dependency</th><th style="text-align: left">Kind</th><th style="text-align: left">Needed for</th><th style="text-align: left">If missing</th></tr>
+</thead>
+<tbody>
+<tr><td style="text-align: left">Rust 1.75+, C compiler, <code>pkg-config</code></td><td style="text-align: left">Build</td><td style="text-align: left">Compiling</td><td style="text-align: left">Build fails</td></tr>
+<tr><td style="text-align: left">GTK 4 (4.12+), libadwaita (1.4+)</td><td style="text-align: left">Build + run</td><td style="text-align: left">The interface</td><td style="text-align: left">Build fails</td></tr>
+<tr><td style="text-align: left">SQLite</td><td style="text-align: left">Build + run</td><td style="text-align: left">The catalogue (bundled by default)</td><td style="text-align: left">(none)</td></tr>
+<tr><td style="text-align: left">LittleCMS 2 (<code>lcms2</code>)</td><td style="text-align: left">Build + run</td><td style="text-align: left">Colour management, ICC export</td><td style="text-align: left">Build fails</td></tr>
+<tr><td style="text-align: left">libheif</td><td style="text-align: left">Build + run</td><td style="text-align: left">HEIC / HEIF / AVIF decoding</td><td style="text-align: left">Build fails</td></tr>
+<tr><td style="text-align: left">GStreamer + plugins (<code>-good</code>, <code>-libav</code>)</td><td style="text-align: left">Run</td><td style="text-align: left">Video playback and thumbnails</td><td style="text-align: left">Videos do not play</td></tr>
+<tr><td style="text-align: left"><strong>OpenVINO 2026.x + oneTBB</strong></td><td style="text-align: left">Run, optional</td><td style="text-align: left"><a href="#ai-focus--quality-analysis">AI focus and quality analysis</a></td><td style="text-align: left">AI is shown as unavailable; everything else works</td></tr>
+<tr><td style="text-align: left">YuNet face model (about 230 KB)</td><td style="text-align: left">Run, optional</td><td style="text-align: left">Eye-focus scoring</td><td style="text-align: left">Downloaded from Preferences → AI</td></tr>
+<tr><td style="text-align: left">Intel GPU / NPU drivers</td><td style="text-align: left">Run, optional</td><td style="text-align: left">Faster AI inference</td><td style="text-align: left">The CPU is used</td></tr>
+<tr><td style="text-align: left">darktable (<code>darktable-cli</code>)</td><td style="text-align: left">Run, optional</td><td style="text-align: left">RAW export rendered with your darktable edits</td><td style="text-align: left">Photon’s built-in RAW renderer is used</td></tr>
+<tr><td style="text-align: left"><code>exiftool</code></td><td style="text-align: left">Run, optional</td><td style="text-align: left">Fuller metadata in exports; video dates</td><td style="text-align: left">A reduced built-in metadata writer is used</td></tr>
+</tbody>
+</table>
+</div>
+<p>RAW decoding uses the pure-Rust <code>rawler</code> crate, so <strong>LibRaw is not required</strong>. The Rust crates are fetched by Cargo.</p>
+<blockquote class="blockquote-tag blockquote-tag-note">
+<p class="blockquote-tag-title"><svg viewbox="0 0 16 16" width="18" height="18"><path d="M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM6.5 7.75A.75.75 0 0 1 7.25 7h1a.75.75 0 0 1 .75.75v2.75h.25a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1 0-1.5h.25v-2h-.25a.75.75 0 0 1-.75-.75ZM8 6a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z"></path></svg>Note</p>
+<p>Everything marked <em>optional</em> can be added later. Photon detects it at start-up and enables the matching feature.</p>
+</blockquote>
+<hr>
+<h2 id="2-install-system-dependencies"><a class="header" href="#2-install-system-dependencies">2. Install System Dependencies</a></h2>
+<h3 id="fedora--rhel--centos-stream"><a class="header" href="#fedora--rhel--centos-stream">Fedora / RHEL / CentOS Stream</a></h3>
+<pre><code class="language-bash">sudo dnf install -y \
+    gcc gcc-c++ pkgconf-pkg-config \
+    gtk4-devel libadwaita-devel \
+    sqlite-devel lcms2-devel libheif-devel \
+    gstreamer1-devel gstreamer1-plugins-base-devel \
+    gstreamer1-plugins-bad-free-devel
+</code></pre>
+<h3 id="debian-12--ubuntu-2310--linux-mint"><a class="header" href="#debian-12--ubuntu-2310--linux-mint">Debian 12 / Ubuntu 23.10+ / Linux Mint</a></h3>
+<pre><code class="language-bash">sudo apt update &amp;&amp; sudo apt install -y \
+    build-essential pkg-config \
+    libgtk-4-dev libadwaita-1-dev \
+    libsqlite3-dev liblcms2-dev libheif-dev \
+    libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+    libgstreamer-plugins-bad1.0-dev
+</code></pre>
+<h3 id="arch-linux--manjaro"><a class="header" href="#arch-linux--manjaro">Arch Linux / Manjaro</a></h3>
+<pre><code class="language-bash">sudo pacman -S --needed \
+    base-devel gtk4 libadwaita sqlite lcms2 \
+    libheif gstreamer gst-plugins-base
+</code></pre>
+<hr>
+<h2 id="3-compile-from-source"><a class="header" href="#3-compile-from-source">3. Compile from Source</a></h2>
+<pre><code class="language-bash"># 1. Clone the repository
+git clone https://github.com/rudrab/Photon.git
+cd Photon
+
+# 2. Run the test suite
+cargo test --release
+
+# 3. Build the optimized release binary
+cargo build --release -p photon-app
+
+# 4. Run Photon
+./target/release/photon
+</code></pre>
+<hr>
+<h2 id="4-optional-ai-analysis-and-other-helpers"><a class="header" href="#4-optional-ai-analysis-and-other-helpers">4. Optional: AI Analysis and Other Helpers</a></h2>
+<pre><code class="language-bash"># Fedora: AI runtime (OpenVINO needs oneTBB, which it does not pull in)
+sudo dnf install openvino tbb
+
+# Fedora: optional helpers
+sudo dnf install darktable perl-Image-ExifTool gstreamer1-plugins-good gstreamer1-libav
+</code></pre>
+<p>Then start Photon and open <strong>Preferences → AI</strong> to check the detected devices and download the face model. See <a href="#ai-focus--quality-analysis">AI Focus &amp; Quality Analysis</a> for details, including GPU and NPU notes.</p>
+<hr>
+<h2 id="5-desktop-integration-optional"><a class="header" href="#5-desktop-integration-optional">5. Desktop Integration (Optional)</a></h2>
+<p>To add Photon to your application launcher, use the desktop entry and icon shipped in <code>assets/</code>:</p>
+<pre><code class="language-bash">install -Dm755 target/release/photon ~/.local/bin/photon
+install -Dm644 assets/org.mavensgroup.photon.desktop ~/.local/share/applications/org.mavensgroup.photon.desktop
+install -Dm644 assets/org.mavensgroup.photon.svg ~/.local/share/icons/hicolor/scalable/apps/org.mavensgroup.photon.svg
+
+update-desktop-database ~/.local/share/applications/
+gtk-update-icon-cache -f ~/.local/share/icons/hicolor 2&gt;/dev/null || true
+</code></pre>
+<p>Make sure <code>~/.local/bin</code> is on your <code>PATH</code>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="ingestion--backup-safety"><a class="header" href="#ingestion--backup-safety">Ingestion &amp; Backup Safety</a></h1>
+<p>Photon is designed with strict file integrity guarantees to ensure that zero photos are lost or corrupted during card ingest, even in the event of hardware disconnection or power failure.</p>
+<hr>
+<h2 id="1-staged-atomic-commit-pipeline"><a class="header" href="#1-staged-atomic-commit-pipeline">1. Staged Atomic Commit Pipeline</a></h2>
+<p>When importing photos into a managed library structure (<code>YYYY/MM/DD</code>), Photon implements a three-stage transactional pipeline:</p>
+<pre><code>[ Camera Card / Source ]
+           │
+           ▼
+[ 1. Staged Copy ] ──► Write to temporary destination (.part)
+           │
+           ▼
+[ 2. Byte Hash Verification ] ──► BLAKE3 streaming verification
+           │
+           ▼
+[ 3. Atomic Rename ] ──► Atomic filesystem rename to final filename
+           │
+           ▼
+[ 4. Database Transaction ] ──► SQLite WAL progressive batch insert
+</code></pre>
+<ul>
+<li><strong>Zero Partial Files:</strong> If a memory card is pulled or the process is killed mid-copy, Photon’s startup sweep automatically purges dangling <code>.part</code> files.</li>
+<li><strong>Non-Blocking Ingest:</strong> Photos are progressively committed in batches, making them visible in the timeline while the remainder of the card imports.</li>
+</ul>
+<hr>
+<h2 id="2-card-wipe-mirror-backup-protection"><a class="header" href="#2-card-wipe-mirror-backup-protection">2. Card-Wipe Mirror Backup Protection</a></h2>
+<p>Performing a <strong>Move</strong> import from an SD card is normally risky. Photon provides built-in hardware protection:</p>
+<ul>
+<li><strong>Automated Secondary Mirroring:</strong> In <strong>Preferences → Import Safety</strong>, configure a secondary backup location (such as an external SSD or network share).</li>
+<li><strong>Safe Sequence:</strong> When moving files, Photon writes the copy to the primary library, verifies the second copy to the backup destination, and only deletes the file from the SD card after <strong>both copies pass full hash verification</strong>.</li>
+</ul>
+<hr>
+<h2 id="3-streaming-hash-deduplication"><a class="header" href="#3-streaming-hash-deduplication">3. Streaming Hash Deduplication</a></h2>
+<p>Photon computes streaming BLAKE3 content hashes for all imported media:</p>
+<ul>
+<li><strong>In-Place Duplicates:</strong> If a photo is already registered in the database, Photon skips copying without re-reading the full file.</li>
+<li><strong>Same-Hash Protection:</strong> If the exact same file is imported under a different name or from another folder, Photon recognizes the duplicate hash and records the reference without duplicating on-disk storage.</li>
+</ul>
+<hr>
+<h2 id="4-raw--jpeg-shot-grouping"><a class="header" href="#4-raw--jpeg-shot-grouping">4. RAW + JPEG Shot Grouping</a></h2>
+<p>When shooting RAW+JPEG pairs:</p>
+<ul>
+<li>Photon groups pairs under a single <code>group_hash</code> based on timestamp, camera serial number, and capture metadata.</li>
+<li>In the timeline, the shot appears as a single unified card.</li>
+<li>In the 1-up viewer, a version switcher button (<code>V</code>) allows instant switching between the embedded camera JPEG and the raw sensor data.</li>
+<li>Any rating, color label, pick flag, or tag applied to the shot applies to both the RAW and JPEG sidecars simultaneously.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="keyboard-culling--triage"><a class="header" href="#keyboard-culling--triage">Keyboard Culling &amp; Triage</a></h1>
+<p>Photon provides high-speed, keyboard-driven triage modeled on commercial standards (Photo Mechanic and Lightroom Classic).</p>
+<hr>
+<h2 id="1-ergonomic-shortcuts"><a class="header" href="#1-ergonomic-shortcuts">1. Ergonomic Shortcuts</a></h2>
+<p>All culling actions operate in both the timeline grid and the 1-up photo viewer:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th style="text-align: left">Shortcut</th><th style="text-align: left">Action</th><th style="text-align: left">Effect</th></tr>
+</thead>
+<tbody>
+<tr><td style="text-align: left"><code>1</code>–<code>5</code></td><td style="text-align: left">Star Rating</td><td style="text-align: left">Sets rating from 1 to 5 stars (<code>xmp:Rating</code>)</td></tr>
+<tr><td style="text-align: left"><code>0</code> / <code>`</code></td><td style="text-align: left">Clear Rating / Color</td><td style="text-align: left">Sets rating to 0 and clears color label</td></tr>
+<tr><td style="text-align: left"><code>6</code></td><td style="text-align: left">Red Label</td><td style="text-align: left">Sets Color Label to Red (<code>xmp:Label="Red"</code>, <code>darktable:colorlabels=0</code>)</td></tr>
+<tr><td style="text-align: left"><code>7</code></td><td style="text-align: left">Yellow Label</td><td style="text-align: left">Sets Color Label to Yellow (<code>xmp:Label="Yellow"</code>, <code>darktable:colorlabels=1</code>)</td></tr>
+<tr><td style="text-align: left"><code>8</code></td><td style="text-align: left">Green Label</td><td style="text-align: left">Sets Color Label to Green (<code>xmp:Label="Green"</code>, <code>darktable:colorlabels=2</code>)</td></tr>
+<tr><td style="text-align: left"><code>9</code></td><td style="text-align: left">Blue Label</td><td style="text-align: left">Sets Color Label to Blue (<code>xmp:Label="Blue"</code>, <code>darktable:colorlabels=3</code>)</td></tr>
+<tr><td style="text-align: left"><code>P</code></td><td style="text-align: left">Pick Flag</td><td style="text-align: left">Marks shot as flagged pick (<code>flagged = 1</code>)</td></tr>
+<tr><td style="text-align: left"><code>X</code></td><td style="text-align: left">Reject Flag</td><td style="text-align: left">Marks shot as reject (<code>flagged = -1</code>, <code>xmp:Rating = -1</code>)</td></tr>
+<tr><td style="text-align: left"><code>U</code></td><td style="text-align: left">Unflag</td><td style="text-align: left">Clears pick/reject status</td></tr>
+<tr><td style="text-align: left"><code>[</code> / <code>]</code></td><td style="text-align: left">Rotate</td><td style="text-align: left">Rotates counter-clockwise / clockwise (updates EXIF orientation)</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="2-shift-auto-advance"><a class="header" href="#2-shift-auto-advance">2. Shift Auto-Advance</a></h2>
+<p>Holding <strong>Shift</strong> while pressing any rating or flag shortcut (<code>Shift+1</code> through <code>Shift+9</code>, <code>Shift+P</code>, <code>Shift+X</code>, <code>Shift+U</code>) applies the metadata change and <strong>automatically advances to the next photo immediately</strong>, cutting culling time in half.</p>
+<hr>
+<h2 id="3-the-continuous-sub-pixel-canvas-photoview"><a class="header" href="#3-the-continuous-sub-pixel-canvas-photoview">3. The Continuous Sub-Pixel Canvas (<code>PhotoView</code>)</a></h2>
+<p>The 1-up viewer canvas (<code>photo_view.rs</code>) provides precise focus verification:</p>
+<ul>
+<li><strong>Instant 1:1 Pixel Lock (<code>Z</code> or Double Click):</strong> Immediately toggles between Fit-to-Screen and 100% full-resolution sensor crop.</li>
+<li><strong>Anchor-Preserved Zoom:</strong> Dragging the zoom slider or using <code>Ctrl+Scroll</code> continuously zooms into the exact image coordinates directly beneath the mouse cursor without jumping.</li>
+<li><strong>Persistent Zoom During Rating:</strong> Changing star ratings or color labels while zoomed into a photo retains the current zoom scale and pan position.</li>
+</ul>
+<hr>
+<h2 id="4-side-by-side-dual-compare-mode"><a class="header" href="#4-side-by-side-dual-compare-mode">4. Side-by-Side Dual Compare Mode</a></h2>
+<p>When choosing between similar candidate shots:</p>
+<ol>
+<li>Select two photos in the timeline grid.</li>
+<li>Press <code>C</code> (or the Compare button in the bottom selection bar).</li>
+<li>Photon renders both frames side-by-side with synchronized zoom and metadata controls, allowing you to pick the winner and reject the duplicate in one view.</li>
+</ol>
+<hr>
+<h2 id="5-50-step-reversible-undo-stack"><a class="header" href="#5-50-step-reversible-undo-stack">5. 50-Step Reversible Undo Stack</a></h2>
+<p>Photon maintains an in-memory transactional undo/redo stack (<code>UndoManager</code>):</p>
+<ul>
+<li>Press <strong><code>Ctrl+Z</code></strong> to undo the last rating, color label, pick flag, tag, rotation, or trash action.</li>
+<li>Press <strong><code>Ctrl+Shift+Z</code></strong> to redo.</li>
+<li>Restoring a trashed image automatically recovers the source file from the FreeDesktop Trash bin, re-inserts all database relationships, and writes the sidecar.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="darktable-2-way-synchronization"><a class="header" href="#darktable-2-way-synchronization">Darktable 2-Way Synchronization</a></h1>
+<p>Photon is engineered as the primary ingestion, culling, and Digital Asset Management companion for <strong>Darktable</strong>.</p>
+<hr>
+<h2 id="1-non-destructive-sidecar-synchronization"><a class="header" href="#1-non-destructive-sidecar-synchronization">1. Non-Destructive Sidecar Synchronization</a></h2>
+<p>Photon stores metadata in standard <code>.xmp</code> sidecars associated with your RAW and raster files:</p>
+<pre><code class="language-xml">&lt;x:xmpmeta xmlns:x="adobe:ns:meta/"&gt;
+ &lt;rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"&gt;
+  &lt;rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:darktable="http://darktable.sf.net/"
+    xmlns:dc="http://purl.org/dc/elements/1.1/"
+    xmlns:tiff="http://ns.adobe.com/tiff/1.0/"
+    xmp:Rating="4"
+    xmp:Label="Red"
+    tiff:Orientation="1"&gt;
+   &lt;darktable:colorlabels&gt;
+    &lt;rdf:Seq&gt;
+     &lt;rdf:li&gt;0&lt;/rdf:li&gt;
+    &lt;/rdf:Seq&gt;
+   &lt;/darktable:colorlabels&gt;
+   &lt;dc:subject&gt;
+    &lt;rdf:Bag&gt;
+     &lt;rdf:li&gt;Landscape&lt;/rdf:li&gt;
+     &lt;rdf:li&gt;Sunset&lt;/rdf:li&gt;
+    &lt;/rdf:Bag&gt;
+   &lt;/dc:subject&gt;
+   &lt;!-- Darktable edit history is preserved untouched --&gt;
+   &lt;darktable:history&gt;
+    ...
+   &lt;/darktable:history&gt;
+  &lt;/rdf:Description&gt;
+ &lt;/rdf:RDF&gt;
+&lt;/x:xmpmeta&gt;
+</code></pre>
+<hr>
+<h2 id="2-edit-history-protection"><a class="header" href="#2-edit-history-protection">2. Edit History Protection</a></h2>
+<p>Other photo managers often overwrite or invalidate Darktable’s non-destructive processing modules when editing metadata.</p>
+<p>Photon’s XML engine (<code>photon-import/src/sidecar.rs</code>):</p>
+<ul>
+<li>Parses existing sidecars and <strong>preserves all <code>&lt;darktable:history&gt;</code> blocks, parametric masks, and module states intact</strong>.</li>
+<li>Only updates ratings, color labels, tags, titles, and descriptions.</li>
+</ul>
+<hr>
+<h2 id="3-color-label-mapping"><a class="header" href="#3-color-label-mapping">3. Color Label Mapping</a></h2>
+<p>Color labels are synchronized across standard Adobe/Lightroom formats and Darktable sequences:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th style="text-align: left">Color</th><th style="text-align: left"><code>xmp:Label</code></th><th style="text-align: left"><code>darktable:colorlabels</code> sequence</th><th style="text-align: left">Key</th></tr>
+</thead>
+<tbody>
+<tr><td style="text-align: left"><strong>None</strong></td><td style="text-align: left">Removed</td><td style="text-align: left">Removed</td><td style="text-align: left"><code>0</code></td></tr>
+<tr><td style="text-align: left"><strong>Red</strong></td><td style="text-align: left"><code>Red</code></td><td style="text-align: left"><code>0</code></td><td style="text-align: left"><code>6</code></td></tr>
+<tr><td style="text-align: left"><strong>Yellow</strong></td><td style="text-align: left"><code>Yellow</code></td><td style="text-align: left"><code>1</code></td><td style="text-align: left"><code>7</code></td></tr>
+<tr><td style="text-align: left"><strong>Green</strong></td><td style="text-align: left"><code>Green</code></td><td style="text-align: left"><code>2</code></td><td style="text-align: left"><code>8</code></td></tr>
+<tr><td style="text-align: left"><strong>Blue</strong></td><td style="text-align: left"><code>Blue</code></td><td style="text-align: left"><code>3</code></td><td style="text-align: left"><code>9</code></td></tr>
+<tr><td style="text-align: left"><strong>Purple</strong></td><td style="text-align: left"><code>Purple</code></td><td style="text-align: left"><code>4</code></td><td style="text-align: left">Menu</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="4-live-focus-sync--ping-pong-loop-prevention"><a class="header" href="#4-live-focus-sync--ping-pong-loop-prevention">4. Live Focus Sync &amp; Ping-Pong Loop Prevention</a></h2>
+<ul>
+<li><strong>External Changes Detected:</strong> When you switch back to the Photon window from Darktable, Photon automatically checks the <code>mtime</code> of sidecars and refreshes ratings or tags applied in Darktable.</li>
+<li><strong>Timestamp Tracking:</strong> Photon records the exact <code>xmp_mtime</code> written during its own saves, preventing infinite reload cycles.</li>
+</ul>
+<hr>
+<h2 id="5-recommended-darktable-settings"><a class="header" href="#5-recommended-darktable-settings">5. Recommended Darktable Settings</a></h2>
+<p>To ensure the smoothest two-way synchronization:</p>
+<ol>
+<li>In Darktable, open <strong>Preferences → Storage</strong>.</li>
+<li>Set <strong>“write sidecar file for each image”</strong> to <strong>“on edit”</strong> or <strong>“always”</strong>.</li>
+<li>When returning to Darktable after culling in Photon, select the photos in the Lighttable and click <strong>“reload selected XMP files”</strong> (or enable automatic sidecar lookup on startup).</li>
+</ol>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="ai-focus--quality-analysis"><a class="header" href="#ai-focus--quality-analysis">AI Focus &amp; Quality Analysis</a></h1>
+<p>Photon can check your photos for blur, missed eye focus, and clipped exposure, and suggest which shots to reject. All analysis runs <strong>on your machine</strong>. No photo, thumbnail, face or score is ever sent anywhere.</p>
+<blockquote class="blockquote-tag blockquote-tag-note">
+<p class="blockquote-tag-title"><svg viewbox="0 0 16 16" width="18" height="18"><path d="M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM6.5 7.75A.75.75 0 0 1 7.25 7h1a.75.75 0 0 1 .75.75v2.75h.25a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1 0-1.5h.25v-2h-.25a.75.75 0 0 1-.75-.75ZM8 6a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z"></path></svg>Note</p>
+<p>AI is <strong>optional</strong>. Without OpenVINO or the face model, Photon works normally. The whole-frame blur and exposure checks still run; only the eye-focus check is skipped. Nothing is ever rejected automatically: Photon <em>suggests</em> and you confirm.</p>
+</blockquote>
+<hr>
+<h2 id="1-what-you-need"><a class="header" href="#1-what-you-need">1. What you need</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th style="text-align: left">Requirement</th><th style="text-align: left">Needed for</th><th style="text-align: left">Notes</th></tr>
+</thead>
+<tbody>
+<tr><td style="text-align: left"><strong>OpenVINO runtime</strong> (<code>libopenvino_c.so</code>)</td><td style="text-align: left">Face and eye-focus detection</td><td style="text-align: left">Loaded at run time; not needed to build or start Photon. Tested with 2026.0.</td></tr>
+<tr><td style="text-align: left"><strong>oneTBB</strong> (<code>libtbb.so.12</code>)</td><td style="text-align: left">OpenVINO itself</td><td style="text-align: left">On Fedora the <code>openvino</code> package does not pull it in; install <code>tbb</code>.</td></tr>
+<tr><td style="text-align: left"><strong>YuNet face model</strong> (about 230 KB)</td><td style="text-align: left">Face and eye-focus detection</td><td style="text-align: left">Not bundled. Downloaded once, after you confirm.</td></tr>
+<tr><td style="text-align: left">Intel GPU / NPU drivers</td><td style="text-align: left">Optional acceleration</td><td style="text-align: left">The CPU is the default and is fast enough (see below).</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="install-openvino"><a class="header" href="#install-openvino">Install OpenVINO</a></h3>
+<pre><code class="language-bash"># Fedora
+sudo dnf install openvino tbb
+</code></pre>
+<p>Other distributions: install an OpenVINO 2026.x runtime that provides <code>libopenvino_c.so</code> (from your distribution, or Intel’s archives), plus oneTBB.</p>
+<p>Optional acceleration, for Intel hardware only:</p>
+<pre><code class="language-bash">sudo dnf install intel-compute-runtime   # Intel GPU
+sudo usermod -aG render "$USER"          # permission to use /dev/dri (log out and in)
+</code></pre>
+<blockquote class="blockquote-tag blockquote-tag-warning">
+<p class="blockquote-tag-title"><svg viewbox="0 0 16 16" width="18" height="18"><path d="M6.457 1.047c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0 1 14.082 15H1.918a1.75 1.75 0 0 1-1.543-2.575Zm1.763.707a.25.25 0 0 0-.44 0L1.698 13.132a.25.25 0 0 0 .22.368h12.164a.25.25 0 0 0 .22-.368Zm.53 3.996v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z"></path></svg>Warning</p>
+<p><strong>NPU:</strong> Fedora’s OpenVINO does not yet ship the NPU plugin (<code>libopenvino_intel_npu_plugin.so</code>), so the NPU cannot be used even with <code>intel-npu-driver</code> installed. Photon reports this in Preferences.</p>
+</blockquote>
+<h3 id="download-the-model"><a class="header" href="#download-the-model">Download the model</a></h3>
+<ol>
+<li>Open <strong>Preferences → AI</strong>.</li>
+<li>Under <strong>AI Models</strong>, choose <strong>Download</strong> on <em>YuNet</em>. Photon downloads it only after you confirm.</li>
+<li>The file is saved to <code>~/.local/share/photon/models/</code> and checked against a fixed SHA-256 before it is used, and again before every load. A corrupt or altered file is refused.</li>
+</ol>
+<p>The same page lists the devices OpenVINO found (CPU, GPU, NPU). For any device it does not list, Photon says why: a missing driver, a missing plugin, or a missing permission.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th style="text-align: left">Model</th><th style="text-align: left">Task</th><th style="text-align: left">Licence</th><th style="text-align: left">Source</th></tr>
+</thead>
+<tbody>
+<tr><td style="text-align: left">YuNet 2023mar</td><td style="text-align: left">Face detection with 5 landmarks</td><td style="text-align: left">MIT</td><td style="text-align: left"><a href="https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet">OpenCV Zoo</a></td></tr>
+</tbody>
+</table>
+</div>
+<blockquote class="blockquote-tag blockquote-tag-tip">
+<p class="blockquote-tag-title"><svg viewbox="0 0 16 16" width="18" height="18"><path d="M8 1.5c-2.363 0-4 1.69-4 3.75 0 .984.424 1.625.984 2.304l.214.253c.223.264.47.556.673.848.284.411.537.896.621 1.49a.75.75 0 0 1-1.484.211c-.04-.282-.163-.547-.37-.847a8.456 8.456 0 0 0-.542-.68c-.084-.1-.173-.205-.268-.32C3.201 7.75 2.5 6.766 2.5 5.25 2.5 2.31 4.863 0 8 0s5.5 2.31 5.5 5.25c0 1.516-.701 2.5-1.328 3.259-.095.115-.184.22-.268.319-.207.245-.383.453-.541.681-.208.3-.33.565-.37.847a.751.751 0 0 1-1.485-.212c.084-.593.337-1.078.621-1.489.203-.292.45-.584.673-.848.075-.088.147-.173.213-.253.561-.679.985-1.32.985-2.304 0-2.06-1.637-3.75-4-3.75ZM5.75 12h4.5a.75.75 0 0 1 0 1.5h-4.5a.75.75 0 0 1 0-1.5ZM6 15.25a.75.75 0 0 1 .75-.75h2.5a.75.75 0 0 1 0 1.5h-2.5a.75.75 0 0 1-.75-.75Z"></path></svg>Tip</p>
+<p>Photon only makes network requests to download a model you asked for. Delete it from <strong>Preferences → AI</strong> at any time.</p>
+</blockquote>
+<h3 id="speed"><a class="header" href="#speed">Speed</a></h3>
+<p>Measured on a Core Ultra 5 125H, 640 × 640 input:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th style="text-align: left">Device</th><th style="text-align: left">Median per frame</th></tr>
+</thead>
+<tbody>
+<tr><td style="text-align: left">CPU (default)</td><td style="text-align: left">4.6 ms</td></tr>
+<tr><td style="text-align: left">Intel Arc GPU</td><td style="text-align: left">2.8 ms, but about 460 MB more memory</td></tr>
+</tbody>
+</table>
+</div>
+<p>Decoding the preview takes longer than either, which is why the CPU is the default.</p>
+<hr>
+<h2 id="2-running-the-analysis"><a class="header" href="#2-running-the-analysis">2. Running the analysis</a></h2>
+<p>Choose <strong>Analyse Photo Quality…</strong> from the menu. Photon scores the photos in your selection, or in the current view if nothing is selected (a day, event, album, tag or search). Progress is shown, and you can stop at any time. When it finishes, the photos it suggests rejecting are listed for you to confirm.</p>
+<ul>
+<li>Scores are stored, so later runs only score new photos. <strong>Analyse Again</strong> re-scores everything.</li>
+<li>A <strong>Possibly blurred</strong> filter shows the suspect photos in the grid.</li>
+<li>Confirmed rejects are written like a manual reject: to the catalogue and the XMP sidecar, and you can undo them.</li>
+<li>Photon never suggests a pick, a photo you have already rejected, or the best frame of a burst.</li>
+</ul>
+<hr>
+<h2 id="3-what-is-measured"><a class="header" href="#3-what-is-measured">3. What is measured</a></h2>
+<p>All measurements use the <strong>Large preview</strong> (scaled to 1024 px), so RAW files are not fully decoded.</p>
+<h3 id="whole-frame-sharpness"><a class="header" href="#whole-frame-sharpness">Whole-frame sharpness</a></h3>
+<p>The variance of the Laplacian, taken over a 4 × 4 grid of tiles. The sharpest tile counts, so a sharp subject on a soft background is not penalised.</p>
+<h3 id="eye-sharpness-needs-the-face-model"><a class="header" href="#eye-sharpness-needs-the-face-model">Eye sharpness (needs the face model)</a></h3>
+<p>Whole-frame sharpness cannot tell a blurred face in front of a detailed background from a sharp one. So, when a face model is available:</p>
+<ol>
+<li>YuNet finds the faces; the largest is treated as the subject.</li>
+<li>The area around both eyes is cropped and scaled to a fixed width, so faces of different sizes compare fairly.</li>
+<li>The variance of the Laplacian of that crop measures the micro-contrast of the iris and lashes.</li>
+</ol>
+<h3 id="exposure"><a class="header" href="#exposure">Exposure</a></h3>
+<ul>
+<li><strong>Blown highlights:</strong> more than 25 % of pixels at luma 253 or above.</li>
+<li><strong>Crushed shadows:</strong> more than 35 % of pixels at luma 2 or below.</li>
+</ul>
+<p>A saturated colour is not counted as clipped.</p>
+<hr>
+<h2 id="4-when-a-shot-is-suggested-for-rejection"><a class="header" href="#4-when-a-shot-is-suggested-for-rejection">4. When a shot is suggested for rejection</a></h2>
+<p>Photon judges each <strong>shot</strong>, not each file: a RAW and its JPEG companion count once and are suggested together.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th style="text-align: left">Situation</th><th style="text-align: left">A shot is suggested when…</th></tr>
+</thead>
+<tbody>
+<tr><td style="text-align: left"><strong>Burst</strong> (2 or more shots, same camera, up to 2 s apart)</td><td style="text-align: left">its sharpness is below 60 % of the burst’s sharpest</td></tr>
+<tr><td style="text-align: left"><strong>Not in a burst</strong></td><td style="text-align: left">its sharpness is below 8 % of your library’s median</td></tr>
+<tr><td style="text-align: left"><strong>Faces, in a session</strong> (same camera, within ±30 min, 3 or more face shots)</td><td style="text-align: left">its eye sharpness is below 50 % of the session’s 80th percentile</td></tr>
+<tr><td style="text-align: left"><strong>Faces, in a burst</strong></td><td style="text-align: left">its eye sharpness is below 60 % of the sharpest eyes in the burst</td></tr>
+<tr><td style="text-align: left"><strong>Exposure</strong></td><td style="text-align: left">highlights or shadows are clipped beyond the limits above</td></tr>
+</tbody>
+</table>
+</div>
+<p>If a session has too few face shots, the library’s 80th percentile is used instead.</p>
+<hr>
+<h2 id="5-limits"><a class="header" href="#5-limits">5. Limits</a></h2>
+<ul>
+<li>Motion blur that leaves sharp specular highlights can score higher than it looks.</li>
+<li>Only the largest face in a frame is measured.</li>
+<li>Analysis is not run during import.</li>
+<li>The thresholds are tuned on one photographer’s library. Treat the suggestions as a shortlist and check them in the viewer before confirming.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="smart-collections--rules"><a class="header" href="#smart-collections--rules">Smart Collections &amp; Rules</a></h1>
+<p>Smart Collections in Photon are dynamic, saved queries that automatically update their contents and live count badges as your library changes.</p>
+<hr>
+<h2 id="1-creating-a-smart-collection"><a class="header" href="#1-creating-a-smart-collection">1. Creating a Smart Collection</a></h2>
+<ol>
+<li>In the navigation sidebar, locate the <strong>Smart Collections</strong> section.</li>
+<li>Click the <strong><code>+</code></strong> button in the section header.</li>
+<li>Configure your desired filtering criteria in the dialog:
+<ul>
+<li><strong>Collection Name:</strong> e.g., “5-Star Landscapes”, “Recent Sony Picks”.</li>
+<li><strong>Minimum Star Rating:</strong> Any rating, ★ 1+, ★ 2+, ★ 3+, ★ 4+, or ★ 5.</li>
+<li><strong>Status / Flag:</strong> Any status, Picks only, Unflagged only, or Rejects only.</li>
+<li><strong>Colour Label:</strong> Any colour, No colour (None), 🔴 Red, 🟡 Yellow, 🟢 Green, 🔵 Blue, or 🟣 Purple.</li>
+<li><strong>Text Search / Keyword:</strong> Substring or filename match (e.g., “sunset”, “raw”).</li>
+<li><strong>Included Tags:</strong> Comma-separated list of required tags (e.g. <code>nature, travel</code>).</li>
+<li><strong>Excluded Tags:</strong> Comma-separated list of excluded tags (e.g. <code>draft, private</code>).</li>
+<li><strong>Camera Model:</strong> e.g., <code>Sony A7IV</code>, <code>Canon EOS R5</code>.</li>
+<li><strong>Lens Model:</strong> e.g., <code>50mm</code>, <code>24-70mm</code>.</li>
+<li><strong>Exclude Rejected Photos:</strong> Automatically excludes <code>flagged = -1</code> items.</li>
+</ul>
+</li>
+<li>Click <strong>Create Collection</strong>.</li>
+</ol>
+<hr>
+<h2 id="2-live-dynamic-evaluation"><a class="header" href="#2-live-dynamic-evaluation">2. Live Dynamic Evaluation</a></h2>
+<p>Smart collections are stored as structured JSON queries in the <code>smart_collections</code> SQLite table:</p>
+<ul>
+<li>Every time photos are imported, rated, flagged, or tagged, Photon re-evaluates the query in SQL.</li>
+<li>The badge next to the smart collection in the sidebar displays the <strong>live photo count</strong> in real-time.</li>
+<li>Selecting the collection displays matching photos in the virtualized timeline.</li>
+</ul>
+<hr>
+<h2 id="3-managing-collections"><a class="header" href="#3-managing-collections">3. Managing Collections</a></h2>
+<p>Right-click any Smart Collection in the sidebar to open the context menu:</p>
+<ul>
+<li><strong>Edit Rules…:</strong> Re-opens the rules dialog with current criteria populated.</li>
+<li><strong>Rename…:</strong> Quick rename dialog.</li>
+<li><strong>Delete Collection:</strong> Removes the smart collection from the sidebar (underlying photos remain safe in your library).</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="color-management--icc"><a class="header" href="#color-management--icc">Color Management &amp; ICC</a></h1>
+<p>Photon includes a complete color management pipeline based on <strong>LittleCMS2 (<code>lcms2</code>)</strong> to guarantee color fidelity across wide-gamut displays, raw sensor renders, and exported deliverables.</p>
+<hr>
+<h2 id="1-embedded-icc-profile-extraction"><a class="header" href="#1-embedded-icc-profile-extraction">1. Embedded ICC Profile Extraction</a></h2>
+<p>When importing and rendering images:</p>
+<ul>
+<li>Photon parses embedded color spaces directly from image metadata:
+<ul>
+<li><strong>JPEG:</strong> APP2 <code>ICC_PROFILE</code> segments.</li>
+<li><strong>TIFF:</strong> Tag <code>34675</code> (<code>Exif.Image.InterColorProfile</code>).</li>
+<li><strong>PNG:</strong> <code>iCCP</code> chunks.</li>
+<li><strong>HEIC / AVIF:</strong> <code>colr</code> boxes.</li>
+</ul>
+</li>
+<li>If no embedded profile is detected, Photon safely assumes the standard <strong>sRGB</strong> color space.</li>
+</ul>
+<hr>
+<h2 id="2-littlecms2-color-transformation-pipeline"><a class="header" href="#2-littlecms2-color-transformation-pipeline">2. LittleCMS2 Color Transformation Pipeline</a></h2>
+<ul>
+<li><strong>Thumbnail &amp; Preview Normalization:</strong> All wide-gamut sources (such as AdobeRGB or Display P3 camera JPEGs) are transformed through LittleCMS2 into calibrated sRGB texture representations, preventing the desaturated or washed-out appearance common in basic image viewers.</li>
+<li><strong>16-Bit Processing:</strong> During high-precision export, Photon maintains a 16-bit linear color transform pipeline directly from the RAW decode stage.</li>
+</ul>
+<hr>
+<h2 id="3-export-output-color-spaces"><a class="header" href="#3-export-output-color-spaces">3. Export Output Color Spaces</a></h2>
+<p>When exporting photos (<strong><code>Ctrl+E</code></strong>), you can select the target color profile:</p>
+<ul>
+<li><strong>sRGB (Standard):</strong> Recommended for web publishing, social media, and consumer printing.</li>
+<li><strong>AdobeRGB (1998):</strong> Wide-gamut color space ideal for commercial offset printing and publishing.</li>
+<li><strong>Display P3:</strong> Wide-gamut color space designed for modern Apple displays, OLED screens, and HDR monitors.</li>
+</ul>
+<p>Photon embeds the selected ICC profile directly into the exported JPEG, TIFF, or WebP file container.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="export--production-pipeline"><a class="header" href="#export--production-pipeline">Export &amp; Production Pipeline</a></h1>
+<p>Photon includes a full-featured production export engine designed for delivering finished assets to clients, web galleries, or print labs.</p>
+<hr>
+<h2 id="1-export-formats--depth"><a class="header" href="#1-export-formats--depth">1. Export Formats &amp; Depth</a></h2>
+<ul>
+<li><strong>JPEG:</strong> Optimized 8-bit JPEG with user-selectable quality slider (<code>1–100</code>) and ICC profile embedding.</li>
+<li><strong>TIFF (8-bit / 16-bit):</strong> High-precision uncompressed or LZW-compressed TIFFs. 16-bit TIFFs use a true 16-bit decode pipeline from raw files.</li>
+<li><strong>WebP:</strong> Native modern WebP encoding with lossy or lossless compression.</li>
+</ul>
+<hr>
+<h2 id="2-output-resizing--sharpening"><a class="header" href="#2-output-resizing--sharpening">2. Output Resizing &amp; Sharpening</a></h2>
+<ul>
+<li><strong>Dimension Constraints:</strong>
+<ul>
+<li>Original resolution.</li>
+<li>Fit within bounds (e.g. <code>2048 x 2048 px</code> for web).</li>
+<li>Long edge or short edge limits.</li>
+</ul>
+</li>
+<li><strong>Unsharp Mask (USM):</strong>
+<ul>
+<li>Applies edge sharpening post-resize to compensate for downsampling softness.</li>
+<li>Tuned modes for <strong>Screen (Web)</strong> and <strong>Print</strong>.</li>
+</ul>
+</li>
+</ul>
+<hr>
+<h2 id="3-watermarking"><a class="header" href="#3-watermarking">3. Watermarking</a></h2>
+<p>Photon includes flexible watermark blending directly in the export dialog:</p>
+<ul>
+<li><strong>Text Watermark:</strong> Custom text string, font selection, size, opacity slider (<code>0–100%</code>), and 9-point anchor placement (Top-Left, Center, Bottom-Right, etc.).</li>
+<li><strong>Image / Logo Watermark:</strong> Upload a PNG logo with alpha transparency, set scaling factor, margin, and opacity.</li>
+</ul>
+<hr>
+<h2 id="4-metadata-preservation--privacy-stripping"><a class="header" href="#4-metadata-preservation--privacy-stripping">4. Metadata Preservation &amp; Privacy Stripping</a></h2>
+<ul>
+<li><strong>Embedded EXIF / IPTC / XMP:</strong> Injects camera make, model, lens, capture timestamp, title, description, and keywords directly into the export file.</li>
+<li><strong>Orientation Normalization:</strong> Always exports with pixel dimensions upright and sets EXIF <code>Orientation = 1</code> to prevent orientation glitches on social media platforms.</li>
+<li><strong>Privacy Options:</strong>
+<ul>
+<li><strong>Strip GPS Location:</strong> Removes latitude, longitude, and altitude coordinates.</li>
+<li><strong>Strip All Metadata:</strong> Delivers clean, anonymous pixel-only files.</li>
+</ul>
+</li>
+</ul>
+<hr>
+<h2 id="5-collision-safe-naming-templates"><a class="header" href="#5-collision-safe-naming-templates">5. Collision-Safe Naming Templates</a></h2>
+<p>Exports support dynamic naming patterns:</p>
+<ul>
+<li><strong>Tokens:</strong> <code>{name}</code>, <code>{date:%Y%m%d}</code>, <code>{camera_model}</code>, <code>{seq:04}</code>.</li>
+<li><strong>Collision Safety:</strong> Photon never silently overwrites existing files. If a destination file exists, Photon automatically appends a non-destructive suffix (<code>_2</code>, <code>_3</code>).</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="keyboard-shortcuts-cheat-sheet"><a class="header" href="#keyboard-shortcuts-cheat-sheet">Keyboard Shortcuts Cheat Sheet</a></h1>
+<p>Photon is designed to be operated almost entirely from the keyboard during import, culling, and navigation.</p>
+<hr>
+<h2 id="1-culling--metadata"><a class="header" href="#1-culling--metadata">1. Culling &amp; Metadata</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th style="text-align: left">Key</th><th style="text-align: left">Action</th><th style="text-align: left">Notes</th></tr>
+</thead>
+<tbody>
+<tr><td style="text-align: left"><code>1</code>–<code>5</code></td><td style="text-align: left">Star Rating</td><td style="text-align: left">Rates 1 to 5 stars (<code>xmp:Rating</code>)</td></tr>
+<tr><td style="text-align: left"><code>0</code> / <code>`</code></td><td style="text-align: left">Clear Rating / Color</td><td style="text-align: left">Sets rating to 0 and clears color label</td></tr>
+<tr><td style="text-align: left"><code>6</code></td><td style="text-align: left">Red Color Label</td><td style="text-align: left"><code>xmp:Label="Red"</code>, <code>darktable:colorlabels=0</code></td></tr>
+<tr><td style="text-align: left"><code>7</code></td><td style="text-align: left">Yellow Color Label</td><td style="text-align: left"><code>xmp:Label="Yellow"</code>, <code>darktable:colorlabels=1</code></td></tr>
+<tr><td style="text-align: left"><code>8</code></td><td style="text-align: left">Green Color Label</td><td style="text-align: left"><code>xmp:Label="Green"</code>, <code>darktable:colorlabels=2</code></td></tr>
+<tr><td style="text-align: left"><code>9</code></td><td style="text-align: left">Blue Color Label</td><td style="text-align: left"><code>xmp:Label="Blue"</code>, <code>darktable:colorlabels=3</code></td></tr>
+<tr><td style="text-align: left"><code>P</code></td><td style="text-align: left">Pick Flag</td><td style="text-align: left">Flags photo as pick (<code>flagged = 1</code>)</td></tr>
+<tr><td style="text-align: left"><code>X</code></td><td style="text-align: left">Reject Flag</td><td style="text-align: left">Marks photo as reject (<code>flagged = -1</code>)</td></tr>
+<tr><td style="text-align: left"><code>U</code></td><td style="text-align: left">Unflag</td><td style="text-align: left">Clears pick/reject status</td></tr>
+<tr><td style="text-align: left"><code>Shift + [1–9, P, X, U]</code></td><td style="text-align: left"><strong>Cull + Auto-Advance</strong></td><td style="text-align: left">Applies rating/flag and steps to next shot</td></tr>
+<tr><td style="text-align: left"><code>[</code> / <code>]</code></td><td style="text-align: left">Rotate ±90°</td><td style="text-align: left">Rotates counter-clockwise / clockwise</td></tr>
+<tr><td style="text-align: left"><code>Ctrl + R</code></td><td style="text-align: left">Rotate 90° Clockwise</td><td style="text-align: left">Updates EXIF orientation in DB &amp; XMP</td></tr>
+<tr><td style="text-align: left"><code>Delete</code></td><td style="text-align: left">Trash Photo</td><td style="text-align: left">Moves to system Trash with XMP sidecars</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="2-viewer--canvas-navigation"><a class="header" href="#2-viewer--canvas-navigation">2. Viewer &amp; Canvas Navigation</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th style="text-align: left">Key</th><th style="text-align: left">Action</th><th style="text-align: left">Notes</th></tr>
+</thead>
+<tbody>
+<tr><td style="text-align: left"><code>Left</code> / <code>Right</code></td><td style="text-align: left">Previous / Next Photo</td><td style="text-align: left">In 1-up photo viewer</td></tr>
+<tr><td style="text-align: left"><code>Space</code></td><td style="text-align: left">Next Photo</td><td style="text-align: left">Quick advance</td></tr>
+<tr><td style="text-align: left"><code>Escape</code></td><td style="text-align: left">Back to Grid / Deselect</td><td style="text-align: left">Exits viewer or clears selection</td></tr>
+<tr><td style="text-align: left"><code>Z</code> / <code>Double-Click</code></td><td style="text-align: left"><strong>1:1 Full-Res Zoom</strong></td><td style="text-align: left">Toggles 100% pixel lock on cursor</td></tr>
+<tr><td style="text-align: left"><code>+</code> / <code>=</code> / <code>KP_Add</code></td><td style="text-align: left">Zoom In</td><td style="text-align: left">Smooth continuous step in</td></tr>
+<tr><td style="text-align: left"><code>-</code> / <code>KP_Subtract</code></td><td style="text-align: left">Zoom Out</td><td style="text-align: left">Smooth continuous step out</td></tr>
+<tr><td style="text-align: left"><code>I</code></td><td style="text-align: left">Toggle Info Panel</td><td style="text-align: left">Shows EXIF, sidecars, and histogram</td></tr>
+<tr><td style="text-align: left"><code>V</code></td><td style="text-align: left">Switch RAW / JPEG Version</td><td style="text-align: left">Toggles embedded JPEG vs RAW sensor view</td></tr>
+<tr><td style="text-align: left"><code>C</code></td><td style="text-align: left">Compare Mode</td><td style="text-align: left">Compares selected photos side-by-side</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="3-global--grid-controls"><a class="header" href="#3-global--grid-controls">3. Global &amp; Grid Controls</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th style="text-align: left">Key</th><th style="text-align: left">Action</th><th style="text-align: left">Notes</th></tr>
+</thead>
+<tbody>
+<tr><td style="text-align: left"><code>Ctrl + O</code></td><td style="text-align: left">Import Photos</td><td style="text-align: left">Opens import dialog / card picker</td></tr>
+<tr><td style="text-align: left"><code>Ctrl + E</code></td><td style="text-align: left">Export Selected</td><td style="text-align: left">Opens export dialog</td></tr>
+<tr><td style="text-align: left"><code>Ctrl + F</code></td><td style="text-align: left">Search Library</td><td style="text-align: left">Focuses search bar</td></tr>
+<tr><td style="text-align: left"><code>Ctrl + A</code></td><td style="text-align: left">Select All</td><td style="text-align: left">Selects all photos in active view</td></tr>
+<tr><td style="text-align: left"><code>F5</code></td><td style="text-align: left">Slideshow</td><td style="text-align: left">Starts a slideshow from the library</td></tr>
+<tr><td style="text-align: left"><code>Ctrl + Z</code></td><td style="text-align: left"><strong>Undo</strong></td><td style="text-align: left">50-step reversible undo</td></tr>
+<tr><td style="text-align: left"><code>Ctrl + Shift + Z</code></td><td style="text-align: left"><strong>Redo</strong></td><td style="text-align: left">Reapplies undone action</td></tr>
+<tr><td style="text-align: left"><code>Ctrl + Q</code></td><td style="text-align: left">Quit Application</td><td style="text-align: left">Clean exit</td></tr>
+</tbody>
+</table>
+</div>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-09f2665d.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-c22b7243.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="src/custom-5e78988c.js"></script>
+
+        <script>
+        window.addEventListener('load', function() {
+            window.setTimeout(window.print, 100);
+        });
+        </script>
+
+
+    </div>
+    </body>
+</html>
