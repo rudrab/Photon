@@ -1,0 +1,121 @@
+name: Release
+
+# Independent of the docs: push a tag starting with "v" (e.g. v0.1.0) to build
+# the code and attach the packages to a GitHub release. "test-v*" tags build
+# everything but leave the release as a draft.
+on:
+  push:
+    tags:
+      - 'v*'
+      - 'test-v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # RPM — built in a Fedora container, because cargo-generate-rpm's auto-req
+  # resolves dependency names against the host package database.
+  # Photon needs libheif >= 1.23 (libheif-rs "v1_23" feature); the sanity check
+  # below fails early, with a clear message, if the image is too old.
+  # OpenVINO is loaded at run time and is not a build dependency.
+  # ---------------------------------------------------------------------------
+  build-rpm:
+    name: Build RPM
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+    steps:
+      - name: Install toolchain and dependencies
+        run: |
+          set -e
+          dnf -y install \
+            gcc gcc-c++ make pkgconf-pkg-config \
+            rust cargo \
+            gtk4-devel libadwaita-devel lcms2-devel libheif-devel \
+            rpm-build gh git tar findutils
+
+      - name: Check library versions
+        run: |
+          set -e
+          echo "libheif $(pkg-config --modversion libheif)"
+          pkg-config --atleast-version=1.23 libheif
+          echo "libadwaita $(pkg-config --modversion libadwaita-1)"
+          pkg-config --atleast-version=1.4 libadwaita-1
+
+      - uses: actions/checkout@v4
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm --locked
+
+      - name: Run tests
+        run: cargo test --release --locked --workspace
+
+      - name: Build binary
+        run: cargo build --release --locked -p photon-app
+
+      - name: Build RPM
+        run: |
+          set -e
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo generate-rpm -p crates/photon-app
+          mkdir -p dist
+          mv target/generate-rpm/*.rpm dist/photon.rpm
+          (cd dist && sha256sum photon.rpm > photon.rpm.sha256)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm
+          path: dist/
+
+  # ---------------------------------------------------------------------------
+  # Create the GitHub release only after the build succeeded. Photon is beta,
+  # so releases are marked as pre-releases; test-v* tags stay drafts.
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: build-rpm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rpm
+          path: dist
+
+      - name: Create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          cat > notes.md <<'NOTES'
+          > **Beta.** Keep backups of your photos and catalogue.
+
+          ### Install (Fedora)
+
+              sudo dnf install ./photon.rpm
+
+          Optional AI analysis needs OpenVINO and oneTBB (`sudo dnf install openvino tbb`),
+          then download the face model in Preferences → AI. See the
+          [documentation](https://rudrab.github.io/Photon/).
+          NOTES
+
+          DRAFT=""
+          case "${{ github.ref_name }}" in test-v*) DRAFT="--draft" ;; esac
+
+          gh release create "${{ github.ref_name }}" \
+            $DRAFT --prerelease \
+            --title "Photon ${{ github.ref_name }}" \
+            --generate-notes \
+            --notes-file notes.md \
+            dist/photon.rpm dist/photon.rpm.sha256
