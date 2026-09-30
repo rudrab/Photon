@@ -7,17 +7,23 @@
 //! chosen by clicking or with the arrow keys). Enter opens the active photo
 //! in the 1-up viewer; Esc goes back to the library. Dropping a photo from
 //! the survey doesn't change it.
+//!
+//! F zooms every photo to its own face, F again to the next face (Shift+F
+//! the previous): faces are counted left to right, so it is the same person
+//! in each photo of a burst. Ctrl+0 fits them all again. Each photo also
+//! zooms and pans on its own (Ctrl+scroll, drag).
 
 use crate::ui::compare::ViewContext;
+use crate::ui::faces;
 use crate::ui::mark::{self, MarkButton, QualityGauge};
+use crate::ui::photo_view::{PhotoView, Zoom};
 use gtk4::prelude::*;
 use gtk4::{
     gdk, glib, ActionBar, Align, Box as GtkBox, Button, EventControllerKey, GestureClick, Grid, Label, Orientation,
-    Overlay, Picture,
+    Overlay,
 };
 use photon_core::db::queries;
 use photon_core::models::TimelineItem;
-use photon_import::thumbnails::{thumb_path, ThumbSize};
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
@@ -25,6 +31,7 @@ struct Photo {
     id: i64,
     root: GtkBox,
     mark: MarkButton,
+    view: Rc<PhotoView>,
 }
 
 struct Survey {
@@ -33,6 +40,9 @@ struct Survey {
     /// In display order; photos dropped from the survey are removed.
     cells: RefCell<Vec<Rc<Photo>>>,
     active: Cell<usize>,
+    /// Which face the photos are zoomed to (see [`faces::pick`]); `None`
+    /// when not zoomed to faces.
+    face_step: Cell<Option<isize>>,
     counter: Label,
     on_open: Rc<dyn Fn(i64)>,
 }
@@ -73,6 +83,7 @@ pub fn build_survey(ctx: ViewContext, items: Vec<TimelineItem>, on_open: Rc<dyn 
         grid,
         cells: RefCell::new(Vec::new()),
         active: Cell::new(0),
+        face_step: Cell::new(None),
         counter: counter.clone(),
         on_open,
     });
@@ -97,16 +108,35 @@ pub fn build_survey(ctx: ViewContext, items: Vec<TimelineItem>, on_open: Rc<dyn 
     start.append(&title);
     start.append(&counter);
     bar.pack_start(&start);
+    let center = GtkBox::new(Orientation::Horizontal, 8);
     let hint = Label::new(Some("✕ drops a photo from the survey · Enter opens it · P X 1–5 mark it"));
     hint.add_css_class("dim-label");
     hint.add_css_class("caption");
-    bar.set_center_widget(Some(&hint));
+    let zoom = GtkBox::new(Orientation::Horizontal, 2);
+    zoom.add_css_class("photon-bar-group");
+    zoom.set_valign(Align::Center);
+    let fit = Button::from_icon_name("zoom-fit-best-symbolic");
+    fit.add_css_class("flat");
+    fit.set_tooltip_text(Some("Fit all (Ctrl+0)"));
+    let face = Button::from_icon_name("avatar-default-symbolic");
+    face.add_css_class("flat");
+    face.set_tooltip_text(Some("Zoom each photo to its face; again for the next face (F, Shift+F)"));
+    zoom.append(&fit);
+    zoom.append(&face);
+    center.append(&hint);
+    center.append(&zoom);
+    bar.set_center_widget(Some(&center));
+    let w = Rc::downgrade(&this);
+    fit.connect_clicked(move |_| with(&w, |s| s.fit_all()));
+    let w = Rc::downgrade(&this);
+    face.connect_clicked(move |_| with(&w, |s| s.step_faces(1)));
     root.append(&bar);
 
     // The key handler holds the survey strongly: it lives as long as the root.
     let keys = EventControllerKey::new();
     let s = this.clone();
-    keys.connect_key_pressed(move |_, key, _, _| {
+    keys.connect_key_pressed(move |_, key, _, state| {
+        let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
         let n = s.cells.borrow().len();
         let cols = columns(n) as isize;
         let move_by = |d: isize| {
@@ -128,6 +158,10 @@ pub fn build_survey(ctx: ViewContext, items: Vec<TimelineItem>, on_open: Rc<dyn 
                 }
             }
             gdk::Key::BackSpace | gdk::Key::Delete => s.drop_photo(s.active.get()),
+            gdk::Key::_0 | gdk::Key::KP_0 if ctrl => s.fit_all(),
+            gdk::Key::f | gdk::Key::F if !ctrl => {
+                s.step_faces(if state.contains(gdk::ModifierType::SHIFT_MASK) { -1 } else { 1 })
+            }
             _ => match mark::mark_for_key(key) {
                 Some((r, f, c)) => s.save_marks(s.active.get(), r, f, c),
                 None => return glib::Propagation::Proceed,
@@ -149,21 +183,10 @@ impl Survey {
         let id = item.id;
         let weak = Rc::downgrade(self);
 
-        let picture = Picture::new();
-        picture.set_content_fit(gtk4::ContentFit::Contain);
-        picture.set_can_shrink(true);
-        picture.set_vexpand(true);
-        picture.set_hexpand(true);
-        let grid_thumb = thumb_path(&self.ctx.cache_dir, ThumbSize::Grid, &image.hash);
-        if grid_thumb.exists() {
-            picture.set_filename(Some(&grid_thumb));
-        }
-        let large = thumb_path(&self.ctx.cache_dir, ThumbSize::Large, &image.hash);
-        if large.exists() {
-            crate::ui::widgets::load_texture_async(&picture, &large);
-        } else {
-            crate::ui::detail::load_large_preview(&picture, &image, &self.ctx.cache_dir);
-        }
+        // Fitted, like a picture; zoomable, for faces. Double-click opens
+        // the photo instead of zooming.
+        let view = PhotoView::new(&image, &self.ctx.cache_dir, None, Rc::new(|_| {}));
+        view.set_double_click_zoom(false);
 
         let drop_btn = Button::from_icon_name("window-close-symbolic");
         drop_btn.add_css_class("osd");
@@ -184,7 +207,7 @@ impl Survey {
         });
         let overlay = Overlay::new();
         overlay.add_css_class("photon-photo-backdrop");
-        overlay.set_child(Some(&picture));
+        overlay.set_child(Some(view.widget()));
         overlay.add_overlay(&drop_btn);
 
         let caption = GtkBox::new(Orientation::Horizontal, 8);
@@ -235,7 +258,7 @@ impl Survey {
         });
         root.add_controller(click);
 
-        Some(Rc::new(Photo { id, root, mark: mark_btn }))
+        Some(Rc::new(Photo { id, root, mark: mark_btn, view }))
     }
 
     /// Place the cells in the grid for their number.
@@ -260,6 +283,60 @@ impl Survey {
                 cell.root.remove_css_class("active");
             }
         }
+    }
+
+    fn fit_all(&self) {
+        self.face_step.set(None);
+        for cell in self.cells.borrow().iter() {
+            cell.view.set_zoom(Zoom::Fit, None);
+        }
+    }
+
+    /// Zoom every photo to the next face (`delta` 1) or the previous one
+    /// (−1); the first face if not zoomed to faces yet. A photo without that
+    /// face is fitted.
+    fn step_faces(self: &Rc<Self>, delta: isize) {
+        if !faces::model_ready() {
+            (self.ctx.notify)(faces::NO_MODEL);
+            return;
+        }
+        let step = self.face_step.get().map_or(0, |s| s + delta);
+        self.face_step.set(Some(step));
+        let cells: Vec<Rc<Photo>> = self.cells.borrow().clone();
+        let weak = Rc::downgrade(self);
+        let cache_dir = self.ctx.cache_dir.clone();
+        glib::spawn_future_local(async move {
+            let mut any = false;
+            // One at a time: the first time, each is a preview decode and a
+            // detection on a worker thread; later they come from memory.
+            for cell in cells {
+                let found = faces::faces_of(cell.view.image(), &cache_dir).await;
+                let Some(s) = weak.upgrade() else { return };
+                // Stepped on, or fitted, meanwhile.
+                if s.face_step.get() != Some(step) {
+                    return;
+                }
+                let face = match found {
+                    Ok(boxes) => faces::pick(&boxes, step),
+                    Err(e) => {
+                        log::warn!("Faces of photo {}: {e}", cell.id);
+                        None
+                    }
+                };
+                match face {
+                    Some(face) => {
+                        any = true;
+                        cell.view.zoom_to_face(face);
+                    }
+                    None => cell.view.set_zoom(Zoom::Fit, None),
+                }
+            }
+            if !any {
+                if let Some(s) = weak.upgrade() {
+                    (s.ctx.notify)("No faces found in these photos");
+                }
+            }
+        });
     }
 
     /// Take the photo at `pos` out of the survey (not out of the library).

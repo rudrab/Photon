@@ -15,6 +15,7 @@ use gtk4::{
     gdk, gio, glib, Align, EventControllerMotion, EventControllerScroll, EventControllerScrollFlags,
     GestureClick, GestureDrag, GestureZoom, Label, Overlay, Picture, ScrolledWindow, Spinner,
 };
+use crate::ui::faces::FaceBox;
 use photon_core::models::Image;
 use photon_import::thumbnails::{thumb_path, ThumbSize, ThumbnailGenerator};
 use std::cell::{Cell, RefCell};
@@ -25,6 +26,9 @@ use std::rc::{Rc, Weak};
 pub const MAX_ZOOM: f64 = 8.0;
 /// One wheel notch or +/− keypress zooms by this factor.
 pub const ZOOM_STEP: f64 = 1.25;
+/// Zoomed to a face, the view is this many times the face's size: room for
+/// the hair and chin, with the eyes large enough to judge focus.
+const FACE_ROOM: f64 = 2.2;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Zoom {
@@ -61,6 +65,10 @@ pub struct PhotoView {
     /// A restored view's centre, applied once the viewport has its size.
     pending_center: Cell<Option<(f64, f64)>>,
     pointer: Cell<Option<(f64, f64)>>,
+    /// A face to zoom to once the viewport has its size.
+    pending_face: Cell<Option<FaceBox>>,
+    /// Whether double-click toggles Fit ↔ 1:1 (Survey uses it to open a photo).
+    double_click_zoom: Cell<bool>,
     sync_queued: Cell<bool>,
     on_change: Rc<dyn Fn(&PhotoView)>,
     /// Called whenever what is on screen moves: zoom or pan (for Compare,
@@ -145,6 +153,8 @@ impl PhotoView {
             full_requested: Cell::new(false),
             pending_center: Cell::new(pending_center),
             pointer: Cell::new(None),
+            pending_face: Cell::new(None),
+            double_click_zoom: Cell::new(true),
             sync_queued: Cell::new(false),
             on_change,
             on_moved: Default::default(),
@@ -158,6 +168,10 @@ impl PhotoView {
 
     pub fn widget(&self) -> &Overlay {
         &self.root
+    }
+
+    pub fn image(&self) -> &Image {
+        &self.image
     }
 
     pub fn zoom(&self) -> Zoom {
@@ -191,17 +205,47 @@ impl PhotoView {
         if self.size.get().is_none() {
             return;
         }
-        let zoom = match zoom {
-            // Smaller than Fit only leaves empty space around the photo.
-            Zoom::Scale(s) if s <= self.fit_scale() * 1.001 => Zoom::Fit,
-            Zoom::Scale(s) => Zoom::Scale(s.min(MAX_ZOOM.max(self.fit_scale()))),
-            Zoom::Fit => Zoom::Fit,
-        };
+        let zoom = self.clamped(zoom);
         if zoom == self.zoom.get() {
             return;
         }
         let anchor = anchor.unwrap_or_else(|| self.viewport_center());
         let frac = self.frac_at(anchor);
+        self.show_at(zoom, frac, anchor);
+    }
+
+    /// Zoom in on `face`, centred in the view. Before the view is laid out,
+    /// this happens once it is.
+    pub fn zoom_to_face(self: &Rc<Self>, face: FaceBox) {
+        let (vw, vh) = self.viewport();
+        let Some((w, h)) = self.size.get() else { return };
+        if vw <= 0.0 || vh <= 0.0 {
+            self.pending_face.set(Some(face));
+            return;
+        }
+        self.pending_face.set(None);
+        let (fw, fh) = ((face.size.0 * w).max(1.0), (face.size.1 * h).max(1.0));
+        let scale = (vw / (fw * FACE_ROOM)).min(vh / (fh * FACE_ROOM)) * self.device_scale();
+        self.show_at(self.clamped(Zoom::Scale(scale)), face.center, self.viewport_center());
+    }
+
+    /// Whether double-click toggles Fit ↔ 1:1 (on by default).
+    pub fn set_double_click_zoom(&self, on: bool) {
+        self.double_click_zoom.set(on);
+    }
+
+    /// `zoom` within what the view shows: no smaller than Fit, no larger than [`MAX_ZOOM`].
+    fn clamped(&self, zoom: Zoom) -> Zoom {
+        match zoom {
+            // Smaller than Fit only leaves empty space around the photo.
+            Zoom::Scale(s) if s <= self.fit_scale() * 1.001 => Zoom::Fit,
+            Zoom::Scale(s) => Zoom::Scale(s.min(MAX_ZOOM.max(self.fit_scale()))),
+            Zoom::Fit => Zoom::Fit,
+        }
+    }
+
+    /// Show the photo at `zoom` with its point `frac` at viewport point `anchor`.
+    fn show_at(self: &Rc<Self>, zoom: Zoom, frac: (f64, f64), anchor: (f64, f64)) {
         self.pending_center.set(None);
         self.zoom.set(zoom);
         self.apply_size();
@@ -340,6 +384,12 @@ impl PhotoView {
     }
 
     fn viewport_changed(self: &Rc<Self>) {
+        if let Some(face) = self.pending_face.get() {
+            let (vw, vh) = self.viewport();
+            if vw > 0.0 && vh > 0.0 {
+                self.zoom_to_face(face);
+            }
+        }
         if let Some(center) = self.pending_center.get() {
             let (dw, dh) = self.displayed();
             let (hadj, vadj) = (self.scrolled.hadjustment(), self.scrolled.vadjustment());
@@ -443,7 +493,11 @@ impl PhotoView {
         let weak = Rc::downgrade(self);
         click.connect_released(move |_, n_press, x, y| {
             if n_press == 2 {
-                with(&weak, |v| v.toggle(Some((x, y))));
+                with(&weak, |v| {
+                    if v.double_click_zoom.get() {
+                        v.toggle(Some((x, y)));
+                    }
+                });
             }
         });
         self.scrolled.add_controller(click);
@@ -578,6 +632,8 @@ thread_local! {
 }
 
 pub fn invalidate_full_res(hash: &str) {
+    // Whatever changes the pixels (a rotation) moves the faces too.
+    crate::ui::faces::invalidate(hash);
     FULL_RES.with(|c| c.borrow_mut().retain(|(h, _)| h != hash));
 }
 

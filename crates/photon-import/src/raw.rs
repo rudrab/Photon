@@ -19,7 +19,7 @@ use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Decode and develop the RAW file at `path` at full sensor resolution, 8 bits
@@ -162,12 +162,13 @@ const DARKTABLE_TIMEOUT: Duration = Duration::from_secs(300);
 ///
 /// darktable runs with a private copy of the user's configuration: it gets
 /// their preferences and presets, but can't clash with a running darktable
-/// over the library lock. Renders are serialised: each one uses every core
-/// (and the GPU) already.
+/// over the library lock. A few renders run at once: about 2 s of each one is
+/// darktable starting up on a single core, so three in parallel export an
+/// ORF batch 2.5× faster than one at a time. More gains little and each
+/// render holds several hundred MB.
 pub fn render_with_darktable(raw: &Path, xmp: Option<&Path>, space: ColorSpace, sixteen_bit: bool) -> Result<DynamicImage> {
-    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
     let cli = darktable_cli().context("darktable-cli is not installed")?;
-    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = DarktableTurn::take();
 
     let work = tempfile::Builder::new().prefix("photon-darktable-").tempdir()?;
     let configdir = private_darktable_config(work.path())?;
@@ -208,6 +209,37 @@ pub fn render_with_darktable(raw: &Path, xmp: Option<&Path>, space: ColorSpace, 
         bail!("darktable-cli failed ({status}): {}", last.trim());
     }
     image::open(&out).context("Reading darktable's render")
+}
+
+/// Most darktable renders running at once.
+fn darktable_slots() -> usize {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (cores / 4).clamp(1, 3)
+}
+
+static DARKTABLE_RUNNING: Mutex<usize> = Mutex::new(0);
+static DARKTABLE_FREED: Condvar = Condvar::new();
+
+/// One of the [`darktable_slots`], held for a render and given back on drop.
+struct DarktableTurn;
+
+impl DarktableTurn {
+    fn take() -> Self {
+        let mut running = DARKTABLE_RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+        while *running >= darktable_slots() {
+            running = DARKTABLE_FREED.wait(running).unwrap_or_else(|e| e.into_inner());
+        }
+        *running += 1;
+        DarktableTurn
+    }
+}
+
+impl Drop for DarktableTurn {
+    fn drop(&mut self) {
+        let mut running = DARKTABLE_RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+        *running -= 1;
+        DARKTABLE_FREED.notify_one();
+    }
 }
 
 /// A configuration directory under `work` holding a copy of the user's

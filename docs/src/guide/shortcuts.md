@@ -34,6 +34,7 @@ Photon is designed to be operated almost entirely from the keyboard during impor
 | `Z` / `Double-Click` | **1:1 Full-Res Zoom** | Toggles 100% pixel lock on cursor |
 | `+` / `=` / `KP_Add` | Zoom In | Smooth continuous step in |
 | `-` / `KP_Subtract` | Zoom Out | Smooth continuous step out |
+| `F` / `Shift+F` | Zoom to Face | Zooms to a face, then the next (previous); in Compare and Survey each photo zooms to its own face |
 | `I` | Toggle Info Panel | Shows EXIF, sidecars, and histogram |
 | `V` | Switch RAW / JPEG Version | Toggles embedded JPEG vs RAW sensor view |
 | `C` | Compare Mode | Compares selected photos side-by-side |

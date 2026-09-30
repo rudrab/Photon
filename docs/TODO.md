@@ -85,7 +85,7 @@ Useful tools installed on the dev machine: `xmllint`, `exiv2`, `darktable-cli`,
 ### Done (2026-09-29) — don't redo
 
 - Phase 1 (harden): PART 3 bugs, R-13, R-14. See those tasks for what and where.
-  P-0's hand checks are the user's.
+  P-0's hand checks: done by the user on 2026-09-30.
 
 - Continuous zoom in the 1-up viewer (`ui/photo_view.rs`, see R-16). The viewer's
   hidden info-panel revealer must keep `hexpand(false)`: its entries expand, and
@@ -148,10 +148,10 @@ Useful tools installed on the dev machine: `xmllint`, `exiv2`, `darktable-cli`,
   slider + slideshow) and selection mode (selection count + deselect + culling/rating/rotation/album/export/trash
   actions) without covering grid photos.
 
-**Not yet verified by hand in the GUI:** 1:1 zoom on ORF and large JPEG,
-Preferences → Import Safety, a Move import with a backup folder. See P-0.
-The rebuilt export dialog (presets save/delete, watermark rows, remembered
-settings) and the re-read of sidecars when the window is focused again.
+**Verified by hand (2026-09-30):** everything in P-0.
+**Not yet verified by hand in the GUI:** the rebuilt export dialog (presets
+save/delete, watermark rows, remembered settings) and the re-read of sidecars
+when the window is focused again.
 
 ---
 
@@ -172,18 +172,18 @@ The marker sits at the start of each task heading and each checklist item.
 
 ## PART 1 — Personal use (replace Shotwell)
 
-### 🟠 P-0 · Verify and commit the 2026-09-28 work · S
+### 🟢 P-0 · Verify and commit the 2026-09-28 work · S
 
-Committed 2026-09-29. Still to verify by hand — run the app and check:
+Committed 2026-09-29. Verified by hand by the user on 2026-09-30:
 
-- 🔴 In the 1-up viewer, Z or double-click on an ORF: the spinner shows, the image gets sharper, brightness doesn't jump, and scrollbars cover the full sensor size.
-- 🔴 The same on a large JPEG: real pixels, not a blurry upscale.
-- 🔴 Step prev/next while zoomed: previously seen photos show instantly (from the cache).
-- 🔴 Continuous zoom: drag the slider and Ctrl+scroll — the point under the pointer stays put, no jump when the full-resolution render replaces the preview; rating a photo while zoomed keeps the zoom and position.
-- 🔴 Preferences → Import Safety: the switch persists across restarts; choose and clear the backup folder; the subtitle warns when it's on the library's disk.
-- 🔴 Move import from a card with a backup folder: files appear in both places, and the card is emptied.
-- 🔴 Rate a darktable-edited ORF in Photon, then open it in darktable: the edit history is intact and the rating shows.
-- 🔴 Export an edited ORF with "Render RAW files with darktable" on: the export includes the edit.
+- 🟢 In the 1-up viewer, Z or double-click on an ORF: the spinner shows, the image gets sharper, brightness doesn't jump, and scrollbars cover the full sensor size.
+- 🟢 The same on a large JPEG: real pixels, not a blurry upscale.
+- 🟢 Step prev/next while zoomed: previously seen photos show instantly (from the cache).
+- 🟢 Continuous zoom: drag the slider and Ctrl+scroll — the point under the pointer stays put, no jump when the full-resolution render replaces the preview; rating a photo while zoomed keeps the zoom and position.
+- 🟢 Preferences → Import Safety: the switch persists across restarts; choose and clear the backup folder; the subtitle warns when it's on the library's disk.
+- 🟢 Move import from a card with a backup folder: files appear in both places, and the card is emptied.
+- 🟢 Rate a darktable-edited ORF in Photon, then open it in darktable: the edit history is intact and the rating shows.
+- 🟢 Export an edited ORF with "Render RAW files with darktable" on: the export includes the edit.
 
 ### 🟢 P-1 · Manual rotate · S
 
@@ -451,6 +451,12 @@ Build a synthetic library generator (a test or bench) with 200k image rows plus 
   ✕ / Backspace drops a photo from the survey, Enter opens it in 1-up. The bar's Compare
   button opens Compare for 2, Survey for 3–9.
 - 🔴 Preload the next and previous full-res renders while zoomed (a background task into `FULL_RES`).
+- 🟢 Zoom to faces (`ui/faces.rs`, `PhotoView::zoom_to_face`): F zooms to a face, F again the next
+  (Shift+F back), in 1-up, Compare (each pane to its own face) and Survey (every photo, cells are
+  now zoomable `PhotoView`s). YuNet on the Large preview on demand, cached per session; faces
+  numbered left to right (background faces < 40 % of the largest dropped), so the same person
+  across a burst. Not verified by hand in the GUI yet.
+- 🔴 Limit concurrent full-res renders: face zoom in a 9-photo Survey can develop 9 RAWs at once (~300 MB each).
 - 🟢 Continuous zoom in the 1-up viewer (`ui/photo_view.rs`): log slider, Fit / 1:1 buttons, Ctrl+wheel and pinch anchored at the pointer, +/−, drag to pan, double-click toggles Fit ↔ 1:1 at the clicked point. Full resolution loads only once the zoom needs more pixels than the Large preview.
 - 🟢 Sharpness score & burst rejects: variance of the Laplacian (4×4 tile max + global), exposure clipping, burst detection (≤ 2 s), "Photo Quality" results dialog with grouped bursts, XMP Rating="-1" sync, viewer info panel sharpness, timeline "Possibly blurred" filter, and parallel rayon quality backfill (see AI-7).
 

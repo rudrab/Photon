@@ -138,6 +138,9 @@ const UI: &str = r#"
               <property name="title">Zoom to fit / 100%</property>
               <property name="accelerator">&lt;ctrl&gt;0 &lt;ctrl&gt;1</property></object></child>
             <child><object class="GtkShortcutsShortcut">
+              <property name="title">Zoom to next / previous face (also Compare, Survey)</property>
+              <property name="accelerator">f &lt;shift&gt;f</property></object></child>
+            <child><object class="GtkShortcutsShortcut">
               <property name="title">Copy / export photo</property>
               <property name="accelerator">&lt;ctrl&gt;c &lt;ctrl&gt;e</property></object></child>
           </object>

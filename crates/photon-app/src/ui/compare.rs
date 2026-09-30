@@ -6,8 +6,11 @@
 //! Select") keeps the candidate: it becomes the select and the next photo
 //! the candidate — survival of the sharpest through a burst. Click a pane (or
 //! Tab) to make it active: P X U, 1–5 0, 6–9 mark the active photo, and the
-//! zoom buttons act on it (the other follows).
+//! zoom buttons act on it (the other follows). F zooms each photo to its own
+//! face, F again to the next face (Shift+F the previous); a new candidate
+//! comes in zoomed to the same face.
 
+use crate::ui::faces;
 use crate::ui::mark::{self, MarkButton, QualityGauge};
 use crate::ui::photo_view::{PhotoView, Zoom, ZOOM_STEP};
 use gtk4::prelude::*;
@@ -50,6 +53,9 @@ struct Compare {
     active: Cell<usize>,
     /// Set while one view follows the other, so it doesn't echo back.
     syncing: Rc<Cell<bool>>,
+    /// Which face the photos are zoomed to (see [`faces::pick`]); `None`
+    /// when not zoomed to faces.
+    face_step: Cell<Option<isize>>,
     counter: Label,
 }
 
@@ -135,6 +141,7 @@ pub fn build_compare(ctx: ViewContext, photos: Rc<Vec<TimelineItem>>, select: us
             candidate: Cell::new(candidate),
             active: Cell::new(1),
             syncing: Rc::new(Cell::new(false)),
+            face_step: Cell::new(None),
             counter: counter.clone(),
         }
     });
@@ -184,8 +191,10 @@ pub fn build_compare(ctx: ViewContext, photos: Rc<Vec<TimelineItem>>, select: us
     let zoom = group();
     let fit = icon_button("zoom-fit-best-symbolic", "Fit both (Ctrl+0)");
     let one = icon_button("zoom-original-symbolic", "Both at 100% (Z / Ctrl+1)");
+    let face = icon_button("avatar-default-symbolic", "Zoom each to its face; again for the next face (F, Shift+F)");
     zoom.append(&fit);
     zoom.append(&one);
+    zoom.append(&face);
     center.append(&candidates);
     center.append(&keep_group);
     center.append(&zoom);
@@ -202,6 +211,8 @@ pub fn build_compare(ctx: ViewContext, photos: Rc<Vec<TimelineItem>>, select: us
     fit.connect_clicked(move |_| with(&w, |c| c.zoom_active(|v| v.set_zoom(Zoom::Fit, None))));
     let w = Rc::downgrade(&this);
     one.connect_clicked(move |_| with(&w, |c| c.zoom_active(|v| v.set_zoom(Zoom::Scale(1.0), None))));
+    let w = Rc::downgrade(&this);
+    face.connect_clicked(move |_| with(&w, |c| c.step_faces(1)));
 
     // ── Keys ────────────────────────────────────────────
     // The key handler holds the view's state strongly: it lives exactly as
@@ -219,6 +230,9 @@ pub fn build_compare(ctx: ViewContext, photos: Rc<Vec<TimelineItem>>, select: us
             gdk::Key::_0 | gdk::Key::KP_0 if ctrl => c.zoom_active(|v| v.set_zoom(Zoom::Fit, None)),
             gdk::Key::_1 | gdk::Key::KP_1 if ctrl => c.zoom_active(|v| v.set_zoom(Zoom::Scale(1.0), None)),
             gdk::Key::z | gdk::Key::Z => c.zoom_active(|v| v.toggle(None)),
+            gdk::Key::f | gdk::Key::F if !ctrl => {
+                c.step_faces(if state.contains(gdk::ModifierType::SHIFT_MASK) { -1 } else { 1 })
+            }
             gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => c.zoom_active(|v| v.zoom_by(ZOOM_STEP, None)),
             gdk::Key::minus | gdk::Key::KP_Subtract => c.zoom_active(|v| v.zoom_by(1.0 / ZOOM_STEP, None)),
             _ => match mark::mark_for_key(key) {
@@ -284,6 +298,79 @@ impl Compare {
         pane.holder.append(view.widget());
         *pane.view.borrow_mut() = Some(view);
         self.counter.set_text(&format!("{} / {}", self.index_of(1) + 1, self.photos.len()));
+        if self.face_step.get().is_some() {
+            self.show_faces(&[side]);
+        }
+    }
+
+    /// Zoom to the next face (`delta` 1) or the previous one (−1); the first
+    /// face if not zoomed to faces yet.
+    fn step_faces(self: &Rc<Self>, delta: isize) {
+        if !faces::model_ready() {
+            (self.ctx.notify)(faces::NO_MODEL);
+            return;
+        }
+        self.face_step.set(Some(self.face_step.get().map_or(0, |s| s + delta)));
+        self.show_faces(&[0, 1]);
+    }
+
+    /// Zoom the photos on `sides` to their face number `face_step`, each to
+    /// its own. A photo without one follows the other: in a burst, a turned
+    /// head is still where the face was.
+    fn show_faces(self: &Rc<Self>, sides: &[usize]) {
+        let Some(step) = self.face_step.get() else { return };
+        let wanted: Vec<(usize, i64, photon_core::models::Image)> = sides
+            .iter()
+            .filter_map(|&side| {
+                let view = self.panes[side].view.borrow().clone()?;
+                Some((side, self.panes[side].item_id.get(), view.image().clone()))
+            })
+            .collect();
+        let weak = Rc::downgrade(self);
+        let cache_dir = self.ctx.cache_dir.clone();
+        glib::spawn_future_local(async move {
+            let mut found = Vec::new();
+            for (side, id, image) in wanted {
+                found.push((side, id, faces::faces_of(&image, &cache_dir).await));
+            }
+            let Some(c) = weak.upgrade() else { return };
+            // Stepped on, or zoomed some other way, meanwhile.
+            if c.face_step.get() != Some(step) {
+                return;
+            }
+            let mut without = Vec::new();
+            for (side, id, result) in found {
+                if c.panes[side].item_id.get() != id {
+                    continue;
+                }
+                let face = match result {
+                    Ok(boxes) => faces::pick(&boxes, step),
+                    Err(e) => {
+                        log::warn!("Faces of photo {id}: {e}");
+                        None
+                    }
+                };
+                let view = c.panes[side].view.borrow().clone();
+                match (face, view) {
+                    (Some(face), Some(view)) => {
+                        c.syncing.set(true);
+                        view.zoom_to_face(face);
+                        c.syncing.set(false);
+                    }
+                    _ => without.push(side),
+                }
+            }
+            for side in &without {
+                let leader = c.panes[1 - side].view.borrow().clone();
+                let view = c.panes[*side].view.borrow().clone();
+                if let (Some(leader), Some(view)) = (leader, view) {
+                    view.follow(leader.state());
+                }
+            }
+            if without.len() == 2 {
+                (c.ctx.notify)("No faces found in these photos");
+            }
+        });
     }
 
     fn load_quality(&self, side: usize, image: &photon_core::models::Image) {
@@ -316,6 +403,7 @@ impl Compare {
     }
 
     fn zoom_active(&self, f: impl Fn(&Rc<PhotoView>)) {
+        self.face_step.set(None);
         let view = self.panes[self.active.get()].view.borrow().clone();
         if let Some(view) = view {
             f(&view);

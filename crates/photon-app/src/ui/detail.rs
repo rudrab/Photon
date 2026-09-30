@@ -19,18 +19,17 @@ use gtk4::prelude::*;
 use gtk4::{
     gio, glib, ActionBar, Align, Box as GtkBox, Button, Entry, EventControllerKey,
     FileChooserAction, FileChooserNative, FlowBox, Label, MediaControls,
-    Orientation, Picture, ResponseType, Revealer, Scale, ScrolledWindow,
+    Orientation, ResponseType, Revealer, Scale, ScrolledWindow,
     ToggleButton, Video, Window,
 };
 use photon_core::db::queries;
 use photon_core::db::Database;
 use photon_core::models::{ColorLabel, Image, Preferences, TimelineItem, UIAction};
-use photon_import::thumbnails::{thumb_path, ThumbSize, ThumbnailGenerator};
+use photon_import::thumbnails::{thumb_path, ThumbSize};
 use crate::ui::histogram::HistogramWidget;
 use libadwaita as adw;
 use libadwaita::prelude::MessageDialogExt;
 use crate::ui::share;
-use crate::ui::widgets::load_texture_async;
 use crate::ui::photo_view::{PhotoView, ViewState, Zoom, MAX_ZOOM, ZOOM_STEP};
 pub use crate::ui::photo_view::invalidate_full_res;
 use std::cell::{Cell, RefCell};
@@ -186,9 +185,14 @@ pub fn build_viewer(
     zoom_scale.set_focusable(false);
     zoom_scale.set_tooltip_text(Some("Zoom (Ctrl+scroll, + / −)"));
 
+    let face_btn = Button::from_icon_name("avatar-default-symbolic");
+    face_btn.add_css_class("flat");
+    face_btn.set_tooltip_text(Some("Zoom to a face; again for the next face (F, Shift+F)"));
+
     zoom_group.append(&fit_btn);
     zoom_group.append(&zoom_scale);
     zoom_group.append(&one_btn);
+    zoom_group.append(&face_btn);
     center_box.append(&zoom_group);
 
     // Rotate buttons
@@ -323,9 +327,50 @@ pub fn build_viewer(
             }
         }
     };
+    // Which face the view is zoomed to (see `faces::pick`); `None` when not
+    // zoomed to a face. Kept across photos, so stepping through a burst
+    // stays on the same person.
+    let face_step: Rc<Cell<Option<isize>>> = Rc::default();
     let toggle_zoom: Rc<dyn Fn()> = {
         let with_view = with_view.clone();
-        Rc::new(move || with_view(&|v| v.toggle(None)))
+        let face_step = face_step.clone();
+        Rc::new(move || {
+            face_step.set(None);
+            with_view(&|v| v.toggle(None))
+        })
+    };
+    let step_faces: Rc<dyn Fn(isize)> = {
+        let current_view = current_view.clone();
+        let face_step = face_step.clone();
+        let notify = share_ctx.notify.clone();
+        let cache_dir = cache_dir.to_path_buf();
+        Rc::new(move |delta| {
+            if !crate::ui::faces::model_ready() {
+                notify(crate::ui::faces::NO_MODEL);
+                return;
+            }
+            let Some(view) = current_view.borrow().clone() else { return };
+            let step = face_step.get().map_or(0, |s| s + delta);
+            face_step.set(Some(step));
+            let (weak, face_step, notify, cache_dir) = (Rc::downgrade(&view), face_step.clone(), notify.clone(), cache_dir.clone());
+            glib::spawn_future_local(async move {
+                let image = match weak.upgrade() {
+                    Some(v) => v.image().clone(),
+                    None => return,
+                };
+                let found = crate::ui::faces::faces_of(&image, &cache_dir).await;
+                // Stepped to another photo, or zoomed some other way, meanwhile.
+                let Some(view) = weak.upgrade().filter(|_| face_step.get() == Some(step)) else { return };
+                match found.map(|boxes| crate::ui::faces::pick(&boxes, step)) {
+                    Ok(Some(face)) => view.zoom_to_face(face),
+                    Ok(None) => {
+                        face_step.set(None);
+                        notify("No faces found in this photo");
+                    }
+                    Err(e) => notify(&e),
+                }
+            });
+        })
     };
     let zoom_by: Rc<dyn Fn(f64)> = {
         let with_view = with_view.clone();
@@ -333,7 +378,11 @@ pub fn build_viewer(
     };
     let zoom_to: Rc<dyn Fn(Zoom)> = {
         let with_view = with_view.clone();
-        Rc::new(move |zoom| with_view(&|v| v.set_zoom(zoom, None)))
+        let face_step = face_step.clone();
+        Rc::new(move |zoom| {
+            face_step.set(None);
+            with_view(&|v| v.set_zoom(zoom, None))
+        })
     };
 
 
@@ -646,6 +695,8 @@ pub fn build_viewer(
     });
     let zt = zoom_to.clone();
     one_btn.connect_clicked(move |_| zt(Zoom::Scale(1.0)));
+    let sf = step_faces.clone();
+    face_btn.connect_clicked(move |_| sf(1));
     let zt = zoom_to.clone();
     zoom_scale.connect_value_changed(move |scale| {
         if !syncing_zoom.get() {
@@ -823,6 +874,7 @@ pub fn build_viewer(
         #[weak] info_btn,
         #[weak] version_btn,
         #[strong] toggle_zoom,
+        #[strong] step_faces,
         #[strong] zoom_by,
         #[strong] zoom_to,
         #[strong] update_cull,
@@ -880,6 +932,9 @@ pub fn build_viewer(
                 }
                 gtk4::gdk::Key::z | gtk4::gdk::Key::Z => {
                     toggle_zoom();
+                }
+                gtk4::gdk::Key::f | gtk4::gdk::Key::F if !is_ctrl => {
+                    step_faces(if is_shift { -1 } else { 1 });
                 }
                 gtk4::gdk::Key::plus | gtk4::gdk::Key::equal | gtk4::gdk::Key::KP_Add => {
                     zoom_by(ZOOM_STEP);
@@ -1715,27 +1770,6 @@ fn populate_info_panel(
 
     info_box.append(&columns);
 }
-
-/// Generate the large preview on a worker thread and show it in `picture`,
-/// unless the viewer has moved on to another photo by then.
-pub(crate) fn load_large_preview(picture: &Picture, image: &Image, cache_dir: &Path) {
-    let generator = ThumbnailGenerator::new(cache_dir.to_path_buf());
-    let image = image.clone();
-    let weak = picture.downgrade();
-    glib::spawn_future_local(async move {
-        let result = gio::spawn_blocking(move || generator.ensure(&image, ThumbSize::Large)).await;
-        match result {
-            Ok(Ok(path)) => {
-                if let Some(picture) = weak.upgrade().filter(|p| p.parent().is_some()) {
-                    load_texture_async(&picture, &path);
-                }
-            }
-            Ok(Err(e)) => log::warn!("Large preview failed: {e:#}"),
-            Err(_) => log::warn!("Large preview worker panicked"),
-        }
-    });
-}
-
 
 /// Open in the appropriate editor based on format. The error says why the
 /// editor couldn't be started, for the user.

@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 rust-version = "1.75"
@@ -30,3 +30,9 @@ rayon = "1.10"
 crossbeam-channel = "0.5"
 thiserror = "1.0"
 thumbhash = "0.1"
+
+# Debug builds (`cargo run`) with optimised dependencies: unoptimised image
+# decoding, JPEG encoding and RAW demosaicing make exports and full-resolution
+# renders 2–10× slower. Photon's own crates stay quick to rebuild.
+[profile.dev.package."*"]
+opt-level = 3

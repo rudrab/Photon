@@ -3,6 +3,7 @@
 pub mod compare;
 pub mod detail;
 pub mod export_dialog;
+pub mod faces;
 pub mod histogram;
 pub mod mark;
 pub mod photo_view;
