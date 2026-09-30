@@ -1,5 +1,6 @@
 <div align="center">
-  <h1>📷 Photon</h1>
+  <img src="docs/src/images/photon.svg" width="140" alt="Photon logo">
+  <h1>Photon</h1>
   <p><strong>A high-performance, non-destructive photo manager and culling workstation for GNOME Linux.</strong></p>
   <p>Built with <strong>Rust</strong>, <strong>GTK4</strong>, and <strong>Libadwaita</strong> — designed as the modern ingest, triage, and asset management companion for <strong>Darktable</strong>.</p>
 </div>

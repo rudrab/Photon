@@ -9,3 +9,4 @@ additional-css = ["src/custom.css"]
 additional-js  = ["src/custom.js"]
 git-repository-url = "https://github.com/rudrab/Photon"
 site-url = "/Photon/"
+theme = "src/theme"
