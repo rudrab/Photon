@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use Photon, or parts of it, in your work, please cite it as below."
+title: "Photon: a non-destructive photo culling and asset manager for GNOME"
+type: software
+version: 0.1.0
+license: GPL-3.0-or-later
+repository-code: "https://github.com/mavensgroup/photon"
+url: "https://mavensgroup.github.io/photon/"
+authors:
+  - family-names: Banerjee
+    given-names: Rudra
+    affiliation: "The Mavens Group"
+keywords:
+  - photo management
+  - culling
+  - darktable
+  - XMP
+  - Rust
+  - GTK4

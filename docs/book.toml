@@ -1,0 +1,11 @@
+[book]
+title = "Photon"
+authors = ["Rudra Banerjee"]
+language = "en"
+src = "src"
+
+[output.html]
+additional-css = ["src/custom.css"]
+additional-js  = ["src/custom.js"]
+git-repository-url = "https://github.com/mavensgroup/photon"
+site-url = "/photon/"
