@@ -9,6 +9,14 @@
    xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
    xmlns="http://www.w3.org/2000/svg"
    xmlns:svg="http://www.w3.org/2000/svg">
+  <style id="theme">
+    /* The artwork uses currentColor: dark on light pages, white on dark ones. */
+    svg { color: #1f2430; }
+    @media (prefers-color-scheme: dark) {
+      svg { color: #ffffff; }
+    }
+  </style>
+
   <defs
      id="defs1">
     <!-- Aperture Iris Mask with transparent mechanical blade gaps -->
@@ -71,25 +79,24 @@
       </g>
     </mask>
   </defs>
-  <rect x="0" y="0" width="218.4" height="218.4" rx="44" ry="44" fill="#1f2430" id="logo_bg" />
   <!-- Material 3 / GNOME HIG duo-tone solar/amber circular base -->
   <!-- Outer Lens Barrel Rings (3.6px / 1.5px matching suite weight) -->
   <circle
      cx="109.2"
      cy="109.2"
      r="96"
-     style="opacity:0.95;fill:none;stroke:#ffffff;stroke-width:3.6;stroke-linecap:round;stroke-linejoin:round"
+     style="opacity:0.95;fill:none;stroke:currentColor;stroke-width:3.6;stroke-linecap:round;stroke-linejoin:round"
      id="circle6" />
   <circle
      cx="109.2"
      cy="109.2"
      r="90"
-     style="opacity:0.5;fill:none;stroke:#ffffff;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round"
+     style="opacity:0.5;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round"
      id="circle7" />
   <!-- Lens Index & Calibration Markings (Focal alignment ticks) -->
   <g
      id="index_marks"
-     style="opacity:0.85;stroke:#ffffff;stroke-width:2.4;stroke-linecap:round"
+     style="opacity:0.85;stroke:currentColor;stroke-width:2.4;stroke-linecap:round"
      transform="translate(-18.8,-18.8)">
     <line
        x1="128"
@@ -141,19 +148,19 @@
        y2="198.60001"
        id="line14" />
   </g>
-  <!-- Masked Pure White Aperture Iris Assembly (#ffffff) -->
+  <!-- Masked Pure White Aperture Iris Assembly (currentColor) -->
   <circle
      cx="128"
      cy="128"
      r="86"
-     fill="#ffffff"
+     fill="currentColor"
      mask="url(#iris_mask)"
      id="circle14"
      transform="translate(-18.8,-18.8)" />
   <!-- Central Radiant Photon Light Emitter / Optical Spark -->
   <g
      id="photon_core"
-     style="fill:#ffffff"
+     style="fill:currentColor"
      transform="translate(-18.8,-18.8)">
     <!-- 4-point primary photon ray starburst -->
     <path
@@ -175,12 +182,12 @@
   <!-- Optical Lens Coating Reflection Arc (3.6px stroke) -->
   <path
      d="m 49.2,53.2 a 78,78 0 0 1 88,-20"
-     style="opacity:0.85;fill:none;stroke:#ffffff;stroke-width:3.6;stroke-linecap:round"
+     style="opacity:0.85;fill:none;stroke:currentColor;stroke-width:3.6;stroke-linecap:round"
      id="path16" />
   <circle
      cx="149.2"
      cy="149.2"
      r="3.2"
-     style="opacity:0.85;fill:#ffffff"
+     style="opacity:0.85;fill:currentColor"
      id="circle16" />
 </svg>
