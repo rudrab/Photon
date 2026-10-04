@@ -79,8 +79,21 @@ impl Database {
     ///
     /// A database that fails SQLite's integrity check is not backed up, and
     /// no old copy is removed: the error says what is wrong, and the last good
-    /// copies are what the user will need.
+    /// copies are what the user will need. A check that could only not run
+    /// because other connections were writing is retried, then skipped
+    /// ([`BackupOutcome::Busy`]), never reported as damage.
     pub fn back_up(&self, dir: &Path, keep: usize, min_age: Duration) -> Result<BackupOutcome, PhotonError> {
+        self.back_up_checked(dir, keep, min_age, Duration::from_secs(2), quick_check)
+    }
+
+    fn back_up_checked(
+        &self,
+        dir: &Path,
+        keep: usize,
+        min_age: Duration,
+        retry_delay: Duration,
+        check: impl Fn(&Connection) -> Result<Vec<String>, rusqlite::Error>,
+    ) -> Result<BackupOutcome, PhotonError> {
         std::fs::create_dir_all(dir)?;
         let mut backups = list_backups(dir)?;
         if let Some((_, newest)) = backups.last() {
@@ -90,11 +103,25 @@ impl Database {
         }
 
         let conn = self.conn()?;
-        let problems: Vec<String> = conn
-            .prepare("PRAGMA quick_check")?
-            .query_map([], |r| r.get(0))?
-            .collect::<Result<_, _>>()?;
-        if problems != ["ok"] {
+        let mut attempts = 0;
+        loop {
+            let problems = match check(&conn) {
+                Ok(problems) => problems,
+                Err(e) if is_busy_error(&e) => vec![e.to_string()],
+                Err(e) => return Err(e.into()),
+            };
+            if problems == ["ok"] {
+                break;
+            }
+            if is_busy(&problems) {
+                attempts += 1;
+                if attempts >= CHECK_ATTEMPTS {
+                    log::info!("Library backup skipped: the database stayed busy ({})", problems.join("; "));
+                    return Ok(BackupOutcome::Busy);
+                }
+                std::thread::sleep(retry_delay);
+                continue;
+            }
             return Err(PhotonError::Other(format!(
                 "The library database failed its integrity check: {}",
                 problems.join("; ")
@@ -280,6 +307,35 @@ pub enum BackupOutcome {
     Saved(PathBuf),
     /// A recent enough backup already exists.
     Recent,
+    /// The database was too busy to be checked (other connections kept
+    /// writing): nothing was done; the next run tries again.
+    Busy,
+}
+
+/// How often a busy database is re-checked before a backup is put off.
+const CHECK_ATTEMPTS: u32 = 5;
+
+fn quick_check(conn: &Connection) -> Result<Vec<String>, rusqlite::Error> {
+    conn.prepare("PRAGMA quick_check")?.query_map([], |r| r.get(0))?.collect()
+}
+
+/// SQLite reports a lock it couldn't wait out in the *text* of a check
+/// result (e.g. "unable to validate the inverted index for FTS5 table
+/// main.images_fts: database is locked"), which is no sign of damage.
+fn is_busy(problems: &[String]) -> bool {
+    !problems.is_empty()
+        && problems.iter().all(|p| {
+            let p = p.to_lowercase();
+            p.contains("database is locked") || p.contains("database table is locked") || p.contains("database is busy")
+        })
+}
+
+fn is_busy_error(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(f, _)
+            if matches!(f.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
 }
 
 /// Backups in `dir`, oldest first.
@@ -414,5 +470,44 @@ mod tests {
         assert_eq!(left.len(), 3, "{left:?}");
         assert!(left.contains(&"unrelated.db".to_string()));
         assert!(!left.iter().any(|n| n.contains("2020") || n.contains("2021")));
+    }
+
+    #[test]
+    fn a_busy_database_is_not_reported_as_damaged() {
+        assert!(is_busy(&["unable to validate the inverted index for FTS5 table main.images_fts: database is locked".to_string()]));
+        assert!(!is_busy(&["ok".to_string()]));
+        assert!(!is_busy(&["*** in database main ***\nPage 9: btreeInitPage() returns error code 11".to_string()]));
+        // A lock message next to real damage is still damage.
+        assert!(!is_busy(&["database is locked".to_string(), "row 5 missing from index".to_string()]));
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("photon.db")).unwrap();
+        let backups = dir.path().join("backups");
+        let locked = |_: &Connection| Ok(vec!["unable to validate the inverted index: database is locked".to_string()]);
+
+        // Busy every time: put off, no error, no backup made.
+        let out = db.back_up_checked(&backups, 3, Duration::ZERO, Duration::ZERO, locked).unwrap();
+        assert_eq!(out, BackupOutcome::Busy);
+        assert!(list_backups(&backups).unwrap().is_empty());
+
+        // Busy a few times, then fine: backed up.
+        let calls = std::cell::Cell::new(0);
+        let flaky = |c: &Connection| {
+            calls.set(calls.get() + 1);
+            if calls.get() < 3 { locked(c) } else { quick_check(c) }
+        };
+        let out = db.back_up_checked(&backups, 3, Duration::ZERO, Duration::ZERO, flaky).unwrap();
+        assert!(matches!(out, BackupOutcome::Saved(_)), "{out:?}");
+        assert_eq!(calls.get(), 3);
+
+        // Real damage is still an error, and is not retried.
+        let calls = std::cell::Cell::new(0);
+        let damaged = |_: &Connection| {
+            calls.set(calls.get() + 1);
+            Ok(vec!["row 5 missing from index idx_images_hash".to_string()])
+        };
+        let err = db.back_up_checked(&backups, 3, Duration::ZERO, Duration::ZERO, damaged).unwrap_err();
+        assert!(err.to_string().contains("integrity check"), "{err}");
+        assert_eq!(calls.get(), 1);
     }
 }
