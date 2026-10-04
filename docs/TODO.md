@@ -44,6 +44,12 @@ Useful tools installed on the dev machine: `xmllint`, `exiv2`, `darktable-cli`,
 - UI changes can't be fully verified headless: say so in the report, and list
   what the user should click through.
 - The maintainer commits. Don't commit unless asked.
+- **Never point Photon at the user's archive without a read-only sandbox.** Importing in place writes
+  sidecars next to the photos (see R-20), and the app sweeps/relinks. Run the test inside
+  `bwrap --bind / / --ro-bind <mount> <mount> --dev-bind /dev /dev --proc /proc --bind /tmp /tmp <cmd>`
+  (the second mount makes the drive read-only for the kernel; check with `findmnt` inside, and
+  `test -w`), with a scratch database/cache (`XDG_DATA_HOME`, `XDG_CACHE_HOME`) outside the drive.
+  Verify afterwards that nothing under the mount is newer than the run (`find -newermt`).
 - **Open source only.** Every dependency, runtime and ML model must be under an
   OSI-approved licence (MIT, Apache-2.0, BSD, GPL/LGPL, MPL…). Model *weights*
   count: "research only", "non-commercial" or custom-restricted weights are out,
@@ -432,6 +438,79 @@ Build a synthetic library generator (a test or bench) with 200k image rows plus 
     recently viewed folders; later, replace polling with R-11's file monitor;
   - measure it in the R-12 benchmark (target: < 1 s at 100k on SSD, no work on focus beyond that).
 
+**Measured 2026-09-30** (Core Ultra 5 125H, NVMe/btrfs, release build; synthetic libraries are
+RAW+JPG pairs, files absent, so stat numbers are warm-cache only):
+
+| What | Result |
+|---|---|
+| Cold start → first frame, real library (611 files, 304 shots) | ~155 ms; settled ~270 ms; same cold and warm (DB, thumbnails and binary evicted from the page cache) |
+| Cold start → first frame, 200k files (100k shots) | ~470 ms, of which the timeline query is ~310 ms **on the UI thread** (`MainWindow::new`); frames 2–3 at 0.7–1.2 s while the library check and thumbnail backfill run |
+| Timeline query, all shots: 10k / 50k / 200k files | 8 / 49 / 211 ms |
+| Full-text search: 10k / 50k / 200k | 22 / 98 / 403 ms (**misses the < 200 ms target at 200k**) |
+| `PRAGMA quick_check` / catalog backup at 200k | 161 / 283 ms (DB 93 MB) |
+| Import 510 ORF (5.7 GB) in place, with grid thumbnails and ThumbHash | 5.5 s (~93 photos/s; bound by the disk) |
+| Large (2560 px) preview from a RAW / full 1:1 RAW develop | ~205 ms / 0.66–0.8 s |
+| `exists()` per file / + sidecar lookup (`find_xmp`), warm | 0.8 µs / 3.4 µs → the library check is ~0.7 s per pass at 200k warm, far worse cold or on an HDD; `read_dir` lists 50k entries in 5 ms |
+
+**Measured 2026-10-01 on a real archive** (USB SSD, ext4, 56,094 files / 397 GB, 42,224 photos after
+dedupe; the drive was mounted read-only inside `bwrap` — see "Rules for agents"). In-place import with
+grid thumbnails and ThumbHash, into a scratch library:
+
+| What | Result |
+|---|---|
+| Whole archive, first import | **86 min** (~77 MB/s effective; the drive reads 175–200 MB/s raw); 105 % CPU, i.e. ~1 of 18 cores; peak RSS 885 MB |
+| Per year folder | 7–30 files/s (RAW-heavy years ~7.5/s); the name+size+date fast path (known files) ran at 72 files/s |
+| Exact duplicates found by content | 4,744 of 46,968 files |
+| Cold start → first frame, 42k photos (27,342 shots) | ~430–450 ms; frame 3 at ~1.0 s; timeline query ~170 ms on the UI thread; DB, 2.8 GB of thumbnails and binary evicted from the page cache |
+| Memory at that size | **1.4–1.6 GB RSS** (baseline ~150 MB); timeline items are only ~10 MB, so the rest is unexplained → investigate before 100k+ photos |
+
+What this showed:
+- In-place import reads every byte (BLAKE3) so the first import of a big archive is I/O-bound. **The hash
+  itself is cheap** (blake3 ~1.4 GB/s; the import used 7 % CPU); the slowness was *four parallel read
+  streams* on a USB SSD: Photon's own `blake3_hash_file` read 160 photos at 210 MB/s with 1 thread and
+  49 MB/s with 4, and plain `cat` showed the same (233 / 165 / 91 MB/s for 1 / 4 / 16 streams).
+  **Fixed 2026-10-01:** `ImportConfig.io_threads` defaults to 0 = auto (`photon-import::device`: USB,
+  memory cards and spinning disks get 1 stream, internal SSDs and unknown mounts 4). Same 438 files
+  (4.7 GB) from the drive, cold: 42–78 s (avg ~58) → 22–45 s (avg ~26), now at the single-stream
+  ceiling (~215 MB/s); internal NVMe unchanged (1 GB/s). Not re-run on the whole 397 GB archive:
+  expect ~30–40 min instead of 86.
+- **Still open — read fewer bytes.** Thumbnails and metadata need ~1–2 MB per photo, the hash needs all
+  20 MB. Hash lazily in the background: import with preview + EXIF + the existing name/size/date key,
+  fill in the hash later. Costs: the thumbnail cache and `images.hash` (UNIQUE) are keyed by the content
+  hash (invariant 4) → a provisional key and a rename when the real hash arrives; exact duplicates are
+  found after the photos were already shown (merge or drop the newer row, never lose a rating/tag);
+  a resumable background job (rows with a pending hash, run at startup). Expected: archive usable in
+  ~5–10 min, hash finished in the background. Decide before building (see R-20 / "Skip hashing known
+  files faster").
+- Per-file latency still matters when the bandwidth is free (directory scan, stats, EXIF, sidecar lookups
+  ~15 s of the 37 s hash-only run at one stream before the fix): a two-stage pipeline (metadata and
+  sidecars in parallel, bulk reads in one stream) is the other lever.
+- **Import writes sidecars next to the photos** (`read_image_xmp` → `spread_cull_to_shot`: a rating in one
+  file's sidecar is copied to the shot's other files). 562 such writes were attempted on the archive.
+  Wanted for the user's own library, but an archive/backup must be openable read-only (see R-20).
+
+Not measured: scroll frame rate, key-to-photo latency in the viewer, Photo Mechanic / Lightroom for
+comparison. Still to do: run the timeline query off the UI
+thread (or page it) beyond ~100k shots, and make search meet the target (FTS on `metadata_json`
+is the cost: index only the fields people search).
+
+### 🔴 R-20 · Library health: damaged files, read-only archives · S–M
+
+Found 2026-10-01 importing a real 397 GB archive (see R-12).
+
+- **Damaged-files report.** Import only says "imported, but it can't be shown" once, in a message.
+  Keep the list (a `damaged` flag + reason per photo, or a smart collection), show it in the sidebar
+  like "Missing Photos", and say what is wrong: truncated JPEG (no end marker, size a multiple of 4096),
+  undecodable RAW preview, unsupported. Across that archive: 47 files really damaged (41 truncated JPEGs
+  from 2017, 2 DNG, 1 JPEG missing its last bytes, 3 corrupted mid-file) and 106 false alarms, which the
+  preview-scanner fix (PART 3) removed. The user's copy of the lists: `~/photon-elements-ii-report/`.
+- **Read-only mode** for archives: don't write sidecars or anything next to the photos when a folder is
+  read-only or the user opts out ("Import without touching the folder"); the DB then holds the ratings and
+  the write is retried when the folder becomes writable. Today the writes just fail with a warning each.
+- **Skip hashing known files faster / lazily** (see R-12: the design is written up there; needs a decision).
+- **Verify the detach/re-mount flow by hand** (unplug the drive, use Photon, re-mount: photos should go
+  offline and come back, thumbnails still show, edits made offline reach the sidecars later). Not tested.
+
 ### 🟢 R-13 · Robustness tests · M
 
 - 🟢 Truncated, zero-byte, permission-denied and wrong-extension files in an import: the import continues and each error is reported (`engine.rs` test `damaged_and_unreadable_files_…`). Empty files are refused; files that import but can't be previewed are reported.
@@ -527,6 +606,27 @@ panel (`detail.rs`, the tag entry and chips). Keywording a 300-photo shoot that 
 - 🟢 Move import: when a photo stays on the card (backup failed), its XMP sidecar is now copied, not moved.
 - 🟢 Compare mode shows real pixels now (R-16).
 - 🟢 HEIC/AVIF/GIF are accepted but can't be decoded (fixed by P-3).
+- 🟢 **Preview scanner picked the wrong JPEG inside RAW files** (found 2026-10-01 on a real archive:
+  106 of 15k ORFs got no thumbnail, e.g. `2018/11/27/PB270032.ORF`; fixed 2026-10-01).
+  `thumbnails::load_raw_preview` took the biggest JPEG-looking block and gave up if it didn't decode.
+  Olympus ORFs hold a sensor-sized (4608×3456) JPEG-like block that isn't a picture (its scan fails on
+  restart markers) next to the real 3200×2400 preview, and some store a preview twice with one copy
+  damaged (ties went to the *last* one). Now candidates are tried biggest first, ties in file order
+  (`embedded_jpegs_by_size`, `decode_first_embedded`), then the camera's JPG, then smaller candidates,
+  then the EXIF thumbnail; `embedded_preview_luma` (the RAW exposure fit) uses the same. Verified on all
+  106 files from the real archive (read-only), and two tests that fail on the old logic. Still to do:
+  prefer the offsets the file's own metadata declares (EXIF/MakerNote `PreviewImage`, `JpgFromRaw`) so the
+  bogus block isn't decoded (~25 ms wasted per affected file) at all.
+- 🟡 Three JPEGs that look fine but are corrupted mid-file (`2017/10/14/PA140156.JPG`,
+  `2025/07/12/P7120033.JPG`, `P7120799.JPG`): `jpeg-decoder` fails with "no marker found where RSTn was
+  expected"; libjpeg resyncs and shows them with a displaced band. Photon shows nothing for them. Optional:
+  fall back to a lenient decoder (`zune-jpeg`, already in the lock file) so the user sees what is left,
+  flagged as damaged (R-20).
+- 🟢 The daily catalog backup reported a busy database as corruption: `PRAGMA quick_check`
+  returns lock failures as text ("unable to validate the inverted index for FTS5 table
+  main.images_fts: database is locked"), which showed the "Library Database Problem" dialog
+  while imports or the library check were writing (seen on a 200k library). Busy checks are
+  now retried, then put off (`BackupOutcome::Busy`); real damage is still an error (2026-09-30).
 - 🟢 XMP read-back deleted all of a photo's library tags when its sidecar had no `dc:subject`
   (darktable writes such sidecars), e.g. for tags whose sidecar write had failed. Now
   `XmpReadResult.tags` is an `Option`: no `dc:subject` leaves the tags alone (2026-09-30).
