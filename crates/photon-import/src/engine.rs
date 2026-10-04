@@ -55,8 +55,10 @@ pub struct ImportConfig {
     pub deduplicate: bool,
     /// Max images per DB transaction.
     pub batch_size: usize,
-    /// Concurrent file reads/copies. Cards and USB drives are fastest with a
-    /// few parallel streams; many more just makes the device seek.
+    /// Concurrent file reads/copies; 0 picks by device ([`crate::device`]):
+    /// one stream on USB drives, memory cards and hard disks, which serve
+    /// one sequential stream much faster than several (measured: 4× on a USB
+    /// SSD), several on internal SSDs and network shares.
     pub io_threads: usize,
     /// Copy and Move: read every copy back from disk and compare it with the
     /// original before it counts as imported (and before a move deletes it).
@@ -77,7 +79,7 @@ impl Default for ImportConfig {
             extract_metadata: true,
             deduplicate: true,
             batch_size: 200,
-            io_threads: 4,
+            io_threads: 0,
             verify: true,
             backup_dir: None,
             cancel: CancelToken::default(),
@@ -281,8 +283,15 @@ impl ImportEngine {
         emit: &(impl Fn(ImportProgress) + Sync),
     ) -> anyhow::Result<()> {
         let config = ctx.config;
+        let io_threads = if config.io_threads == 0 {
+            let n = crate::device::suggested_io_threads(files);
+            log::info!("Reading {n} file(s) at a time ({})", files.first().map_or(String::new(), |f| f.display().to_string()));
+            n
+        } else {
+            config.io_threads
+        };
         let io_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(config.io_threads.max(1))
+            .num_threads(io_threads.max(1))
             .thread_name(|i| format!("photon-import-io-{i}"))
             .build()?;
         let thumbs = self.thumbnail_gen.as_ref().filter(|_| config.generate_thumbnails);
@@ -496,7 +505,7 @@ impl ImportEngine {
         // Same bounded parallelism as the import's I/O stage: a few streams
         // keep a card reader busy without making it seek.
         let io_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(ImportConfig::default().io_threads)
+            .num_threads(crate::device::PARALLEL_IO_THREADS)
             .thread_name(|i| format!("photon-prescan-{i}"))
             .build()?;
         let classified: Vec<Option<(bool, PreImportItem)>> = io_pool.install(|| {

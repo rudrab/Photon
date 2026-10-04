@@ -687,7 +687,7 @@ pub fn quick_previews(
     on_preview: impl Fn(usize, Preview) + Sync,
 ) -> Result<()> {
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(crate::ImportConfig::default().io_threads)
+        .num_threads(crate::device::PARALLEL_IO_THREADS)
         .thread_name(|i| format!("photon-preview-{i}"))
         .build()?;
     pool.install(|| {

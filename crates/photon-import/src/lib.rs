@@ -4,6 +4,7 @@
 //! `crossbeam_channel::Sender<ImportProgress>`.
 
 pub mod dedup;
+pub mod device;
 pub mod engine;
 pub mod library;
 pub mod metadata;
