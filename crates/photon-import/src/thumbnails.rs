@@ -423,8 +423,7 @@ pub(crate) fn embedded_preview_upright(image: &Image) -> Result<RgbImage> {
 /// preview in RAW file `path`: what the camera meant the photo to look like.
 pub(crate) fn embedded_preview_luma(path: &Path) -> Option<f32> {
     let data = fs::read(path).ok()?;
-    let (start, _, _) = largest_embedded_jpeg(&data)?;
-    let preview = decode_jpeg_scaled(Cursor::new(&data[start..]), 512).ok()?.into_rgb8();
+    let preview = decode_first_embedded(&data, &embedded_jpegs_by_size(&data), 512)?.into_rgb8();
     let decode = |v: u8| {
         let v = v as f32 / 255.0;
         if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
@@ -586,34 +585,59 @@ pub fn load_video_frame(path: &Path, long_edge: u32) -> Result<DynamicImage> {
 }
 
 /// RAW files can't be decoded here; use the best JPEG the camera stored.
+///
+/// The biggest JPEG-looking thing in a RAW is often not a picture: Olympus
+/// ORFs hold a sensor-sized JPEG-like block whose scan doesn't decode, and a
+/// camera may store a preview twice with one copy damaged. So candidates are
+/// tried biggest first until one decodes, then the camera's own JPEG, then
+/// the smaller ones, then the EXIF thumbnail.
 fn load_raw_preview(path: &Path, long_edge: u32) -> Result<DynamicImage> {
     let data = fs::read(path)?;
-    let embedded = largest_embedded_jpeg(&data);
+    let candidates = embedded_jpegs_by_size(&data);
+    let (big_enough, smaller): (Vec<_>, Vec<_>) =
+        candidates.into_iter().partition(|&(_, w, h)| w.max(h) >= long_edge);
 
-    if let Some((start, w, h)) = embedded {
-        if w.max(h) >= long_edge {
-            return decode_jpeg_scaled(Cursor::new(&data[start..]), long_edge);
-        }
+    if let Some(img) = decode_first_embedded(&data, &big_enough, long_edge) {
+        return Ok(img);
     }
-    // The embedded preview is smaller than wanted: the camera JPEG is better, if present.
+    // No embedded preview as big as wanted: the camera JPEG is better, if present.
     if let Some(jpeg) = find_camera_jpeg(path) {
         if let Ok(img) = decode_jpeg_scaled(File::open(jpeg)?, long_edge) {
             return Ok(img);
         }
     }
-    if let Some((start, _, _)) = embedded {
-        return decode_jpeg_scaled(Cursor::new(&data[start..]), long_edge);
+    if let Some(img) = decode_first_embedded(&data, &smaller, long_edge) {
+        return Ok(img);
     }
     exif_thumbnail(path, &data, long_edge)
 }
 
-/// Find every embedded JPEG (SOI marker followed by a parseable header) and
-/// return the offset and size of the largest one.
+/// The first of `candidates` (offsets of embedded JPEGs in `data`) that decodes.
+fn decode_first_embedded(data: &[u8], candidates: &[(usize, u32, u32)], long_edge: u32) -> Option<DynamicImage> {
+    candidates.iter().find_map(|&(start, w, h)| {
+        match decode_jpeg_scaled(Cursor::new(&data[start..]), long_edge) {
+            Ok(img) => Some(img),
+            Err(e) => {
+                log::debug!("embedded JPEG at {start} ({w}x{h}) doesn't decode: {e}");
+                None
+            }
+        }
+    })
+}
+
+
+/// Every embedded JPEG (SOI marker followed by a parseable header), biggest
+/// first; equal sizes in file order (a camera's first copy of a preview, not
+/// a later duplicate).
 ///
 /// This works across vendors without parsing each maker-note format: Olympus,
 /// Canon, Nikon, Sony, Fuji and Panasonic all embed a baseline JPEG preview.
-fn largest_embedded_jpeg(data: &[u8]) -> Option<(usize, u32, u32)> {
-    embedded_jpegs(data).into_iter().max_by_key(|&(_, w, h)| w as u64 * h as u64)
+/// Not every candidate is a picture, so callers try them in order
+/// ([`decode_first_embedded`]).
+fn embedded_jpegs_by_size(data: &[u8]) -> Vec<(usize, u32, u32)> {
+    let mut found = embedded_jpegs(data);
+    found.sort_by_key(|&(start, w, h)| (std::cmp::Reverse(w as u64 * h as u64), start));
+    found
 }
 
 /// Every embedded JPEG in `data`: offset and dimensions.
@@ -893,12 +917,81 @@ mod tests {
         raw.extend(std::fs::read(&big).unwrap());
         raw.extend([0xFF, 0xD8, 0xFF, 0x00, 0x01]); // false positive
 
-        assert_eq!(largest_embedded_jpeg(&raw), Some((big_at, 1600, 1200)));
+        assert_eq!(embedded_jpegs_by_size(&raw).first().copied(), Some((big_at, 1600, 1200)));
 
         let orf = dir.path().join("P1.ORF");
         std::fs::write(&orf, &raw).unwrap();
         let preview = load_raw_preview(&orf, 640).unwrap();
         assert_eq!(preview.width().max(preview.height()), 800); // 1/2 IDCT scale, ≥ 640
+    }
+
+    /// A JPEG whose header is fine but whose scan is garbage, as in the
+    /// sensor-sized block of an Olympus ORF.
+    fn undecodable_jpeg(width: u32, height: u32) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("g.jpg");
+        write_jpeg(&good, &Spec { width, height, exif: false, ..Default::default() });
+        let mut jpeg = std::fs::read(&good).unwrap();
+        // Keep everything up to the start of scan, then junk containing a stray SOI.
+        let sos = jpeg.windows(2).position(|w| w == [0xFF, 0xDA]).unwrap();
+        let header_end = sos + 2 + u16::from_be_bytes([jpeg[sos + 2], jpeg[sos + 3]]) as usize;
+        jpeg.truncate(header_end);
+        jpeg.extend([0x12, 0x34, 0xFF, 0xD8, 0xFF, 0xE0, 0x56, 0x78, 0x9A]);
+        jpeg
+    }
+
+    #[test]
+    fn a_big_candidate_that_does_not_decode_falls_through_to_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let thumb = dir.path().join("t.jpg");
+        let preview = dir.path().join("p.jpg");
+        write_jpeg(&thumb, &Spec { width: 160, height: 120, exif: false, ..Default::default() });
+        write_jpeg(&preview, &Spec { width: 1600, height: 1200, exif: false, ..Default::default() });
+
+        // Like PB270032.ORF: thumbnail, a sensor-sized block that is no picture, the real preview.
+        let mut raw = b"IIRO\x08\0\0\0junk".to_vec();
+        raw.extend(std::fs::read(&thumb).unwrap());
+        raw.extend(undecodable_jpeg(4608, 3456));
+        raw.extend([0u8; 64]);
+        raw.extend(std::fs::read(&preview).unwrap());
+        let orf = dir.path().join("P1.ORF");
+        std::fs::write(&orf, &raw).unwrap();
+
+        // The "largest" is the bogus block...
+        assert_eq!(embedded_jpegs_by_size(&raw).first().map(|&(_, w, h)| (w, h)), Some((4608, 3456)));
+        // ...but the thumbnail comes from the real preview.
+        let img = load_raw_preview(&orf, 640).unwrap();
+        assert_eq!(img.width().max(img.height()), 800);
+        // The exposure fit uses it too.
+        assert!(embedded_preview_luma(&orf).is_some());
+    }
+
+    #[test]
+    fn of_two_equal_previews_the_first_is_used_and_a_damaged_one_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let preview = dir.path().join("p.jpg");
+        write_jpeg(&preview, &Spec { width: 1600, height: 1200, exif: false, ..Default::default() });
+        let good = std::fs::read(&preview).unwrap();
+
+        // Like PA290475.ORF: the good preview, later a damaged copy of the same size.
+        let mut raw = b"IIRO\x08\0\0\0".to_vec();
+        let first_at = raw.len();
+        raw.extend(&good);
+        raw.extend([0u8; 100]);
+        raw.extend(undecodable_jpeg(1600, 1200));
+        assert_eq!(embedded_jpegs_by_size(&raw).first().map(|c| c.0), Some(first_at));
+
+        let orf = dir.path().join("P2.ORF");
+        std::fs::write(&orf, &raw).unwrap();
+        assert!(load_raw_preview(&orf, 640).is_ok());
+
+        // Only the damaged one: the camera's JPG next to it is the next best thing.
+        let only_bad = [b"IIRO\x08\0\0\0".to_vec(), undecodable_jpeg(1600, 1200)].concat();
+        let orf3 = dir.path().join("P3.ORF");
+        std::fs::write(&orf3, &only_bad).unwrap();
+        assert!(load_raw_preview(&orf3, 640).is_err());
+        std::fs::copy(&preview, dir.path().join("P3.JPG")).unwrap();
+        assert!(load_raw_preview(&orf3, 640).is_ok());
     }
 
     #[test]
