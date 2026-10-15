@@ -508,8 +508,41 @@ Found 2026-10-01 importing a real 397 GB archive (see R-12).
   read-only or the user opts out ("Import without touching the folder"); the DB then holds the ratings and
   the write is retried when the folder becomes writable. Today the writes just fail with a warning each.
 - **Skip hashing known files faster / lazily** (see R-12: the design is written up there; needs a decision).
+- Import safety (logout hold, close confirmation, resume): done, see R-21.
 - **Verify the detach/re-mount flow by hand** (unplug the drive, use Photon, re-mount: photos should go
   offline and come back, thumbnails still show, edits made offline reach the sidecars later). Not tested.
+
+### 🟢 R-21 · Import safety on the road · S–M
+
+Done 2026-10-15 (for a photo trip: a laptop, memory cards, hotel power).
+
+- 🟢 **Logout and suspend are held off while an import runs** (`ui/import_guard.rs`, a GTK
+  `Application::inhibit` for LOGOUT | SUSPEND, released when the import ends). Checked on GNOME: the
+  session manager shows the inhibitor (flags 5, reason "Photon is importing photos") for exactly the
+  length of the import. Not checked: what a closed laptop lid does (that is the desktop's setting).
+- 🟢 **Closing the window or Ctrl+Q mid-import asks first** ("Import in progress": Keep Importing /
+  Quit Anyway). The quit action now closes the windows instead of `app.quit()`, so the window can ask.
+  `MainWindow.active_imports` counts running imports.
+- 🟢 **An import cut short is reported at the next start** ("The last import didn't finish", once;
+  `queries::running_import_batches` / `mark_running_imports_interrupted`), with "Import Again…" for folder
+  imports whose source is still there (a card is never offered as a link). Batches older than 30 days are
+  only marked.
+- 🟢 **Importing again after an interruption doesn't duplicate.** A photo copied (or moved) before the run
+  was cut short but not yet registered used to be copied a second time as `IMG_1_1.jpg` (measured: 34 of
+  509). Now an identical file already at the destination is adopted (`library::is_same_file`); a different
+  photo with the same name is still never overwritten or adopted. After kill → restart → import again the
+  library, the source and the disk all had 509 photos, no `_N` copies, no orphans.
+- 🟢 **The photo library folder is a setting** (Preferences → Photo Library; default: the Pictures folder
+  itself, so photos land in `~/Pictures/YYYY/MM/DD`, not `~/Pictures/Photon Library`; any folder can be
+  chosen, e.g. an external SSD). `Preferences.library_dir`, `library::library_root`, a writable check
+  (`library::is_writable_dir`) with a warning in the import dialog. Existing libraries are not moved
+  (paths are stored per photo).
+- 🔴 **Move still deletes the card's copy before the photo is registered in the database** (a crash in the
+  ~0.4 s window leaves the photo safely in the library folder but unknown to Photon; importing the
+  library folder in place registers it). Better: remove the source only after the commit.
+- Not verified by hand in the GUI: the Preferences row, the import dialog's folder line, the dialogs'
+  looks. Verified with a throw-away harness driving the real app (real Copy import, quit mid-way, next
+  start, import again).
 
 ### 🟢 R-13 · Robustness tests · M
 

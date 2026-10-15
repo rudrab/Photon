@@ -599,6 +599,10 @@ pub struct Preferences {
     pub verify_imports: bool,
     #[serde(default)]
     pub import_backup_dir: Option<PathBuf>,
+    /// Where Copy/Move imports file photos (`YYYY/MM/DD/`). None: the Pictures
+    /// folder, where Linux keeps photos.
+    #[serde(default)]
+    pub library_dir: Option<PathBuf>,
 }
 
 fn default_true() -> bool {
@@ -680,6 +684,7 @@ impl Default for Preferences {
             share_versions: Versions::share_default(),
             verify_imports: true,
             import_backup_dir: None,
+            library_dir: None,
         }
     }
 }
@@ -943,6 +948,15 @@ mod tests {
         let prefs: Preferences = serde_json::from_str(json).unwrap();
         assert_eq!(prefs.delete_mode, Versions::AllVersions);
         assert_eq!(prefs.share_versions, Versions::RasterOnly);
+        // Settings added later start at their defaults: verified copies, no
+        // backup folder, and the Pictures folder as the library.
+        assert!(prefs.verify_imports);
+        assert_eq!(prefs.import_backup_dir, None);
+        assert_eq!(prefs.library_dir, None);
+
+        let chosen = r#"{"raster_editor":"gimp","raw_editor":"darktable","viewer":"eog","thumbnail_size":220,"library_dir":"/mnt/ssd/Photos"}"#;
+        let prefs: Preferences = serde_json::from_str(chosen).unwrap();
+        assert_eq!(prefs.library_dir.as_deref(), Some(std::path::Path::new("/mnt/ssd/Photos")));
     }
 
     #[test]

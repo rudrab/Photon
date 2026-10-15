@@ -626,20 +626,39 @@ fn try_process_file(src: &Path, ctx: &Context) -> anyhow::Result<Option<Image>> 
             (src.to_path_buf(), hash)
         }
         FolderImportMode::Copy => {
-            let dest = ctx.planner.lock().unwrap().plan(src, created_at)?;
-            let staged = library::stage_copy(src, &dest, config.verify)?;
-            let hash = staged.hash.clone();
-            if !ctx.claim(&hash) {
-                return Ok(None); // dropping `staged` deletes the copy
-            }
-            match staged.commit() {
-                Ok(dest) => {
-                    back_up(ctx, src, &dest, &hash);
-                    (dest, hash)
+            // The same photo may already sit where it would go: an earlier
+            // import was cut short after copying it, before registering it.
+            // Adopt that copy rather than make a second one (`IMG_1_1.jpg`).
+            let len = fs::metadata(src)?.len();
+            let natural = ctx.planner.lock().unwrap().natural(src, created_at)?;
+            let adopted = if fs::metadata(&natural).is_ok_and(|m| m.is_file() && m.len() == len) {
+                let hash = dedup::blake3_hash_file(src)?;
+                library::is_same_file(&natural, len, &hash).then_some(hash)
+            } else {
+                None
+            };
+            if let Some(hash) = adopted {
+                if !ctx.claim(&hash) {
+                    return Ok(None);
                 }
-                Err(e) => {
-                    ctx.release(&hash);
-                    return Err(e.into());
+                back_up(ctx, src, &natural, &hash);
+                (natural, hash)
+            } else {
+                let dest = ctx.planner.lock().unwrap().plan(src, created_at)?;
+                let staged = library::stage_copy(src, &dest, config.verify)?;
+                let hash = staged.hash.clone();
+                if !ctx.claim(&hash) {
+                    return Ok(None); // dropping `staged` deletes the copy
+                }
+                match staged.commit() {
+                    Ok(dest) => {
+                        back_up(ctx, src, &dest, &hash);
+                        (dest, hash)
+                    }
+                    Err(e) => {
+                        ctx.release(&hash);
+                        return Err(e.into());
+                    }
                 }
             }
         }
@@ -648,12 +667,20 @@ fn try_process_file(src: &Path, ctx: &Context) -> anyhow::Result<Option<Image>> 
             if !ctx.claim(&hash) {
                 return Ok(None); // the source of a duplicate is left untouched
             }
-            let dest = ctx.planner.lock().unwrap().plan(src, created_at)?;
-            let moved = match library::move_into_place(src, &dest, Some(&hash), config.verify) {
-                Ok(moved) => moved,
-                Err(e) => {
-                    ctx.release(&hash);
-                    return Err(e.into());
+            // Already in place? An earlier import moved this photo and was cut
+            // short before registering it: there is nothing to move, and the
+            // card's copy (kept until now) can go once the backup exists.
+            let natural = ctx.planner.lock().unwrap().natural(src, created_at)?;
+            let (dest, moved) = if library::is_same_file(&natural, fs::metadata(src)?.len(), &hash) {
+                (natural, library::Moved::Copied)
+            } else {
+                let dest = ctx.planner.lock().unwrap().plan(src, created_at)?;
+                match library::move_into_place(src, &dest, Some(&hash), config.verify) {
+                    Ok(moved) => (dest, moved),
+                    Err(e) => {
+                        ctx.release(&hash);
+                        return Err(e.into());
+                    }
                 }
             };
             // The card's copy goes only once the library copy (and backup) exist.
@@ -851,6 +878,77 @@ mod tests {
         assert_eq!((again.imported_count, again.duplicate_count), (0, 2));
         assert_eq!(files_in(lib.path()), 1);
         assert!(card.path().join("DCIM/one.jpg").exists());
+    }
+
+    /// An import cut short after copying a photo but before registering it
+    /// leaves the copy in the library folder, unknown to the library. Running
+    /// the import again must pick that copy up, not copy the photo a second time.
+    #[test]
+    fn importing_again_adopts_a_copy_an_interrupted_import_left() {
+        let card = tempfile::tempdir().unwrap();
+        let lib = tempfile::tempdir().unwrap();
+        let src = card.path().join("DCIM/IMG_7.jpg");
+        write_jpeg(&src, &Spec { seed: 7, ..Default::default() });
+        // What the interrupted run left: the photo at its place, not registered.
+        let left = lib.path().join("2023/07/04/IMG_7.jpg");
+        fs::create_dir_all(left.parent().unwrap()).unwrap();
+        fs::copy(&src, &left).unwrap();
+
+        let engine = engine();
+        let cfg = config(FolderImportMode::Copy, lib.path());
+        let batch = engine.import(&DiskSource::new(card.path().to_path_buf(), true), &cfg, None).unwrap();
+
+        assert_eq!((batch.imported_count, batch.duplicate_count), (1, 0));
+        assert_eq!(files_in(lib.path()), 1, "no IMG_7_1.jpg: the copy that was there is the photo");
+        assert!(!lib.path().join("2023/07/04/IMG_7_1.jpg").exists());
+        assert_eq!(photos(&engine)[0].path, left);
+        assert!(src.exists(), "a copy never touches the card");
+    }
+
+    #[test]
+    fn a_different_photo_with_the_same_name_and_size_is_not_adopted() {
+        let card = tempfile::tempdir().unwrap();
+        let lib = tempfile::tempdir().unwrap();
+        let src = card.path().join("DCIM/IMG_7.jpg");
+        write_jpeg(&src, &Spec { seed: 7, ..Default::default() });
+        // Another photo, same name and (padded to) the same size, already there.
+        let other = lib.path().join("2023/07/04/IMG_7.jpg");
+        fs::create_dir_all(other.parent().unwrap()).unwrap();
+        let mut bytes = fs::read(&src).unwrap();
+        let last = bytes.len() - 3;
+        bytes[last] ^= 0xFF;
+        fs::write(&other, &bytes).unwrap();
+
+        let engine = engine();
+        let cfg = config(FolderImportMode::Copy, lib.path());
+        engine.import(&DiskSource::new(card.path().to_path_buf(), true), &cfg, None).unwrap();
+
+        assert_eq!(fs::read(&other).unwrap(), bytes, "the other photo is left alone");
+        assert_eq!(files_in(lib.path()), 2);
+        assert_eq!(photos(&engine)[0].path, lib.path().join("2023/07/04/IMG_7_1.jpg"));
+    }
+
+    /// A Move cut short after moving a photo: the library holds it, the card
+    /// lost it, nothing registered it. Importing again from a card that still
+    /// has other photos must not move the same photo twice.
+    #[test]
+    fn a_move_adopts_a_photo_already_in_the_library_and_then_frees_the_card() {
+        let card = tempfile::tempdir().unwrap();
+        let lib = tempfile::tempdir().unwrap();
+        let src = card.path().join("DCIM/IMG_7.jpg");
+        write_jpeg(&src, &Spec { seed: 7, ..Default::default() });
+        let left = lib.path().join("2023/07/04/IMG_7.jpg");
+        fs::create_dir_all(left.parent().unwrap()).unwrap();
+        fs::copy(&src, &left).unwrap();
+
+        let engine = engine();
+        let cfg = config(FolderImportMode::Move, lib.path());
+        let batch = engine.import(&DiskSource::new(card.path().to_path_buf(), true), &cfg, None).unwrap();
+
+        assert_eq!(batch.imported_count, 1);
+        assert_eq!(files_in(lib.path()), 1, "no second copy in the library");
+        assert_eq!(photos(&engine)[0].path, left);
+        assert!(!src.exists(), "the card's copy goes: the library has the photo");
     }
 
     #[test]

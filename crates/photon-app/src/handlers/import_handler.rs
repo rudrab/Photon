@@ -10,6 +10,8 @@
 use crate::ui::window::MainWindow;
 use crossbeam_channel::unbounded;
 use gtk4::prelude::*;
+use libadwaita as adw;
+use libadwaita::prelude::*;
 use gtk4::{
     gio, glib, Align, Box as GtkBox, Button, CheckButton, FileDialog, FileFilter, Label,
     Orientation, ScrolledWindow, Window,
@@ -49,7 +51,7 @@ pub fn show_folder_import_dialog(mw: &MainWindow) {
 }
 
 /// Pre-scan files and show the Pre-Import Review dialog ("N new / N already in library").
-fn show_import_options_dialog(mw: &MainWindow, source_path: PathBuf, from_device: bool) {
+pub(crate) fn show_import_options_dialog(mw: &MainWindow, source_path: PathBuf, from_device: bool) {
     let dialog = Window::builder()
         .transient_for(&mw.window)
         .modal(true)
@@ -181,6 +183,37 @@ fn show_import_options_dialog(mw: &MainWindow, source_path: PathBuf, from_device
         mode_card.append(&mode_box);
         vbox.append(&mode_card);
 
+        // Where Copy and Move put the photos (a Preferences setting), and a
+        // warning when that folder can't be written to.
+        let library = photon_import::library::library_root(mw_for_ui.prefs.borrow().library_dir.as_deref());
+        let dest_lbl = Label::new(None);
+        dest_lbl.set_halign(Align::Start);
+        dest_lbl.set_wrap(true);
+        let update_destination = {
+            let (dest_lbl, rb_link, library) = (dest_lbl.clone(), rb_link.clone(), library.clone());
+            move || {
+                if rb_link.is_active() {
+                    dest_lbl.set_text("Photos stay where they are; Photon only records them.");
+                    dest_lbl.set_css_classes(&["caption", "dim-label"]);
+                } else if photon_import::library::is_writable_dir(&library) {
+                    dest_lbl.set_text(&format!(
+                        "Photos are filed in {}/year/month/day. Change the folder in Preferences.",
+                        library.display()
+                    ));
+                    dest_lbl.set_css_classes(&["caption", "dim-label"]);
+                } else {
+                    dest_lbl.set_text(&format!(
+                        "Can't write to {}: choose another library folder in Preferences.",
+                        library.display()
+                    ));
+                    dest_lbl.set_css_classes(&["caption", "error"]);
+                }
+            }
+        };
+        update_destination();
+        rb_link.connect_toggled(move |_| update_destination());
+        vbox.append(&dest_lbl);
+
         // ── Previews / Item lists ───────────────────────
         let scroll = ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -274,8 +307,6 @@ fn show_import_options_dialog(mw: &MainWindow, source_path: PathBuf, from_device
         let mw = mw_for_ui.clone();
         let src_for_import = src_path.clone();
         import_btn.connect_clicked(move |_| {
-            d_close.close();
-
             let mode = if rb_copy.is_active() {
                 FolderImportMode::Copy
             } else if rb_move.is_active() {
@@ -285,8 +316,20 @@ fn show_import_options_dialog(mw: &MainWindow, source_path: PathBuf, from_device
             };
 
             let prefs = mw.prefs.borrow().clone();
+            if mode != FolderImportMode::InPlace {
+                let library = photon_import::library::library_root(prefs.library_dir.as_deref());
+                if !photon_import::library::is_writable_dir(&library) {
+                    (mw.share_context().notify)(&format!(
+                        "Can't write to the library folder {}: choose another in Preferences",
+                        library.display()
+                    ));
+                    return;
+                }
+            }
+            d_close.close();
             let config = ImportConfig {
                 mode,
+                destination_dir: prefs.library_dir.clone(),
                 verify: prefs.verify_imports,
                 backup_dir: prefs.import_backup_dir,
                 ..ImportConfig::default()
@@ -701,6 +744,13 @@ fn run_import(
     mw.progress_bar.set_fraction(0.0);
     mw.progress_bar.set_text(None);
 
+    // While photos are being copied the laptop must not suspend or log out,
+    // and closing the window asks first.
+    mw.active_imports.set(mw.active_imports.get() + 1);
+    let mut guard = mw.window.application().and_then(|app| {
+        crate::ui::import_guard::ImportGuard::new(&app, &mw.window, "Photon is importing photos")
+    });
+
     let cancel = config.cancel.clone();
     mw.cancel_button.set_visible(true);
     mw.cancel_button.set_sensitive(true);
@@ -759,6 +809,8 @@ fn run_import(
         let Ok(result) = done_rx.try_recv() else {
             return glib::ControlFlow::Continue;
         };
+        drop(guard.take());
+        mw.active_imports.set(mw.active_imports.get().saturating_sub(1));
 
         let summary = match result {
             Ok(batch) => {
@@ -790,6 +842,82 @@ fn run_import(
         });
         glib::ControlFlow::Break
     });
+}
+
+// ═══════════════════════════════════════════════════════════
+// An import that was cut short (startup)
+// ═══════════════════════════════════════════════════════════
+
+/// At startup: if the last session ended in the middle of an import (Photon
+/// was closed or killed, the battery died), say so and offer to run it again.
+/// Photos imported before that are in the library; importing the same folder
+/// again skips them and brings in the rest. Each interrupted import is
+/// reported once.
+pub fn report_interrupted_import(mw: &MainWindow) {
+    use photon_core::db::queries;
+    /// Older ones are history, not news.
+    const RECENT_DAYS: i64 = 30;
+
+    let db = mw.db.clone();
+    let (tx, rx) = async_channel::bounded(1);
+    thread::spawn(move || {
+        let found = db.conn().map_err(|e| e.to_string()).and_then(|conn| {
+            let batches = queries::running_import_batches(&conn).map_err(|e| e.to_string())?;
+            queries::mark_running_imports_interrupted(&conn).map_err(|e| e.to_string())?;
+            Ok(batches)
+        });
+        let _ = tx.send_blocking(found);
+    });
+
+    let mw = mw.clone();
+    glib::spawn_future_local(async move {
+        let batches = match rx.recv().await {
+            Ok(Ok(batches)) => batches,
+            Ok(Err(e)) => return log::warn!("Looking for an interrupted import: {e}"),
+            Err(_) => return,
+        };
+        let cutoff = chrono::Utc::now().timestamp() - RECENT_DAYS * 86_400;
+        if let Some(batch) = batches.into_iter().find(|b| b.started_at >= cutoff) {
+            show_interrupted_import(&mw, &batch);
+        }
+    });
+}
+
+fn show_interrupted_import(mw: &MainWindow, batch: &photon_core::models::ImportBatch) {
+    let source = PathBuf::from(&batch.source_path);
+    let again = batch.source_type == "folder" && source.is_dir();
+    let when = chrono::DateTime::from_timestamp(batch.started_at, 0)
+        .map(|t| t.with_timezone(&chrono::Local).format("%b %-d, %H:%M").to_string())
+        .unwrap_or_default();
+
+    let mut body = format!(
+        "Photon was closed, or the computer lost power, while importing from {} (started {when}). \
+         Photos imported before that are in your library.",
+        batch.source_path
+    );
+    if again {
+        body.push_str("\n\nImport it again to bring in the rest; photos already imported are skipped.");
+    } else if batch.source_type == "folder" {
+        body.push_str("\n\nThat folder isn't available now (card or drive removed?). Connect it and import again.");
+    }
+
+    let dialog = adw::MessageDialog::new(Some(&mw.window), Some("The last import didn't finish"), Some(&body));
+    dialog.add_response("later", if again { "Not Now" } else { "OK" });
+    if again {
+        dialog.add_response("again", "Import Again…");
+        dialog.set_response_appearance("again", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("again"));
+    }
+    dialog.set_close_response("later");
+    let mw = mw.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response == "again" {
+            // A memory card must be copied, never linked in place.
+            let from_card = source.components().any(|c| c.as_os_str() == "DCIM") || source.join("DCIM").is_dir();
+            show_import_options_dialog(&mw, source.clone(), from_card);
+        }
+    });
+    dialog.present();
 }
 
 // ═══════════════════════════════════════════════════════════

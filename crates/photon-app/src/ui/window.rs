@@ -78,6 +78,8 @@ pub struct MainWindow {
     library_check: Rc<Cell<(Option<std::time::Instant>, bool)>>,
     /// The user said "Not Now" to downloading the face model, this session.
     face_model_declined: Rc<Cell<bool>>,
+    /// Imports running now. Closing the window while one runs asks first.
+    pub active_imports: Rc<Cell<usize>>,
 }
 
 /// Coming back to Photon from darktable re-reads changed sidecars, at most
@@ -456,6 +458,7 @@ impl MainWindow {
             timeline_stale: Rc::new(Cell::new(true)),
             library_check: Rc::new(Cell::new((None, false))),
             face_model_declined: Rc::new(Cell::new(false)),
+            active_imports: Rc::new(Cell::new(0)),
             rating_filter,
             cull_flag,
             color_filter,
@@ -694,6 +697,39 @@ impl MainWindow {
             if w.is_active() {
                 mw_focus.check_library();
             }
+        });
+
+        // Closing (or Ctrl+Q) in the middle of an import asks first: what was
+        // imported so far is kept, but the rest would have to be imported again.
+        let importing = mw.active_imports.clone();
+        let confirmed = Rc::new(Cell::new(false));
+        mw.window.connect_close_request(move |win| {
+            if importing.get() == 0 || confirmed.get() {
+                return glib::Propagation::Proceed;
+            }
+            let dialog = adw::MessageDialog::new(
+                Some(win),
+                Some("Import in progress"),
+                Some(
+                    "Photon is still importing photos. If you quit now, the photos imported so far are \
+                     kept and the copy in progress is discarded, but you will have to import again to \
+                     bring in the rest. (Stop Import ends it cleanly.)",
+                ),
+            );
+            dialog.add_response("keep", "Keep Importing");
+            dialog.add_response("quit", "Quit Anyway");
+            dialog.set_response_appearance("quit", adw::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("keep"));
+            dialog.set_close_response("keep");
+            let (win, confirmed) = (win.clone(), confirmed.clone());
+            dialog.connect_response(None, move |_, response| {
+                if response == "quit" {
+                    confirmed.set(true);
+                    win.close();
+                }
+            });
+            dialog.present();
+            glib::Propagation::Stop
         });
 
         mw.navigate(&UIAction::ShowAll);

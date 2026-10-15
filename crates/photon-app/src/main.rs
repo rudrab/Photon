@@ -35,8 +35,15 @@ fn main() -> Result<()> {
     let quit_action = gtk4::gio::SimpleAction::new("quit", None);
     let app_weak = app.downgrade();
     quit_action.connect_activate(move |_, _| {
-        if let Some(app) = app_weak.upgrade() {
+        let Some(app) = app_weak.upgrade() else { return };
+        // Close the windows rather than quitting outright, so a window can
+        // ask first (an import is running).
+        let windows = app.windows();
+        if windows.is_empty() {
             app.quit();
+        }
+        for window in windows {
+            window.close();
         }
     });
     app.add_action(&quit_action);
@@ -91,6 +98,7 @@ fn build_ui(app: &adw::Application) {
 
     handlers::import_handler::generate_missing_thumbnails(&window);
     sweep_interrupted_imports(&window, started);
+    handlers::import_handler::report_interrupted_import(&window);
     if let Some(message) = restore_message {
         (window.share_context().notify)(&message);
     }
@@ -103,10 +111,11 @@ fn build_ui(app: &adw::Application) {
 fn sweep_interrupted_imports(window: &ui::window::MainWindow, started: std::time::SystemTime) {
     let db = window.db.clone();
     let backup = window.prefs.borrow().import_backup_dir.clone();
+    let library_dir = window.prefs.borrow().library_dir.clone();
     let notify = window.share_context().notify;
     glib::spawn_future_local(async move {
         let removed = gtk4::gio::spawn_blocking(move || {
-            let mut roots = vec![photon_import::library::library_root(None)];
+            let mut roots = vec![photon_import::library::library_root(library_dir.as_deref())];
             roots.extend(backup);
             let dirs: Vec<std::path::PathBuf> = match db.conn().map_err(|e| e.to_string()).and_then(|conn| {
                 photon_core::db::queries::get_all_images_for_integrity_check(&conn).map_err(|e| e.to_string())

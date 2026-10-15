@@ -1303,6 +1303,40 @@ pub fn insert_import_batch(conn: &Connection, batch: &ImportBatch) -> Result<i64
     Ok(conn.last_insert_rowid())
 }
 
+/// Imports still marked "running": when Photon starts, those were cut short
+/// (it was closed, killed, or lost power), newest first.
+pub fn running_import_batches(conn: &Connection) -> Result<Vec<ImportBatch>, PhotonError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, source_type, source_path, total_files, imported_count, duplicate_count,
+                error_count, status, started_at, completed_at
+         FROM import_batches WHERE status = 'running' ORDER BY started_at DESC, id DESC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(ImportBatch {
+            id: r.get(0)?,
+            source_type: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            source_path: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            total_files: r.get::<_, Option<i32>>(3)?.unwrap_or(0),
+            imported_count: r.get::<_, Option<i32>>(4)?.unwrap_or(0),
+            duplicate_count: r.get::<_, Option<i32>>(5)?.unwrap_or(0),
+            error_count: r.get::<_, Option<i32>>(6)?.unwrap_or(0),
+            status: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+            started_at: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
+            completed_at: r.get(9)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Mark every import still "running" as "interrupted", so each is reported
+/// once. Returns how many there were.
+pub fn mark_running_imports_interrupted(conn: &Connection) -> Result<usize, PhotonError> {
+    Ok(conn.execute(
+        "UPDATE import_batches SET status = 'interrupted', completed_at = ?1 WHERE status = 'running'",
+        params![chrono::Utc::now().timestamp()],
+    )?)
+}
+
 pub fn complete_import_batch(conn: &Connection, batch: &ImportBatch) -> Result<(), PhotonError> {
     if let Some(id) = batch.id {
         conn.execute(
@@ -2642,6 +2676,33 @@ mod tests {
         let tags = get_tags_for_image(&conn, id).unwrap();
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].name, "holiday");
+    }
+
+    #[test]
+    fn imports_cut_short_are_found_once_and_then_marked() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.pool.get().unwrap();
+        let batch = |path: &str, status: &str, started: i64| {
+            let mut b = ImportBatch::new("folder".to_string(), path.to_string(), 120);
+            b.status = status.to_string();
+            b.started_at = started;
+            insert_import_batch(&conn, &b).unwrap()
+        };
+        batch("/card/old", "running", 100);
+        let done = batch("/card/done", "completed", 150);
+        batch("/card/last", "running", 200);
+
+        let found = running_import_batches(&conn).unwrap();
+        assert_eq!(found.iter().map(|b| b.source_path.as_str()).collect::<Vec<_>>(), ["/card/last", "/card/old"]);
+        assert_eq!(found[0].total_files, 120);
+        assert!(found.iter().all(|b| b.id != Some(done)));
+
+        assert_eq!(mark_running_imports_interrupted(&conn).unwrap(), 2);
+        assert!(running_import_batches(&conn).unwrap().is_empty());
+        assert_eq!(mark_running_imports_interrupted(&conn).unwrap(), 0);
+        let status: String =
+            conn.query_row("SELECT status FROM import_batches WHERE id = ?1", [done], |r| r.get(0)).unwrap();
+        assert_eq!(status, "completed", "finished imports are left alone");
     }
 
     #[test]

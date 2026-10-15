@@ -5,6 +5,7 @@ pub mod detail;
 pub mod export_dialog;
 pub mod faces;
 pub mod histogram;
+pub mod import_guard;
 pub mod mark;
 pub mod photo_view;
 pub mod preferences;

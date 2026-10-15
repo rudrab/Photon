@@ -27,14 +27,28 @@ impl DestinationPlanner {
         }
     }
 
-    /// Pick a free path for `src`, filed under its capture date.
-    /// Name collisions get a numeric suffix: `IMG_001.jpg`, `IMG_001_1.jpg`, …
-    pub fn plan(&mut self, src: &Path, captured_at: Option<i64>) -> io::Result<PathBuf> {
+    /// The folder for a photo taken at `captured_at`: `root/YYYY/MM/DD`.
+    fn folder(&self, captured_at: Option<i64>) -> PathBuf {
         let folder = captured_at
             .and_then(|ts| DateTime::from_timestamp(ts, 0))
             .map(|dt| dt.format("%Y/%m/%d").to_string())
             .unwrap_or_else(|| "Unsorted".to_string());
-        let dir = self.root.join(folder);
+        self.root.join(folder)
+    }
+
+    /// Where `src` would go if nothing were in the way: its own name in its
+    /// date folder. Whether something is there is for the caller to see.
+    pub fn natural(&self, src: &Path, captured_at: Option<i64>) -> io::Result<PathBuf> {
+        let name = src
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+        Ok(self.folder(captured_at).join(name))
+    }
+
+    /// Pick a free path for `src`, filed under its capture date.
+    /// Name collisions get a numeric suffix: `IMG_001.jpg`, `IMG_001_1.jpg`, …
+    pub fn plan(&mut self, src: &Path, captured_at: Option<i64>) -> io::Result<PathBuf> {
+        let dir = self.folder(captured_at);
 
         let name = src
             .file_name()
@@ -60,12 +74,34 @@ impl DestinationPlanner {
     }
 }
 
-/// The library root: explicit destination, else `~/Pictures/Photon Library`.
+/// The library root: the folder the user chose, else the Pictures folder
+/// itself (`~/Pictures`), where Linux keeps photos: photos are filed under it
+/// as `YYYY/MM/DD/`, the layout Shotwell uses.
 pub fn library_root(destination: Option<&Path>) -> PathBuf {
     destination
         .map(Path::to_path_buf)
-        .or_else(|| dirs::picture_dir().map(|p| p.join("Photon Library")))
-        .unwrap_or_else(|| PathBuf::from("Photon Library"))
+        .or_else(dirs::picture_dir)
+        .or_else(|| dirs::home_dir().map(|h| h.join("Pictures")))
+        .unwrap_or_else(|| PathBuf::from("Pictures"))
+}
+
+/// Whether `path` is a file of `len` bytes with BLAKE3 content hash `hash`:
+/// the photo an import placed there before it was cut short, and never got
+/// to register.
+pub fn is_same_file(path: &Path, len: u64, hash: &str) -> bool {
+    fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() == len)
+        && crate::dedup::blake3_hash_file(path).is_ok_and(|h| h == hash)
+}
+
+/// Whether files can be created in directory `dir` (or, if it doesn't exist
+/// yet, in its nearest existing parent): false on read-only mounts and
+/// folders the user may not write to.
+pub fn is_writable_dir(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(existing) = dir.ancestors().find(|p| p.is_dir()) else { return false };
+    let Ok(path) = std::ffi::CString::new(existing.as_os_str().as_bytes()) else { return false };
+    // access(2) asks the kernel, read-only filesystems included, and creates nothing.
+    unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
 }
 
 /// Copy `src` to `dest` while hashing the bytes in the same pass, so a new
@@ -389,6 +425,24 @@ pub fn relink_missing_folder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_library_defaults_to_the_pictures_folder_and_follows_the_users_choice() {
+        let chosen = Path::new("/mnt/trip-ssd/Photos");
+        assert_eq!(library_root(Some(chosen)), chosen);
+        let default = library_root(None);
+        assert!(default.ends_with("Pictures"), "{default:?}");
+        assert!(!default.to_string_lossy().contains("Photon Library"));
+    }
+
+    #[test]
+    fn writability_looks_at_the_nearest_existing_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(is_writable_dir(dir.path()));
+        assert!(is_writable_dir(&dir.path().join("not/yet/created")));
+        assert!(!is_writable_dir(Path::new("/proc/sys")));
+        assert!(!is_writable_dir(Path::new("/nonexistent-drive/Pictures")));
+    }
 
     #[test]
     fn files_by_capture_date_and_avoids_collisions() {

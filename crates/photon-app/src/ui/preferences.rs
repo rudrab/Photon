@@ -148,6 +148,39 @@ pub fn show(
 
     page.add(&group_delete);
 
+    // ── Photo library ───────────────────────────────────
+    let group_library = adw::PreferencesGroup::builder()
+        .title("Photo Library")
+        .description(
+            "Where imports that copy or move photos file them, in year/month/day folders. \
+             Photos linked in place stay where they are.",
+        )
+        .build();
+    let library_dir = Rc::new(RefCell::new(current_prefs.library_dir.clone()));
+    let library_row = adw::ActionRow::builder().title("Library Folder").build();
+    let describe_library = Rc::new({
+        let library_row = library_row.clone();
+        move |dir: Option<&Path>| {
+            let root = photon_import::library::library_root(dir);
+            let which = if dir.is_none() { "the Pictures folder" } else { "your choice" };
+            let warning = if photon_import::library::is_writable_dir(&root) { "" } else { " — can't write here" };
+            library_row.set_subtitle(&format!("{} ({which}){warning}", root.display()));
+        }
+    });
+    describe_library(library_dir.borrow().as_deref());
+    let library_choose = gtk4::Button::builder().label("Choose…").valign(gtk4::Align::Center).build();
+    let library_reset = gtk4::Button::builder()
+        .icon_name("edit-undo-symbolic")
+        .tooltip_text("Use the Pictures folder")
+        .valign(gtk4::Align::Center)
+        .build();
+    library_reset.add_css_class("flat");
+    library_reset.set_sensitive(library_dir.borrow().is_some());
+    library_row.add_suffix(&library_choose);
+    library_row.add_suffix(&library_reset);
+    group_library.add(&library_row);
+    page.add(&group_library);
+
     // ── Import safety ───────────────────────────────────
     let group_import = adw::PreferencesGroup::builder()
         .title("Import Safety")
@@ -163,11 +196,12 @@ pub fn show(
 
     let backup_dir = Rc::new(RefCell::new(current_prefs.import_backup_dir.clone()));
     let backup_row = adw::ActionRow::builder().title("Backup Copy").build();
-    let describe_backup = {
+    let describe_backup = Rc::new({
         let backup_row = backup_row.clone();
+        let library_dir = library_dir.clone();
         move |dir: Option<&Path>| match dir {
             None => backup_row.set_subtitle("Off: photos are only in the library after import"),
-            Some(dir) if same_disk(dir, &photon_import::library::library_root(None)) => backup_row.set_subtitle(&format!(
+            Some(dir) if same_disk(dir, &photon_import::library::library_root(library_dir.borrow().as_deref())) => backup_row.set_subtitle(&format!(
                 "{} — on the library's disk: guards against mistakes, not a disk failure",
                 dir.display()
             )),
@@ -176,7 +210,7 @@ pub fn show(
                 dir.display()
             )),
         }
-    };
+    });
     describe_backup(backup_dir.borrow().as_deref());
     let choose_btn = gtk4::Button::builder().label("Choose…").valign(gtk4::Align::Center).build();
     let clear_btn = gtk4::Button::builder()
@@ -318,6 +352,7 @@ pub fn show(
         let share_row = share_row.clone();
         let verify_row = verify_row.clone();
         let backup_dir = backup_dir.clone();
+        let library_dir = library_dir.clone();
         let on_save = on_save.clone();
         let db = db_clone.clone();
 
@@ -337,6 +372,7 @@ pub fn show(
                     .unwrap_or(Versions::RasterOnly),
                 verify_imports: verify_row.is_active(),
                 import_backup_dir: backup_dir.borrow().clone(),
+                library_dir: library_dir.borrow().clone(),
             };
 
             *prefs.borrow_mut() = new_prefs.clone();
@@ -371,6 +407,34 @@ pub fn show(
 
     let sc7 = save_changes.clone();
     verify_row.connect_active_notify(move |_| sc7());
+
+    let set_library_dir = {
+        let library_dir = library_dir.clone();
+        let backup_dir = backup_dir.clone();
+        let describe_backup = describe_backup.clone();
+        let library_reset = library_reset.clone();
+        let save = save_changes.clone();
+        Rc::new(move |dir: Option<std::path::PathBuf>| {
+            describe_library(dir.as_deref());
+            library_reset.set_sensitive(dir.is_some());
+            *library_dir.borrow_mut() = dir;
+            // Whether the backup is on the library's disk depends on this folder.
+            describe_backup(backup_dir.borrow().as_deref());
+            save();
+        })
+    };
+    let set = set_library_dir.clone();
+    library_reset.connect_clicked(move |_| set(None));
+    let parent = window.clone();
+    library_choose.connect_clicked(move |_| {
+        let dialog = gtk4::FileDialog::builder().title("Photo Library Folder").modal(true).build();
+        let set = set_library_dir.clone();
+        dialog.select_folder(Some(&parent), gtk4::gio::Cancellable::NONE, move |result| {
+            if let Some(path) = result.ok().and_then(|f| f.path()) {
+                set(Some(path));
+            }
+        });
+    });
 
     let set_backup_dir = {
         let backup_dir = backup_dir.clone();
