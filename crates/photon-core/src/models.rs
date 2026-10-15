@@ -408,10 +408,12 @@ impl ColorLabel {
 // Tag
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Tag {
     pub id: Option<i64>,
     pub name: String,
+    #[serde(default)]
+    pub parent_id: Option<i64>,
     pub color: Option<String>, // Hex #RRGGBB
     pub is_category: bool,
 }
@@ -887,6 +889,8 @@ pub struct XmpReadResult {
     /// about the photo's tags (darktable writes sidecars without one), so
     /// the library's tags must be left alone.
     pub tags: Option<Vec<String>>,
+    /// Hierarchical keywords from `lr:hierarchicalSubject` (e.g. `["Places|France|Paris"]`).
+    pub hierarchical_tags: Option<Vec<String>>,
 }
 
 #[cfg(test)]

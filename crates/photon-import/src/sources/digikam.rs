@@ -127,6 +127,19 @@ impl DigikamSource {
             true // a cycle: don't trust it
         };
 
+        let build_path = |mut id: i64| -> Option<String> {
+            let mut parts = Vec::new();
+            let mut visited = HashSet::new();
+            while id != 0 && visited.insert(id) {
+                let (pid, name) = tags.get(&id)?;
+                parts.push(name.as_str());
+                id = *pid;
+            }
+            if parts.is_empty() { return None; }
+            parts.reverse();
+            Some(parts.join("|"))
+        };
+
         let mut stmt = conn.prepare("SELECT imageid, tagid FROM ImageTags")?;
         for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
             let (image, tag) = row?;
@@ -134,7 +147,11 @@ impl DigikamSource {
             match name.as_str() {
                 PICK_REJECTED => infos.entry(image).or_default().flag = -1,
                 PICK_ACCEPTED => infos.entry(image).or_default().flag = 1,
-                _ if !is_internal(tag) => infos.entry(image).or_default().tags.push(name.clone()),
+                _ if !is_internal(tag) => {
+                    if let Some(path) = build_path(tag) {
+                        infos.entry(image).or_default().tags.push(path);
+                    }
+                }
                 _ => {}
             }
         }
@@ -193,7 +210,7 @@ impl ImportSource for DigikamSource {
                 let tag = match tag_ids.get(name) {
                     Some(&tag) => tag,
                     None => {
-                        let tag = queries::ensure_tag(&tx, name)?;
+                        let tag = queries::ensure_tag_path(&tx, name)?;
                         tag_ids.insert(name.clone(), tag);
                         tag
                     }
@@ -209,11 +226,16 @@ impl ImportSource for DigikamSource {
         let known: Vec<String> = queries::get_all_tags(photon)?.into_iter().map(|t| t.name).collect();
         for (id, path) in &updated {
             let Some(image) = queries::get_image(photon, *id)? else { continue };
+            let htags: Vec<String> = queries::get_hierarchical_tags_for_image(photon, *id)?;
             let tags: Vec<String> = queries::get_tags_for_image(photon, *id)?.into_iter().map(|t| t.name).collect();
             let update = crate::sidecar::XmpUpdate {
                 rating: Some(image.rating),
                 rejected: Some(image.flagged == -1),
-                keywords: Some(crate::sidecar::Keywords { tags: &tags, known: &known }),
+                keywords: Some(crate::sidecar::Keywords {
+                    tags: &tags,
+                    known: &known,
+                    hierarchical: Some(&htags),
+                }),
                 ..Default::default()
             };
             if let Err(e) = crate::sidecar::write_image_xmp(photon, *id, path, &update) {
@@ -384,7 +406,7 @@ mod tests {
     fn reads_ratings_picks_and_user_tags() {
         let (_dir, _root, source) = setup();
         let infos = source.infos(&source.open().unwrap()).unwrap();
-        assert_eq!(infos[&1], PhotoInfo { rating: 4, flag: 1, tags: vec!["Paris".into()] });
+        assert_eq!(infos[&1], PhotoInfo { rating: 4, flag: 1, tags: vec!["Places|Paris".into()] });
         assert_eq!(infos[&2], PhotoInfo { rating: 0, flag: -1, tags: vec![] });
     }
 
@@ -405,11 +427,17 @@ mod tests {
         assert_eq!((stored.rating, stored.flagged), (4, 1));
         let tags: Vec<String> = queries::get_tags_for_image(&conn, id).unwrap().into_iter().map(|t| t.name).collect();
         assert_eq!(tags, ["Paris"]);
+        let tag_id = queries::ensure_tag(&conn, "Paris").unwrap();
+        assert_eq!(queries::get_tag_path(&conn, tag_id).unwrap(), "Places|Paris");
 
         // Also in the sidecar, so reading it back keeps them.
         let xmp = crate::sidecar::find_xmp(&root.join("a.jpg")).expect("sidecar written");
         let read = crate::sidecar::read_xmp_metadata(&xmp).unwrap();
-        assert_eq!((read.rating, read.tags), (Some(4), Some(vec!["Paris".to_string()])));
+        assert_eq!(read.rating, Some(4));
+        assert_eq!(read.hierarchical_tags, Some(vec!["Places|Paris".to_string()]));
+        let mut read_tags = read.tags.unwrap();
+        read_tags.sort();
+        assert_eq!(read_tags, vec!["Paris".to_string(), "Places".to_string()]);
         assert!(!crate::sidecar::read_image_xmp(&mut conn, id, &root.join("a.jpg"), stored.xmp_mtime).unwrap());
     }
 

@@ -6,6 +6,7 @@ use crate::models::{
     SmartCollection, SmartQuery, Tag, TimelineItem,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -579,15 +580,20 @@ pub fn timeline_items_with_filters(
             rows.collect::<Result<Vec<_>, _>>()?
         }
         TimelineFilter::Tag(tag) => {
+            let target_name = tag.rsplit('|').next().unwrap_or(tag.as_str()).trim().to_string();
             let sql = format!(
-                "{COLS} WHERE hidden = 0 AND id IN (
+                "WITH RECURSIVE tag_tree AS (
+                    SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE
+                    UNION ALL
+                    SELECT t.id FROM tags t JOIN tag_tree tt ON t.parent_id = tt.id
+                )
+                {COLS} WHERE hidden = 0 AND id IN (
                     SELECT it.image_id FROM image_tags it
-                    JOIN tags t ON t.id = it.tag_id
-                    WHERE t.name = ?1 COLLATE NOCASE
+                    WHERE it.tag_id IN (SELECT id FROM tag_tree)
                 ) {extra} {ORDER}"
             );
             let mut stmt = conn.prepare(&sql)?;
-            let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(tag.clone())];
+            let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(target_name)];
             all_params.extend(extra_params);
             let params_refs: Vec<&dyn rusqlite::types::ToSql> =
                 all_params.iter().map(|p| p.as_ref()).collect();
@@ -1362,6 +1368,9 @@ pub fn complete_import_batch(conn: &Connection, batch: &ImportBatch) -> Result<(
 // ---------------------------------------------------------------------------
 
 pub fn create_tag(conn: &Connection, name: &str, color: Option<&str>) -> Result<i64, PhotonError> {
+    if name.contains('|') || name.contains('/') {
+        return ensure_tag_path(conn, name);
+    }
     conn.execute(
         "INSERT OR IGNORE INTO tags (name, color) VALUES (?1, ?2)",
         params![name, color],
@@ -1369,11 +1378,122 @@ pub fn create_tag(conn: &Connection, name: &str, color: Option<&str>) -> Result<
     Ok(conn.last_insert_rowid())
 }
 
-/// The id of tag `name`, creating it if needed. (Unlike [`create_tag`],
-/// correct when the tag already exists.)
+/// The id of tag `name`, creating it if needed. Handles hierarchical paths like
+/// "Places|France|Paris" or "Places/France/Paris".
 pub fn ensure_tag(conn: &Connection, name: &str) -> Result<i64, PhotonError> {
+    if name.contains('|') || name.contains('/') {
+        return ensure_tag_path(conn, name);
+    }
     conn.execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", params![name])?;
     Ok(conn.query_row("SELECT id FROM tags WHERE name = ?1", params![name], |r| r.get(0))?)
+}
+
+/// Ensure a hierarchical tag path like "Places|France|Paris" or "Places/France/Paris".
+/// Creates parent tags if needed, links them via `parent_id`, and returns the leaf tag id.
+pub fn ensure_tag_path(conn: &Connection, path: &str) -> Result<i64, PhotonError> {
+    let parts: Vec<&str> = path
+        .split(|c| c == '|' || c == '/')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if parts.is_empty() {
+        return Err(PhotonError::Other("Empty tag name".to_string()));
+    }
+
+    let mut parent_id: Option<i64> = None;
+    for &part in &parts {
+        let existing: Option<(i64, Option<i64>)> = conn
+            .query_row(
+                "SELECT id, parent_id FROM tags WHERE name = ?1 COLLATE NOCASE",
+                params![part],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+
+        let current_id = match existing {
+            Some((id, existing_parent)) => {
+                if existing_parent.is_none() && parent_id.is_some() {
+                    conn.execute(
+                        "UPDATE tags SET parent_id = ?1 WHERE id = ?2",
+                        params![parent_id, id],
+                    )?;
+                }
+                id
+            }
+            None => {
+                conn.execute(
+                    "INSERT INTO tags (name, parent_id) VALUES (?1, ?2)",
+                    params![part, parent_id],
+                )?;
+                conn.last_insert_rowid()
+            }
+        };
+        parent_id = Some(current_id);
+    }
+
+    parent_id.ok_or_else(|| PhotonError::Other("Failed to create tag path".to_string()))
+}
+
+/// The full hierarchical path of `tag_id` separated by `|` (e.g. "Places|France|Paris").
+pub fn get_tag_path(conn: &Connection, tag_id: i64) -> Result<String, PhotonError> {
+    let ancestors = get_tag_ancestor_names(conn, tag_id)?;
+    Ok(ancestors.join("|"))
+}
+
+/// All tag names in order from root ancestor to the leaf `tag_id`.
+pub fn get_tag_ancestor_names(conn: &Connection, mut tag_id: i64) -> Result<Vec<String>, PhotonError> {
+    let mut names = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+
+    while visited.insert(tag_id) {
+        let row: Option<(String, Option<i64>)> = conn
+            .query_row(
+                "SELECT name, parent_id FROM tags WHERE id = ?1",
+                params![tag_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+
+        let Some((name, pid)) = row else { break };
+        names.push(name);
+        match pid {
+            Some(p) => tag_id = p,
+            None => break,
+        }
+    }
+    names.reverse();
+    Ok(names)
+}
+
+/// All hierarchical tag paths (e.g. `["Places|France|Paris", "Sunset"]`) for an image.
+pub fn get_hierarchical_tags_for_image(conn: &Connection, image_id: i64) -> Result<Vec<String>, PhotonError> {
+    let tags = get_tags_for_image(conn, image_id)?;
+    let mut paths = Vec::with_capacity(tags.len());
+    for t in tags {
+        if let Some(id) = t.id {
+            paths.push(get_tag_path(conn, id)?);
+        } else {
+            paths.push(t.name);
+        }
+    }
+    Ok(paths)
+}
+
+/// All tags with their full hierarchical path string, ordered by path.
+pub fn get_all_tags_with_paths(conn: &Connection) -> Result<Vec<(Tag, String)>, PhotonError> {
+    let tags = get_all_tags(conn)?;
+    let mut result = Vec::with_capacity(tags.len());
+    for t in tags {
+        let path = if let Some(id) = t.id {
+            get_tag_path(conn, id).unwrap_or_else(|_| t.name.clone())
+        } else {
+            t.name.clone()
+        };
+        result.push((t, path));
+    }
+    result.sort_by(|a, b| a.1.cmp(&b.1));
+    Ok(result)
 }
 
 /// The id of the photo at `path`, if it is in the library.
@@ -1399,14 +1519,205 @@ pub fn untag_image(conn: &Connection, image_id: i64, tag_id: i64) -> Result<(), 
     Ok(())
 }
 
+/// Batch tag images with `tag_id` in a single transaction. Returns how many rows were inserted.
+pub fn batch_tag_images(conn: &mut Connection, image_ids: &[i64], tag_id: i64) -> Result<usize, PhotonError> {
+    let tx = conn.transaction()?;
+    let mut added = 0;
+    {
+        let mut stmt = tx.prepare_cached("INSERT OR IGNORE INTO image_tags (image_id, tag_id) VALUES (?1, ?2)")?;
+        for &id in image_ids {
+            added += stmt.execute(params![id, tag_id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(added)
+}
+
+/// Batch untag images from `tag_id` in a single transaction. Returns how many rows were deleted.
+pub fn batch_untag_images(conn: &mut Connection, image_ids: &[i64], tag_id: i64) -> Result<usize, PhotonError> {
+    let tx = conn.transaction()?;
+    let mut removed = 0;
+    {
+        let mut stmt = tx.prepare_cached("DELETE FROM image_tags WHERE image_id = ?1 AND tag_id = ?2")?;
+        for &id in image_ids {
+            removed += stmt.execute(params![id, tag_id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(removed)
+}
+
+/// Get all tags present on any of `image_ids`, with full path and count of matching shots (collapsing RAW+JPG).
+pub fn get_tags_for_images(
+    conn: &Connection,
+    image_ids: &[i64],
+) -> Result<Vec<(Tag, String, usize)>, PhotonError> {
+    if image_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids_json = serde_json::to_string(image_ids).map_err(|e| PhotonError::Other(e.to_string()))?;
+    let mut stmt = conn.prepare(
+        "SELECT t.id, t.name, t.parent_id, t.color, t.is_category,
+                COUNT(DISTINCT COALESCE(i.group_hash, 'id:' || i.id)) as count
+         FROM tags t
+         JOIN image_tags it ON it.tag_id = t.id
+         JOIN images i ON i.id = it.image_id
+         WHERE it.image_id IN (
+             SELECT id FROM images WHERE id IN (SELECT value FROM json_each(?1))
+             OR (group_hash IS NOT NULL AND group_hash IN (
+                 SELECT group_hash FROM images WHERE id IN (SELECT value FROM json_each(?1)) AND group_hash IS NOT NULL
+             ))
+         )
+         GROUP BY t.id
+         ORDER BY count DESC, t.name ASC",
+    )?;
+    let rows = stmt.query_map(params![ids_json], |row| {
+        let tag = Tag {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            parent_id: row.get(2)?,
+            color: row.get(3)?,
+            is_category: row.get::<_, i32>(4).unwrap_or(0) != 0,
+        };
+        let count: usize = row.get(5)?;
+        Ok((tag, count))
+    })?;
+
+    let mut result = Vec::new();
+    for r in rows {
+        let (tag, count) = r?;
+        let path = if let Some(id) = tag.id {
+            get_tag_path(conn, id).unwrap_or_else(|_| tag.name.clone())
+        } else {
+            tag.name.clone()
+        };
+        result.push((tag, path, count));
+    }
+    Ok(result)
+}
+
+/// Count distinct shots among `image_ids` (collapsing RAW+JPG companions sharing `group_hash`).
+pub fn count_distinct_shots(conn: &Connection, image_ids: &[i64]) -> Result<usize, PhotonError> {
+    if image_ids.is_empty() {
+        return Ok(0);
+    }
+    let ids_json = serde_json::to_string(image_ids).map_err(|e| PhotonError::Other(e.to_string()))?;
+    let count: usize = conn.query_row(
+        "SELECT COUNT(DISTINCT COALESCE(group_hash, 'id:' || id))
+         FROM images
+         WHERE id IN (SELECT value FROM json_each(?1))",
+        params![ids_json],
+        |r| r.get(0),
+    )?;
+    Ok(count)
+}
+
+/// Shot-wide expansion: return all image IDs that share a `group_hash` with any of `image_ids`
+/// (including `image_ids` themselves).
+pub fn expand_shot_image_ids(conn: &Connection, image_ids: &[i64]) -> Result<Vec<i64>, PhotonError> {
+    if image_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids_json = serde_json::to_string(image_ids).map_err(|e| PhotonError::Other(e.to_string()))?;
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT id FROM images
+         WHERE id IN (SELECT value FROM json_each(?1))
+            OR (group_hash IS NOT NULL AND group_hash IN (
+                SELECT group_hash FROM images
+                WHERE id IN (SELECT value FROM json_each(?1)) AND group_hash IS NOT NULL
+            ))",
+    )?;
+    let rows = stmt.query_map(params![ids_json], |r| r.get(0))?;
+    Ok(rows.collect::<Result<Vec<i64>, _>>()?)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HierarchicalTagItem {
+    pub id: i64,
+    pub name: String,
+    pub full_path: String,
+    pub parent_id: Option<i64>,
+    pub direct_count: u32,
+    pub recursive_count: u32,
+    pub children: Vec<HierarchicalTagItem>,
+}
+
+/// Hierarchical tag tree with photo (shot) counts (direct and recursive).
+pub fn get_hierarchical_tags_with_counts(conn: &Connection) -> Result<Vec<HierarchicalTagItem>, PhotonError> {
+    let tags = get_all_tags(conn)?;
+    let counts: std::collections::HashMap<i64, u32> = {
+        let mut stmt = conn.prepare(
+            "SELECT it.tag_id, COUNT(DISTINCT COALESCE(i.group_hash, 'id:' || i.id)) FROM image_tags it
+             JOIN images i ON i.id = it.image_id
+             WHERE i.hidden = 0
+             GROUP BY it.tag_id",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, u32>(1)?)))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    let mut items: Vec<HierarchicalTagItem> = Vec::new();
+    for t in &tags {
+        let id = t.id.unwrap_or(0);
+        let path = get_tag_path(conn, id).unwrap_or_else(|_| t.name.clone());
+        let direct_count = counts.get(&id).copied().unwrap_or(0);
+        items.push(HierarchicalTagItem {
+            id,
+            name: t.name.clone(),
+            full_path: path,
+            parent_id: t.parent_id,
+            direct_count,
+            recursive_count: direct_count,
+            children: Vec::new(),
+        });
+    }
+
+    let id_to_pid: std::collections::HashMap<i64, Option<i64>> = items.iter().map(|it| (it.id, it.parent_id)).collect();
+    let id_to_count: std::collections::HashMap<i64, u32> = items.iter().map(|it| (it.id, it.direct_count)).collect();
+    let mut recursive_counts: std::collections::HashMap<i64, u32> = id_to_count.clone();
+
+    for (&id, &cnt) in &id_to_count {
+        if cnt == 0 { continue; }
+        let mut curr = id_to_pid.get(&id).copied().flatten();
+        let mut visited = std::collections::HashSet::new();
+        while let Some(pid) = curr {
+            if !visited.insert(pid) { break; }
+            *recursive_counts.entry(pid).or_insert(0) += cnt;
+            curr = id_to_pid.get(&pid).copied().flatten();
+        }
+    }
+
+    for it in &mut items {
+        if let Some(&rc) = recursive_counts.get(&it.id) {
+            it.recursive_count = rc;
+        }
+    }
+
+    fn build_tree(items: &[HierarchicalTagItem], parent: Option<i64>) -> Vec<HierarchicalTagItem> {
+        let mut nodes: Vec<HierarchicalTagItem> = items
+            .iter()
+            .filter(|it| it.parent_id == parent)
+            .cloned()
+            .collect();
+        for node in &mut nodes {
+            node.children = build_tree(items, Some(node.id));
+        }
+        nodes.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        nodes
+    }
+
+    Ok(build_tree(&items, None))
+}
+
 pub fn get_all_tags(conn: &Connection) -> Result<Vec<Tag>, PhotonError> {
-    let mut stmt = conn.prepare("SELECT id, name, color, is_category FROM tags ORDER BY name")?;
+    let mut stmt = conn.prepare("SELECT id, name, parent_id, color, is_category FROM tags ORDER BY name")?;
     let rows = stmt.query_map([], |row| {
         Ok(Tag {
             id: row.get(0)?,
             name: row.get(1)?,
-            color: row.get(2)?,
-            is_category: row.get::<_, i32>(3).unwrap_or(0) != 0,
+            parent_id: row.get(2)?,
+            color: row.get(3)?,
+            is_category: row.get::<_, i32>(4).unwrap_or(0) != 0,
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
@@ -1414,7 +1725,7 @@ pub fn get_all_tags(conn: &Connection) -> Result<Vec<Tag>, PhotonError> {
 
 pub fn get_tags_for_image(conn: &Connection, image_id: i64) -> Result<Vec<Tag>, PhotonError> {
     let mut stmt = conn.prepare(
-        "SELECT t.id, t.name, t.color, t.is_category
+        "SELECT t.id, t.name, t.parent_id, t.color, t.is_category
          FROM tags t
          JOIN image_tags it ON it.tag_id = t.id
          WHERE it.image_id = ?1
@@ -1424,17 +1735,19 @@ pub fn get_tags_for_image(conn: &Connection, image_id: i64) -> Result<Vec<Tag>, 
         Ok(Tag {
             id: row.get(0)?,
             name: row.get(1)?,
-            color: row.get(2)?,
-            is_category: row.get::<_, i32>(3).unwrap_or(0) != 0,
+            parent_id: row.get(2)?,
+            color: row.get(3)?,
+            is_category: row.get::<_, i32>(4).unwrap_or(0) != 0,
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
-/// Get all tags that are assigned to at least one photo, with their photo counts.
+/// Get all tags that are assigned to at least one photo, with their photo (shot) counts.
 pub fn get_tags_with_counts(conn: &Connection) -> Result<Vec<(Tag, u32)>, PhotonError> {
     let mut stmt = conn.prepare(
-        "SELECT t.id, t.name, t.color, t.is_category, COUNT(it.image_id) as count
+        "SELECT t.id, t.name, t.parent_id, t.color, t.is_category,
+                COUNT(DISTINCT COALESCE(i.group_hash, 'id:' || i.id)) as count
          FROM tags t
          JOIN image_tags it ON it.tag_id = t.id
          JOIN images i ON i.id = it.image_id
@@ -1448,10 +1761,11 @@ pub fn get_tags_with_counts(conn: &Connection) -> Result<Vec<(Tag, u32)>, Photon
             Tag {
                 id: row.get(0)?,
                 name: row.get(1)?,
-                color: row.get(2)?,
-                is_category: row.get::<_, i32>(3).unwrap_or(0) != 0,
+                parent_id: row.get(2)?,
+                color: row.get(3)?,
+                is_category: row.get::<_, i32>(4).unwrap_or(0) != 0,
             },
-            row.get::<_, u32>(4)?,
+            row.get::<_, u32>(5)?,
         ))
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
@@ -2035,13 +2349,18 @@ pub fn get_images_with_stale_xmp(conn: &Connection, paths: &[&str]) -> Result<Ve
 /// sidecar's mtime so it isn't read again until something else changes it.
 /// Photos tagged `name` (any case), with their paths.
 pub fn images_with_tag(conn: &Connection, name: &str) -> Result<Vec<(i64, PathBuf)>, PhotonError> {
+    let target_name = name.rsplit('|').next().unwrap_or(name).trim();
     let mut stmt = conn.prepare(
-        "SELECT i.id, i.path FROM images i
+        "WITH RECURSIVE tag_tree AS (
+            SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE
+            UNION ALL
+            SELECT t.id FROM tags t JOIN tag_tree tt ON t.parent_id = tt.id
+         )
+         SELECT DISTINCT i.id, i.path FROM images i
          JOIN image_tags it ON it.image_id = i.id
-         JOIN tags t ON t.id = it.tag_id
-         WHERE t.name = ?1",
+         WHERE it.tag_id IN (SELECT id FROM tag_tree)",
     )?;
-    let rows = stmt.query_map(params![name], |r| Ok((r.get(0)?, PathBuf::from(r.get::<_, String>(1)?))))?;
+    let rows = stmt.query_map(params![target_name], |r| Ok((r.get(0)?, PathBuf::from(r.get::<_, String>(1)?))))?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
@@ -2104,20 +2423,40 @@ pub fn update_from_xmp(
     // A sidecar with keywords has all of the photo's tags (every tag change
     // in Photon is written to it), so a tag missing from it was removed in
     // another tool. One without any says nothing about them.
-    if let Some(tags) = &xmp.tags {
-        let mut keep = Vec::with_capacity(tags.len());
-        for t in tags {
-            let tag_id = ensure_tag(&tx, t)?;
-            tx.execute(
-                "INSERT OR IGNORE INTO image_tags (image_id, tag_id) VALUES (?1, ?2)",
-                params![id, tag_id],
-            )?;
-            keep.push(tag_id);
+    if xmp.hierarchical_tags.is_some() || xmp.tags.is_some() {
+        let mut keep = Vec::new();
+        if let Some(htags) = &xmp.hierarchical_tags {
+            for ht in htags {
+                let tag_id = ensure_tag_path(&tx, ht)?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO image_tags (image_id, tag_id) VALUES (?1, ?2)",
+                    params![id, tag_id],
+                )?;
+                keep.push(tag_id);
+            }
         }
-        let keep = serde_json::to_string(&keep).map_err(|e| PhotonError::Other(e.to_string()))?;
+        if let Some(tags) = &xmp.tags {
+            let ancestor_names: std::collections::HashSet<String> = keep
+                .iter()
+                .filter_map(|&tid| get_tag_ancestor_names(&tx, tid).ok())
+                .flatten()
+                .map(|s| s.to_lowercase())
+                .collect();
+            for t in tags {
+                if !ancestor_names.contains(&t.to_lowercase()) {
+                    let tag_id = ensure_tag(&tx, t)?;
+                    tx.execute(
+                        "INSERT OR IGNORE INTO image_tags (image_id, tag_id) VALUES (?1, ?2)",
+                        params![id, tag_id],
+                    )?;
+                    keep.push(tag_id);
+                }
+            }
+        }
+        let keep_json = serde_json::to_string(&keep).map_err(|e| PhotonError::Other(e.to_string()))?;
         tx.execute(
             "DELETE FROM image_tags WHERE image_id = ?1 AND tag_id NOT IN (SELECT value FROM json_each(?2))",
-            params![id, keep],
+            params![id, keep_json],
         )?;
     }
 
@@ -3027,5 +3366,91 @@ mod tests {
         // Delete
         delete_smart_collection(&conn, sc_id).unwrap();
         assert!(get_smart_collection(&conn, sc_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn hierarchical_tag_paths_and_batch_tagging() {
+        let db = Database::open_in_memory().unwrap();
+        let mut conn = db.pool.get().unwrap();
+
+        // 1. Ensure hierarchical path
+        let leaf_id = ensure_tag_path(&conn, "Places|Europe|France|Paris").unwrap();
+        let full_path = get_tag_path(&conn, leaf_id).unwrap();
+        assert_eq!(full_path, "Places|Europe|France|Paris");
+
+        let ancestors = get_tag_ancestor_names(&conn, leaf_id).unwrap();
+        assert_eq!(ancestors, vec!["Places", "Europe", "France", "Paris"]);
+
+        // 2. Insert test images
+        let (id1, id2, id3) = {
+            let tx = conn.transaction().unwrap();
+            let mut img1 = Image::new(PathBuf::from("/p/1.orf"), "h1".into(), 100);
+            img1.group_hash = Some("shot_123".into());
+            let id1 = insert_image(&tx, &img1).unwrap().unwrap();
+
+            let mut img2 = Image::new(PathBuf::from("/p/1.jpg"), "h2".into(), 100);
+            img2.group_hash = Some("shot_123".into());
+            let id2 = insert_image(&tx, &img2).unwrap().unwrap();
+
+            let mut img3 = Image::new(PathBuf::from("/p/2.jpg"), "h3".into(), 100);
+            img3.group_hash = Some("shot_456".into());
+            let id3 = insert_image(&tx, &img3).unwrap().unwrap();
+            tx.commit().unwrap();
+            (id1, id2, id3)
+        };
+
+        // 3. Test shot-wide expansion: expanding [id1] should give [id1, id2] because of group_hash
+        let mut expanded = expand_shot_image_ids(&conn, &[id1]).unwrap();
+        expanded.sort();
+        assert_eq!(expanded, vec![id1, id2]);
+
+        // 4. Batch tag images
+        let added = batch_tag_images(&mut conn, &expanded, leaf_id).unwrap();
+        assert_eq!(added, 2);
+
+        // Check tags for images (collapsed into distinct shots)
+        let tags_summary = get_tags_for_images(&conn, &[id1, id2, id3]).unwrap();
+        assert_eq!(tags_summary.len(), 1);
+        assert_eq!(tags_summary[0].1, "Places|Europe|France|Paris");
+        assert_eq!(tags_summary[0].2, 1); // 1 of 2 shots (id1 and id2 are companion files of 1 shot)
+
+        // 5. Test recursive tag queries:
+        // images_with_tag should return both individual images (RAW + JPG)
+        let imgs_tagged = images_with_tag(&conn, "Places").unwrap();
+        assert_eq!(imgs_tagged.len(), 2);
+
+        // In the timeline, the 2 photos share group_hash so they form 1 shot tile!
+        let items_ancestor = timeline_items_with_cull(&conn, &TimelineFilter::Tag("Places".into()), RatingFilter::Any, None).unwrap();
+        assert_eq!(items_ancestor.len(), 1);
+
+        // Filtering by "Paris" (leaf) also returns the shot tile
+        let items_leaf = timeline_items_with_cull(&conn, &TimelineFilter::Tag("Paris".into()), RatingFilter::Any, None).unwrap();
+        assert_eq!(items_leaf.len(), 1);
+
+        // Filtering by full path "Places|Europe|France|Paris"
+        let items_path = timeline_items_with_cull(&conn, &TimelineFilter::Tag("Places|Europe|France|Paris".into()), RatingFilter::Any, None).unwrap();
+        assert_eq!(items_path.len(), 1);
+
+        // 6. Test hierarchical tag tree with counts (counting shots, not individual raw+jpg files)
+        let tree = get_hierarchical_tags_with_counts(&conn).unwrap();
+        assert_eq!(tree.len(), 1); // "Places" root
+        assert_eq!(tree[0].name, "Places");
+        assert_eq!(tree[0].recursive_count, 1); // 1 shot
+        assert_eq!(tree[0].direct_count, 0);
+        assert_eq!(tree[0].children[0].children[0].children[0].name, "Paris");
+        assert_eq!(tree[0].children[0].children[0].children[0].direct_count, 1); // 1 shot
+
+        // Tag the 2nd shot (id3) as well, and verify count increments to 2 shots
+        batch_tag_images(&mut conn, &[id3], leaf_id).unwrap();
+        let tree2 = get_hierarchical_tags_with_counts(&conn).unwrap();
+        assert_eq!(tree2[0].recursive_count, 2); // 2 shots
+        assert_eq!(tree2[0].children[0].children[0].children[0].direct_count, 2);
+        batch_untag_images(&mut conn, &[id3], leaf_id).unwrap();
+
+        // 7. Batch untag
+        let removed = batch_untag_images(&mut conn, &expanded, leaf_id).unwrap();
+        assert_eq!(removed, 2);
+        let tags_after = get_tags_for_images(&conn, &[id1, id2]).unwrap();
+        assert!(tags_after.is_empty());
     }
 }

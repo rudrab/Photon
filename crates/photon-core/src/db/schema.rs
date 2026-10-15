@@ -41,6 +41,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), PhotonError> {
         (15, MIGRATION_015_IMAGE_QUALITY),
         (16, MIGRATION_016_FACE_SHARPNESS),
         (17, MIGRATION_017_COLOR_LABELS_AND_SMART_COLLECTIONS),
+        (18, MIGRATION_018_HIERARCHICAL_TAGS),
     ];
 
     for (version, sql) in migrations {
@@ -371,6 +372,14 @@ CREATE TABLE IF NOT EXISTS smart_collections (
 );
 ";
 
+// ---------------------------------------------------------------------------
+// Migration 018: Hierarchical keywords (R-8)
+// ---------------------------------------------------------------------------
+const MIGRATION_018_HIERARCHICAL_TAGS: &str = "
+ALTER TABLE tags ADD COLUMN parent_id INTEGER REFERENCES tags(id) ON DELETE CASCADE;
+CREATE INDEX IF NOT EXISTS idx_tags_parent ON tags(parent_id);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,5 +497,26 @@ mod tests {
             )
             .unwrap();
         assert!((sharpness - 42.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn tags_parent_id_column_exists() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        conn.execute("INSERT INTO tags (name) VALUES ('Places')", []).unwrap();
+        let parent_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO tags (name, parent_id) VALUES ('France', ?1)",
+            [parent_id],
+        ).unwrap();
+        let child_id = conn.last_insert_rowid();
+
+        let pid: Option<i64> = conn.query_row(
+            "SELECT parent_id FROM tags WHERE id = ?1",
+            [child_id],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(pid, Some(parent_id));
     }
 }

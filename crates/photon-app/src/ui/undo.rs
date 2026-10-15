@@ -131,21 +131,21 @@ impl UndoManager {
                     Ok(format!("Undid: Rotation ({} photo{})", n, if n == 1 { "" } else { "s" }))
                 }
                 UndoAction::TagAdd { image_ids, tag_id, tag_name } => {
-                    let conn = db.conn()?;
+                    let mut conn = db.conn()?;
+                    queries::batch_untag_images(&mut conn, image_ids, *tag_id)?;
                     for &id in image_ids {
-                        queries::untag_image(&conn, id, *tag_id)?;
                         sync_tags_xmp(&conn, id);
                     }
-                    let n = image_ids.len();
+                    let n = queries::count_distinct_shots(&conn, image_ids).unwrap_or(image_ids.len());
                     Ok(format!("Undid: Added tag #{} ({} photo{})", tag_name, n, if n == 1 { "" } else { "s" }))
                 }
                 UndoAction::TagRemove { image_ids, tag_id, tag_name } => {
-                    let conn = db.conn()?;
+                    let mut conn = db.conn()?;
+                    queries::batch_tag_images(&mut conn, image_ids, *tag_id)?;
                     for &id in image_ids {
-                        queries::tag_image(&conn, id, *tag_id)?;
                         sync_tags_xmp(&conn, id);
                     }
-                    let n = image_ids.len();
+                    let n = queries::count_distinct_shots(&conn, image_ids).unwrap_or(image_ids.len());
                     Ok(format!("Undid: Removed tag #{} ({} photo{})", tag_name, n, if n == 1 { "" } else { "s" }))
                 }
                 UndoAction::Trash { images, tags, trashed_paths } => {
@@ -268,21 +268,21 @@ impl UndoManager {
                     Ok(format!("Redid: Rotation ({} photo{})", n, if n == 1 { "" } else { "s" }))
                 }
                 UndoAction::TagAdd { image_ids, tag_id, tag_name } => {
-                    let conn = db.conn()?;
+                    let mut conn = db.conn()?;
+                    queries::batch_tag_images(&mut conn, image_ids, *tag_id)?;
                     for &id in image_ids {
-                        queries::tag_image(&conn, id, *tag_id)?;
                         sync_tags_xmp(&conn, id);
                     }
-                    let n = image_ids.len();
+                    let n = queries::count_distinct_shots(&conn, image_ids).unwrap_or(image_ids.len());
                     Ok(format!("Redid: Added tag #{} ({} photo{})", tag_name, n, if n == 1 { "" } else { "s" }))
                 }
                 UndoAction::TagRemove { image_ids, tag_id, tag_name } => {
-                    let conn = db.conn()?;
+                    let mut conn = db.conn()?;
+                    queries::batch_untag_images(&mut conn, image_ids, *tag_id)?;
                     for &id in image_ids {
-                        queries::untag_image(&conn, id, *tag_id)?;
                         sync_tags_xmp(&conn, id);
                     }
-                    let n = image_ids.len();
+                    let n = queries::count_distinct_shots(&conn, image_ids).unwrap_or(image_ids.len());
                     Ok(format!("Redid: Removed tag #{} ({} photo{})", tag_name, n, if n == 1 { "" } else { "s" }))
                 }
                 UndoAction::Trash { images, tags: _, trashed_paths } => {
@@ -382,11 +382,12 @@ fn sync_orientation_xmp(conn: &rusqlite::Connection, id: i64, orient: u16) {
     }
 }
 
-fn sync_tags_xmp(conn: &rusqlite::Connection, id: i64) {
+pub fn sync_tags_xmp(conn: &rusqlite::Connection, id: i64) {
     if let Ok(Some(img)) = queries::get_image(conn, id) {
-        if let (Ok(img_tags), Ok(all_tags)) = (
+        if let (Ok(img_tags), Ok(all_tags), Ok(htags)) = (
             queries::get_tags_for_image(conn, id),
             queries::get_all_tags(conn),
+            queries::get_hierarchical_tags_for_image(conn, id),
         ) {
             let names: Vec<String> = img_tags.into_iter().map(|t| t.name).collect();
             let all_names: Vec<String> = all_tags.into_iter().map(|t| t.name).collect();
@@ -394,6 +395,7 @@ fn sync_tags_xmp(conn: &rusqlite::Connection, id: i64) {
                 keywords: Some(Keywords {
                     tags: &names,
                     known: &all_names,
+                    hierarchical: Some(&htags),
                 }),
                 ..Default::default()
             };

@@ -271,7 +271,7 @@ pub fn export_single_with_warning(
             rating: (embed.rating > 0).then_some(embed.rating),
             title: embed.title,
             description: embed.description,
-            keywords: (!keywords.is_empty()).then_some(sidecar::Keywords { tags: keywords, known: keywords }),
+            keywords: (!keywords.is_empty()).then_some(sidecar::Keywords { tags: keywords, known: keywords, hierarchical: None }),
             ..Default::default()
         };
         if let Err(e) = sidecar::sync_xmp_metadata(&dest_path, &update) {
@@ -835,6 +835,9 @@ fn embed_metadata(out: &Path, format: ExportFormat, e: &Embed) -> Result<Vec<Str
         }
         for keyword in e.keywords {
             cmd.arg(format!("-XMP-dc:Subject={keyword}")).arg(format!("-IPTC:Keywords={keyword}"));
+            if keyword.contains('|') {
+                cmd.arg(format!("-XMP-lr:hierarchicalSubject={keyword}"));
+            }
         }
         if e.title.is_some() || e.description.is_some() || !e.keywords.is_empty() {
             cmd.arg("-IPTC:CodedCharacterSet=UTF8");
@@ -903,7 +906,7 @@ fn embed_jpeg_metadata(out: &Path, e: &Embed) -> Result<bool> {
             rating: (e.rating > 0).then_some(e.rating),
             title: e.title,
             description: e.description,
-            keywords: (!e.keywords.is_empty()).then_some(sidecar::Keywords { tags: e.keywords, known: e.keywords }),
+            keywords: (!e.keywords.is_empty()).then_some(sidecar::Keywords { tags: e.keywords, known: e.keywords, hierarchical: None }),
             orientation: xmp.is_some().then_some(1),
             ..Default::default()
         };

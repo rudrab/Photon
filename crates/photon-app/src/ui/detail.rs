@@ -1039,20 +1039,24 @@ pub fn build_viewer(
 /// and grade, and a description. The grade is red whenever the results would
 /// suggest rejecting it (also for clipping). `None` if it isn't scored.
 pub(crate) fn quality_reading(db: &Database, img: &Image) -> Option<(Option<(f64, photon_import::quality::Grade)>, String)> {
-    use photon_import::quality::{self, Grade, SESSION_SECONDS};
     let conn = db.conn().ok()?;
+    quality_reading_conn(&conn, img)
+}
+
+pub(crate) fn quality_reading_conn(conn: &rusqlite::Connection, img: &Image) -> Option<(Option<(f64, photon_import::quality::Grade)>, String)> {
+    use photon_import::quality::{self, Grade, SESSION_SECONDS};
     let id = img.id?;
     let t = img.created_at;
     let session = match t {
-        Some(t) => queries::images_in_session(&conn, img.camera_model.as_deref(), t - SESSION_SECONDS, t + SESSION_SECONDS)
+        Some(t) => queries::images_in_session(conn, img.camera_model.as_deref(), t - SESSION_SECONDS, t + SESSION_SECONDS)
             .map_err(|e| log::warn!("Session of photo {id}: {e}"))
             .ok()?,
         None => vec![img.clone()],
     };
     let ids: Vec<i64> = session.iter().filter_map(|i| i.id).collect();
-    let scores = queries::get_image_quality_batch(&conn, &ids).ok()?;
+    let scores = queries::get_image_quality_batch(conn, &ids).ok()?;
     let q = scores.get(&id)?;
-    let library = quality::library_reference(&conn);
+    let library = quality::library_reference(conn);
 
     // One eye score per shot (its files score alike), for the session's reference.
     let mut per_shot: std::collections::HashMap<String, f64> = Default::default();
@@ -1089,6 +1093,44 @@ pub(crate) fn quality_reading(db: &Database, img: &Image) -> Option<(Option<(f64
         (None, None) => None,
     };
     Some((score, format!("Photo quality — {text}")))
+}
+
+/// Resolve the quality reading for a timeline photo, either by its own `id`
+/// or by one of its companion files sharing `group_hash` (e.g. RAW+JPG pairs
+/// where only one was scored). Fast path exits immediately if unscored.
+pub(crate) fn quality_reading_for_id_or_group(
+    db: &Database,
+    id: i64,
+    group_hash: Option<&str>,
+) -> Option<(Option<(f64, photon_import::quality::Grade)>, String)> {
+    let conn = db.conn().ok()?;
+    if queries::get_image_quality(&conn, id).ok().flatten().is_some() {
+        if let Ok(Some(img)) = queries::get_image(&conn, id) {
+            if let Some(res) = quality_reading_conn(&conn, &img) {
+                if res.0.is_some() {
+                    return Some(res);
+                }
+            }
+        }
+    }
+    if let Some(gh) = group_hash {
+        if let Ok(companions) = queries::get_images_in_group(&conn, gh) {
+            for companion in companions {
+                if companion.id != Some(id) {
+                    if let Some(cid) = companion.id {
+                        if queries::get_image_quality(&conn, cid).ok().flatten().is_some() {
+                            if let Some(res) = quality_reading_conn(&conn, &companion) {
+                                if res.0.is_some() {
+                                    return Some(res);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn clear(container: &GtkBox) {
@@ -1207,10 +1249,14 @@ enum XmpChange<'a> {
 
 fn sync_image_xmp(conn: &rusqlite::Connection, image_id: i64, image_path: &Path, change: XmpChange) {
     let names = |tags: Vec<photon_core::models::Tag>| tags.into_iter().map(|t| t.name).collect::<Vec<_>>();
-    let (tags, known) = match change {
-        XmpChange::Tags => match (queries::get_tags_for_image(conn, image_id), queries::get_all_tags(conn)) {
-            (Ok(tags), Ok(known)) => (names(tags), names(known)),
-            (Err(e), _) | (_, Err(e)) => {
+    let (tags, known, htags) = match change {
+        XmpChange::Tags => match (
+            queries::get_tags_for_image(conn, image_id),
+            queries::get_all_tags(conn),
+            queries::get_hierarchical_tags_for_image(conn, image_id),
+        ) {
+            (Ok(tags), Ok(known), Ok(htags)) => (names(tags), names(known), htags),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
                 log::warn!("Not syncing tags to XMP for {}: {e}", image_path.display());
                 return;
             }
@@ -1224,7 +1270,11 @@ fn sync_image_xmp(conn: &rusqlite::Connection, image_id: i64, image_path: &Path,
             photon_import::XmpUpdate { description: Some(text), ..Default::default() }
         }
         XmpChange::Tags => photon_import::XmpUpdate {
-            keywords: Some(photon_import::Keywords { tags: &tags, known: &known }),
+            keywords: Some(photon_import::Keywords {
+                tags: &tags,
+                known: &known,
+                hierarchical: Some(&htags),
+            }),
             ..Default::default()
         },
         XmpChange::Orientation(orient) => photon_import::XmpUpdate {

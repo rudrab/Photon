@@ -87,6 +87,9 @@ const UI: &str = r#"
               <property name="title">Export</property>
               <property name="accelerator">&lt;ctrl&gt;e</property></object></child>
             <child><object class="GtkShortcutsShortcut">
+              <property name="title">Batch Tags</property>
+              <property name="accelerator">&lt;ctrl&gt;t</property></object></child>
+            <child><object class="GtkShortcutsShortcut">
               <property name="title">Move to Trash</property>
               <property name="accelerator">Delete</property></object></child>
           </object>

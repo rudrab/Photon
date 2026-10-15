@@ -407,6 +407,10 @@ struct Inner {
     on_start_slideshow: RefCell<Option<Rc<dyn Fn()>>>,
     /// Tells the user something (a toast), e.g. that a change wasn't saved.
     notify: RefCell<Option<Rc<dyn Fn(&str)>>>,
+    /// Batch tagging callback for selected photos.
+    on_batch_tag: RefCell<Option<Rc<dyn Fn(Vec<i64>)>>>,
+    /// Quality gauge reading cache: `image_id` -> `Some((percent, grade, tooltip))` if scored, or `None` if unscored.
+    quality_cache: RefCell<HashMap<i64, Option<(f64, photon_import::quality::Grade, String)>>>,
 }
 
 /// Which culling field a batch change sets, and to what.
@@ -554,6 +558,8 @@ impl Timeline {
             on_refresh: RefCell::new(None),
             on_start_slideshow: RefCell::new(None),
             notify: RefCell::new(None),
+            on_batch_tag: RefCell::new(None),
+            quality_cache: RefCell::new(HashMap::new()),
         });
 
         // Key controller for 2D keyboard navigation and multi-selection
@@ -755,6 +761,11 @@ impl Timeline {
         *self.inner.drag_filter.borrow_mut() = Some(Box::new(f));
     }
 
+    /// Connect a handler for batch tagging selected photo IDs (e.g. via Ctrl+T).
+    pub fn connect_batch_tag(&self, f: impl Fn(Vec<i64>) + 'static) {
+        *self.inner.on_batch_tag.borrow_mut() = Some(Rc::new(f));
+    }
+
     /// Called when selection mode is entered or left.
     pub fn connect_selection_mode_changed(&self, f: impl Fn(bool) + 'static) {
         *self.inner.on_selection_mode_changed.borrow_mut() = Some(Box::new(f));
@@ -799,6 +810,7 @@ impl Timeline {
             inner.focused_index.set(None);
             inner.anchor_index.set(None);
             inner.selected_indices.borrow_mut().clear();
+            inner.quality_cache.borrow_mut().clear();
         }
         *inner.items.borrow_mut() = items;
         inner.by_day.set(by_day);
@@ -808,6 +820,11 @@ impl Timeline {
         inner.relayout();
         inner.restore_scroll(value);
         Inner::update_tile_styles(inner);
+    }
+
+    /// Invalidate cached quality readings so subsequent tile renders re-fetch scores.
+    pub fn clear_quality_cache(&self) {
+        self.inner.quality_cache.borrow_mut().clear();
     }
 
     pub fn set_row_height(&self, height: i32) {
@@ -1044,8 +1061,15 @@ impl Inner {
                     }
 
                     if let Some(overlay) = frame.first_child().and_downcast::<Overlay>() {
-                        if let Some(badges_box) = overlay.last_child().and_downcast::<GtkBox>() {
-                            rebuild_tile_badges(&badges_box, item);
+                        let mut child = overlay.first_child();
+                        while let Some(c) = child {
+                            if c.has_css_class("photon-tile-badges") {
+                                if let Some(badges_box) = c.downcast_ref::<GtkBox>() {
+                                    rebuild_tile_badges(badges_box, item);
+                                }
+                                break;
+                            }
+                            child = c.next_sibling();
                         }
                     }
                 }
@@ -1608,6 +1632,27 @@ impl Inner {
                     Self::rotate_selected(this, true);
                     return glib::Propagation::Stop;
                 }
+                gdk::Key::t | gdk::Key::T => {
+                    let items = this.items.borrow();
+                    let sel = this.selected_indices.borrow();
+                    let ids = if sel.is_empty() {
+                        if let Some(focus) = this.focused_index.get() {
+                            ids_at(&items, [focus])
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        ids_at(&items, sel.iter().copied())
+                    };
+                    drop(items);
+                    drop(sel);
+                    if !ids.is_empty() {
+                        if let Some(cb) = this.on_batch_tag.borrow().as_ref() {
+                            cb(ids);
+                            return glib::Propagation::Stop;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1945,9 +1990,9 @@ impl Inner {
         picture.set_can_shrink(true);
         picture.set_vexpand(true);
         picture.set_hexpand(true);
+        picture.set_can_target(false);
 
         let overlay = Overlay::new();
-        overlay.set_can_target(false);
         overlay.set_vexpand(true);
         overlay.set_hexpand(true);
         overlay.set_child(Some(&picture));
@@ -1960,6 +2005,12 @@ impl Inner {
         rebuild_tile_badges(&badges_box, item);
         overlay.add_overlay(&badges_box);
 
+        let quality_box = GtkBox::new(Orientation::Horizontal, 0);
+        quality_box.add_css_class("photon-tile-quality");
+        quality_box.set_valign(Align::End);
+        quality_box.set_halign(Align::End);
+        overlay.add_overlay(&quality_box);
+
         // Shown on hover, while selecting, and on selected tiles (CSS).
         let check = gtk4::Image::from_icon_name("object-select-symbolic");
         check.add_css_class("photon-tile-check");
@@ -1969,6 +2020,14 @@ impl Inner {
         overlay.add_overlay(&check);
 
         frame.append(&overlay);
+
+        if let Some(cached) = this.quality_cache.borrow().get(&item.id) {
+            if let Some((percent, grade, tooltip)) = cached {
+                render_quality_badge(&quality_box, *percent, *grade, tooltip);
+            }
+        } else {
+            Self::load_quality_later(this, &quality_box, item.id, item.group_hash.clone());
+        }
 
         if let Some(texture) = this.textures.borrow_mut().get(&item.hash) {
             picture.set_paintable(Some(&texture));
@@ -2120,6 +2179,45 @@ impl Inner {
             });
         });
     }
+
+    fn load_quality_later(
+        this: &Rc<Self>,
+        quality_box: &GtkBox,
+        id: i64,
+        group_hash: Option<String>,
+    ) {
+        let Some(db) = this.db.borrow().clone() else { return };
+        let weak_inner = Rc::downgrade(this);
+        let weak_box = quality_box.downgrade();
+
+        glib::timeout_add_local_once(LOAD_DELAY, move || {
+            // Skip rows that were scrolled past (unbound → tile destroyed).
+            if weak_box.upgrade().and_then(|b| b.root()).is_none() {
+                return;
+            }
+            glib::spawn_future_local(async move {
+                let reading = gio::spawn_blocking(move || {
+                    crate::ui::detail::quality_reading_for_id_or_group(&db, id, group_hash.as_deref())
+                })
+                .await
+                .ok()
+                .flatten();
+
+                let entry = reading.and_then(|(score, text)| {
+                    score.map(|(percent, grade)| (percent, grade, text))
+                });
+
+                if let Some(inner) = weak_inner.upgrade() {
+                    inner.quality_cache.borrow_mut().insert(id, entry.clone());
+                }
+                if let Some(qbox) = weak_box.upgrade() {
+                    if let Some((percent, grade, tooltip)) = entry {
+                        render_quality_badge(&qbox, percent, grade, &tooltip);
+                    }
+                }
+            });
+        });
+    }
 }
 
 fn clear_children(container: &GtkBox) {
@@ -2179,6 +2277,26 @@ fn rebuild_tile_badges(badges_box: &GtkBox, item: &TimelineItem) {
         reject_label.add_css_class("photon-tile-reject-badge");
         badges_box.append(&reject_label);
     }
+}
+
+fn render_quality_badge(
+    quality_box: &GtkBox,
+    percent: f64,
+    grade: photon_import::quality::Grade,
+    tooltip: &str,
+) {
+    clear_children(quality_box);
+    let badge = GtkBox::new(Orientation::Horizontal, 0);
+    badge.add_css_class("photon-tile-quality-badge");
+    badge.set_valign(Align::Center);
+    badge.set_halign(Align::Center);
+
+    let gauge = crate::ui::mark::quality_gauge();
+    gauge.set(Some((percent, grade)), tooltip);
+
+    badge.append(&gauge.widget);
+    badge.set_tooltip_text(Some(tooltip));
+    quality_box.append(&badge);
 }
 
 fn scroll_fraction(adj: &gtk4::Adjustment) -> f64 {
@@ -2389,6 +2507,94 @@ mod tests {
         // Bottom boundary: navigating down from Row 2 returns None
         assert_eq!(navigate_2d(&rows, 3, true), None);
         assert_eq!(navigate_2d(&rows, 4, true), None);
+    }
+
+    #[test]
+    fn quality_reading_for_timeline_shot_and_companion() {
+        let db = Database::open_in_memory().unwrap();
+
+        let img1 = Image {
+            filename: "shot1.cr3".into(),
+            path: std::path::PathBuf::from("/photos/shot1.cr3"),
+            hash: "raw_hash".into(),
+            group_hash: Some("group_shot_1".into()),
+            camera_model: Some("EOS R5".into()),
+            created_at: Some(1_700_000_000),
+            ..Default::default()
+        };
+        let img2 = Image {
+            filename: "shot1.jpg".into(),
+            path: std::path::PathBuf::from("/photos/shot1.jpg"),
+            hash: "jpg_hash".into(),
+            group_hash: Some("group_shot_1".into()),
+            camera_model: Some("EOS R5".into()),
+            created_at: Some(1_700_000_000),
+            ..Default::default()
+        };
+        let (id1, id2) = {
+            let mut conn = db.conn().unwrap();
+            let tx = conn.transaction().unwrap();
+            let id1 = queries::insert_image(&tx, &img1).unwrap().unwrap();
+            let id2 = queries::insert_image(&tx, &img2).unwrap().unwrap();
+            tx.commit().unwrap();
+            (id1, id2)
+        };
+
+        // Initially neither is scored -> None
+        assert!(crate::ui::detail::quality_reading_for_id_or_group(&db, id1, Some("group_shot_1")).is_none());
+        assert!(crate::ui::detail::quality_reading_for_id_or_group(&db, id2, Some("group_shot_1")).is_none());
+
+        // Save quality for the JPG companion (id2)
+        let q = photon_core::models::ImageQuality {
+            image_id: id2,
+            sharpness: 350.0,
+            sharpness_global: 350.0,
+            clip_shadows: 0.0,
+            clip_highlights: 0.0,
+            mean_luma: 128.0,
+            quality_version: photon_import::quality::QUALITY_VERSION,
+            computed_at: 1_700_000_010,
+            faces: Some(1),
+            eye_sharpness: Some(500.0),
+        };
+        {
+            let conn = db.conn().unwrap();
+            queries::save_image_quality(&conn, &q).unwrap();
+        }
+
+        // id2 has direct score
+        let reading2 = crate::ui::detail::quality_reading_for_id_or_group(&db, id2, Some("group_shot_1"));
+        assert!(reading2.is_some());
+        let (score2, text2) = reading2.unwrap();
+        assert!(score2.is_some());
+        assert!(text2.contains("Photo quality"));
+
+        // id1 (RAW) was unscored, but resolves score through group_hash companion!
+        let reading1 = crate::ui::detail::quality_reading_for_id_or_group(&db, id1, Some("group_shot_1"));
+        assert!(reading1.is_some());
+        let (score1, text1) = reading1.unwrap();
+        assert!(score1.is_some());
+        assert!(text1.contains("Photo quality"));
+    }
+
+    #[test]
+    fn quality_badge_rendering_hierarchy() {
+        if gtk4::init().is_err() {
+            return;
+        }
+        let quality_box = GtkBox::new(Orientation::Horizontal, 0);
+        render_quality_badge(
+            &quality_box,
+            92.0,
+            photon_import::quality::Grade::Good,
+            "Photo quality — Sharpness (eyes): 92%",
+        );
+        let badge = quality_box.first_child().expect("badge container");
+        assert!(badge.has_css_class("photon-tile-quality-badge"));
+        let gauge = badge.first_child().expect("gauge widget");
+        assert!(gauge.has_css_class("photon-quality"));
+        assert!(gauge.has_css_class("good"));
+        assert_eq!(badge.tooltip_text().as_deref(), Some("Photo quality — Sharpness (eyes): 92%"));
     }
 }
 

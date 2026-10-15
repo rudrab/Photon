@@ -902,6 +902,7 @@ impl MainWindow {
     /// stays open, and the timeline catches up when the user returns.
     pub fn refresh(&self) {
         self.timeline_stale.set(true);
+        self.timeline.clear_quality_cache();
         self.sidebar.refresh_events();
         self.sidebar.refresh_tags();
         self.sidebar.refresh_albums();

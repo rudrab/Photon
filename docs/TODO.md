@@ -387,12 +387,13 @@ Ordered by importance. R-1 to R-4 are the minimum before recommending Photon for
 - Decided to keep picks database-only (`flagged = 1`), as there is no universal industry XMP standard (digiKam's `digiKam:PickLabel` is non-standard and rejected by darktable/Lightroom).
 - Documented in `crates/photon-import/src/sidecar.rs`.
 
-### 🔴 R-8 · Hierarchical keywords · M
+### 🟢 R-8 · Hierarchical keywords · M
 
-- `tags.parent_id` (a migration).
-- UI tree in the sidebar.
-- XMP `lr:hierarchicalSubject` with `|` separators (darktable uses the same format), plus the leaf and ancestors in `dc:subject`.
-- Import from the digiKam and XMP sources: read `lr:hierarchicalSubject` back (moved here from R-1).
+- `tags.parent_id` SQLite migration (018) with recursive parent/child linking and path querying (`ensure_tag_path`, `get_tag_path`, `get_tag_ancestor_names`).
+- Collapsible hierarchical tree UI in the sidebar with rollups of recursive photo counts, persistable expand/collapse chevrons, and recursive timeline filtering (`WITH RECURSIVE` CTE matching parent and all descendant tags).
+- XMP two-way sync: writes `lr:hierarchicalSubject` with `|` separators (darktable format) preserving internal `darktable|...` keywords, alongside leaf and ancestors in `dc:subject`.
+- Reads `lr:hierarchicalSubject` back during library refresh/XMP read.
+- digiKam tag tree import: reconstructs full hierarchical keyword paths via `pid` traversal and exports hierarchical tags in sidecars.
 
 ### 🔴 R-9 · Copyright / IPTC template at import · S
 
@@ -592,34 +593,17 @@ Done 2026-10-15 (for a photo trip: a laptop, memory cards, hotel power).
 - 🟢 Ratings, picks and rejects apply to every file of the shot (grid and viewer),
   with undo restoring each file's own value; each file's XMP is written.
 - 🔴 Rotation still applies to the file on screen only; make it shot-wide.
-- 🔴 Tags too (found 2026-09-30): a tag added in the info panel goes to the file on screen,
-  the shot's JPG cover, so the RAW's sidecar — the one darktable reads — never gets the
-  keyword, and a RAW export carries none. Make tagging shot-wide like ratings (every file's
-  tags and sidecar; undo per file), and repair shots whose files disagree the way
-  `reconcile_shots` does for ratings (union of the files' tags). See R-19.
+- 🟢 Tags are shot-wide (implemented with R-19): tags added or removed apply to all companion files (RAW + JPG) and sidecars, with undo/redo per batch.
 - 🔴 Choose which version is the cover; expand a stack in the grid.
 
-### 🔴 R-19 · Batch keywording · S–M
+### 🟢 R-19 · Batch keywording · S–M
 
-Found 2026-09-30. Tags can only be added or removed one photo at a time, in the 1-up info
-panel (`detail.rs`, the tag entry and chips). Keywording a 300-photo shoot that way isn't workable.
-
-- **Where:** `selection_bar.rs` (a "Tags…" action), `timeline.rs` (a key, e.g. **Ctrl+T** —
-  check `shortcuts.rs` for conflicts), `queries.rs` (batch tag/untag in one transaction),
-  `undo.rs` (one undo entry for the whole batch).
-- **UI:** a popover for the selection: entry with autocomplete from `get_all_tags`, the
-  selection's tags as chips with counts ("wedding · 120 of 300"); adding applies to all,
-  removing a chip removes from all.
-- **Shot-wide** (see R-17): every file of each selected shot gets the tag.
-- **Sidecars:** one `sidecar::write_image_xmp` per file with `XmpChange::Tags`-style
-  keywords (the photo's full tag list + the library's known tags), off the UI thread, with
-  progress for large selections; failed writes reported (a toast with the count, details in
-  the log) — never silently dropped: a tag that only the library has is fragile (see the
-  PART 3 read-back fixes).
-- **Acceptance:** tag 300 photos in one action; the tags show in darktable after "reload
-  selected XMP files" (on the RAWs too); Ctrl+Z removes them from all 300 and their sidecars.
-- **Tests:** batch query; shot-wide application; undo round trip; XMP of both RAW and JPG.
-- Later with R-8: hierarchical keywords in the same popover.
+- Batch tagging popover (`ui/batch_tags.rs`) accessible from selection bar ("Tags…") and timeline shortcut (**Ctrl+T**).
+- Tag autocomplete matching known tags and hierarchical paths; support for adding new hierarchical tags (`Places|France|Paris`).
+- Tag chips flowbox showing applied tags across selection with exact match and partial counts (e.g. `wedding · 120 of 300`) and partial chip styling.
+- Shot-wide expansion (`expand_shot_image_ids`): applies tags to all companion files (RAW + JPG) sharing `group_hash`.
+- Non-blocking background XMP sidecar sync across all companion files (`undo::sync_tags_xmp`).
+- 1-action undo/redo integration via `UndoAction::TagAdd` and `UndoAction::TagRemove` with notification toasts and library refresh.
 
 ### 🟡 R-18 · Nice to have for pros · L
 

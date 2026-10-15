@@ -47,6 +47,8 @@ pub struct Sidebar {
     /// Open years `(year, None)` and months `(year, Some(month))`. Survives
     /// refreshes, so live updates during an import don't snap the tree shut.
     expanded: Rc<RefCell<HashSet<NodeKey>>>,
+    /// Open tag IDs in the hierarchical tag tree. Survives refreshes.
+    expanded_tags: Rc<RefCell<HashSet<i64>>>,
     /// Day events cache: (year, month, day) -> Event name
     pub event_names: Rc<RefCell<HashMap<(i32, u32, u32), String>>>,
 }
@@ -257,16 +259,15 @@ impl Sidebar {
         });
     }
 
-    /// Reload the tags list with photo counts.
+    /// Reload the tags list with hierarchical photo counts and collapsible tree.
     pub fn refresh_tags(&self) {
         let db = self.db.clone();
-        let (tx_tags, rx_tags) = async_channel::bounded::<Vec<(photon_core::models::Tag, u32)>>(1);
+        let (tx_tags, rx_tags) = async_channel::bounded::<Vec<queries::HierarchicalTagItem>>(1);
         thread::spawn(move || {
-            let tags = db.conn().map_err(|e| e.to_string()).and_then(|conn| {
-                queries::get_tags_with_counts(&conn).map_err(|e| e.to_string())
-            });
-            if let Ok(tags) = tags {
-                let _ = tx_tags.send_blocking(tags);
+            if let Ok(conn) = db.conn() {
+                if let Ok(tree) = queries::get_hierarchical_tags_with_counts(&conn) {
+                    let _ = tx_tags.send_blocking(tree);
+                }
             }
         });
 
@@ -286,18 +287,93 @@ impl Sidebar {
                 empty_lbl.set_margin_bottom(4);
                 this.tags_container.append(&empty_lbl);
             } else {
-                for (tag, count) in tags {
-                    let label = format!("#{}", tag.name);
-                    let btn = make_row_with_count(&label, "tag-symbolic", Some(count));
-                    let tx = this.sender.clone();
-                    let tag_name = tag.name.clone();
-                    btn.connect_clicked(move |_| {
-                        let _ = tx.send_blocking(UIAction::FilterByTag(tag_name.clone()));
-                    });
-                    this.tags_container.append(&btn);
+                for item in &tags {
+                    this.append_tag_node(&this.tags_container, item, 0);
                 }
             }
         });
+    }
+
+    fn append_tag_node(&self, container: &Box, item: &queries::HierarchicalTagItem, depth: u32) {
+        let node_box = Box::new(Orientation::Vertical, 0);
+        let row_box = Box::new(Orientation::Horizontal, 2);
+        row_box.add_css_class("tag-tree-row");
+        row_box.set_margin_start((depth * 14).min(56) as i32 + 2);
+
+        let has_children = !item.children.is_empty();
+        let is_expanded = self.expanded_tags.borrow().contains(&item.id);
+
+        let children_box = Box::new(Orientation::Vertical, 0);
+        children_box.set_visible(is_expanded);
+
+        if has_children {
+            let chevron = Button::from_icon_name(if is_expanded {
+                "pan-down-symbolic"
+            } else {
+                "pan-end-symbolic"
+            });
+            chevron.add_css_class("flat");
+            chevron.add_css_class("tag-tree-expander");
+            chevron.set_tooltip_text(Some(if is_expanded { "Collapse" } else { "Expand" }));
+
+            let expanded_tags = self.expanded_tags.clone();
+            let tag_id = item.id;
+            let c_box = children_box.clone();
+            chevron.connect_clicked(move |b| {
+                let mut set = expanded_tags.borrow_mut();
+                if set.contains(&tag_id) {
+                    set.remove(&tag_id);
+                    c_box.set_visible(false);
+                    b.set_icon_name("pan-end-symbolic");
+                    b.set_tooltip_text(Some("Expand"));
+                } else {
+                    set.insert(tag_id);
+                    c_box.set_visible(true);
+                    b.set_icon_name("pan-down-symbolic");
+                    b.set_tooltip_text(Some("Collapse"));
+                }
+            });
+            row_box.append(&chevron);
+        } else {
+            let spacer = Box::new(Orientation::Horizontal, 0);
+            spacer.set_size_request(24, -1);
+            row_box.append(&spacer);
+        }
+
+        // Tag button with recursive count badge
+        let label_text = format!("#{}", item.name);
+        let btn = make_row_with_count(&label_text, "tag-symbolic", Some(item.recursive_count));
+        btn.set_hexpand(true);
+
+        if item.direct_count != item.recursive_count {
+            btn.set_tooltip_text(Some(&format!(
+                "Tag: {}\nDirect: {} photo(s), Total with sub-tags: {} photo(s)",
+                item.full_path, item.direct_count, item.recursive_count
+            )));
+        } else {
+            btn.set_tooltip_text(Some(&format!(
+                "Tag: {}\n{} photo(s)",
+                item.full_path, item.recursive_count
+            )));
+        }
+
+        let tx = self.sender.clone();
+        let tag_name = item.name.clone();
+        btn.connect_clicked(move |_| {
+            let _ = tx.send_blocking(UIAction::FilterByTag(tag_name.clone()));
+        });
+        row_box.append(&btn);
+
+        node_box.append(&row_box);
+
+        if has_children {
+            for child in &item.children {
+                self.append_tag_node(&children_box, child, depth + 1);
+            }
+            node_box.append(&children_box);
+        }
+
+        container.append(&node_box);
     }
 
     /// Reload missing photos indicator and count.
@@ -568,6 +644,7 @@ pub fn create(db: Database, sender: Sender<UIAction>) -> Sidebar {
         generation: Rc::new(Cell::new(0)),
         tree: Rc::new(RefCell::new(Rc::new(Vec::new()))),
         expanded: Rc::new(RefCell::new(HashSet::new())),
+        expanded_tags: Rc::new(RefCell::new(HashSet::new())),
         event_names: Rc::new(RefCell::new(HashMap::new())),
     };
 

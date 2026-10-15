@@ -96,16 +96,18 @@ pub struct XmpUpdate<'a> {
     pub orientation: Option<u16>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Keywords<'a> {
     pub tags: &'a [String],
     pub known: &'a [String],
+    pub hierarchical: Option<&'a [String]>,
 }
 
 const XMP_NS: &str = "http://ns.adobe.com/xap/1.0/";
 const DC_NS: &str = "http://purl.org/dc/elements/1.1/";
 const TIFF_NS: &str = "http://ns.adobe.com/tiff/1.0/";
 const DARKTABLE_NS: &str = "http://darktable.sf.net/";
+const LR_NS: &str = "http://ns.adobe.com/lightroom/1.0/";
 
 const EMPTY_XMP: &str = "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>
 <x:xmpmeta xmlns:x=\"adobe:ns:meta/\">
@@ -232,8 +234,6 @@ fn set_keywords(doc: &mut String, keywords: Keywords) {
     let existing = element(doc, "dc:subject")
         .map(|(s, e)| list_items(&doc[s..e]))
         .unwrap_or_default();
-    // darktable's own keywords are its business, even if a library tag has
-    // the same name.
     let internal = darktable_keywords(doc);
     let is_known = |k: &str| {
         !is_darktable_keyword(k, &internal)
@@ -246,19 +246,78 @@ fn set_keywords(doc: &mut String, keywords: Keywords) {
             merged.push(tag.clone());
         }
     }
-    if merged == existing {
-        return;
+    // Include leaf and ancestor names from hierarchical keywords in dc:subject
+    if let Some(hierarchical) = keywords.hierarchical {
+        for path in hierarchical {
+            for part in path.split('|').map(|p| p.trim()).filter(|p| !p.is_empty()) {
+                if !merged.iter().any(|k| k.eq_ignore_ascii_case(part)) && !is_darktable_keyword(part, &internal) {
+                    merged.push(part.to_string());
+                }
+            }
+        }
     }
 
-    if merged.is_empty() {
-        remove_element(doc, "dc:subject");
-        return;
+    if merged != existing {
+        if merged.is_empty() {
+            remove_element(doc, "dc:subject");
+        } else {
+            let items: String = merged
+                .iter()
+                .map(|k| format!("     <rdf:li>{}</rdf:li>\n", xml_escape(k)))
+                .collect();
+            replace_or_insert(doc, "dc:subject", &format!("   <dc:subject>\n    <rdf:Bag>\n{items}    </rdf:Bag>\n   </dc:subject>\n"));
+            ensure_namespace(doc, "dc", DC_NS);
+        }
     }
-    let items: String = merged
+
+    // Now update lr:hierarchicalSubject
+    let existing_hierarchical = element(doc, "lr:hierarchicalSubject")
+        .map(|(s, e)| list_items(&doc[s..e]))
+        .unwrap_or_default();
+
+    let is_known_hierarchical = |k: &str| {
+        if is_darktable_keyword(k, &internal) {
+            return false;
+        }
+        keywords.known.iter().any(|t| t.eq_ignore_ascii_case(k))
+            || keywords.hierarchical.map_or(false, |h| h.iter().any(|t| t.eq_ignore_ascii_case(k)))
+            || keywords.tags.iter().any(|t| t.eq_ignore_ascii_case(k))
+    };
+
+    let mut merged_hierarchical: Vec<String> = existing_hierarchical
         .iter()
-        .map(|k| format!("     <rdf:li>{}</rdf:li>\n", xml_escape(k)))
+        .filter(|k| !is_known_hierarchical(k))
+        .cloned()
         .collect();
-    replace_or_insert(doc, "dc:subject", &format!("   <dc:subject>\n    <rdf:Bag>\n{items}    </rdf:Bag>\n   </dc:subject>\n"));
+
+    let target_hierarchical: Vec<String> = if let Some(htags) = keywords.hierarchical {
+        htags.to_vec()
+    } else {
+        keywords.tags.to_vec()
+    };
+
+    for path in target_hierarchical {
+        if !merged_hierarchical.iter().any(|k| k.eq_ignore_ascii_case(&path)) {
+            merged_hierarchical.push(path);
+        }
+    }
+
+    if merged_hierarchical != existing_hierarchical {
+        if merged_hierarchical.is_empty() {
+            remove_element(doc, "lr:hierarchicalSubject");
+        } else {
+            let items: String = merged_hierarchical
+                .iter()
+                .map(|k| format!("     <rdf:li>{}</rdf:li>\n", xml_escape(k)))
+                .collect();
+            replace_or_insert(
+                doc,
+                "lr:hierarchicalSubject",
+                &format!("   <lr:hierarchicalSubject>\n    <rdf:Bag>\n{items}    </rdf:Bag>\n   </lr:hierarchicalSubject>\n"),
+            );
+            ensure_namespace(doc, "lr", LR_NS);
+        }
+    }
 }
 
 /// The parts of darktable's own hierarchical keywords in `doc`, lowercase.
@@ -585,8 +644,16 @@ pub fn read_xmp_metadata(path: &Path) -> std::io::Result<XmpReadResult> {
         }
     }
 
+    let internal = darktable_keywords(&doc);
+    if let Some((s, e)) = element(&doc, "lr:hierarchicalSubject") {
+        let items = list_items(&doc[s..e]);
+        let filtered: Vec<String> = items.into_iter().filter(|tag| !is_darktable_keyword(tag, &internal)).collect();
+        if !filtered.is_empty() {
+            result.hierarchical_tags = Some(filtered);
+        }
+    }
+
     if let Some((s, e)) = element(&doc, "dc:subject") {
-        let internal = darktable_keywords(&doc);
         let items = list_items(&doc[s..e]);
         result.tags = Some(items.into_iter().filter(|tag| !is_darktable_keyword(tag, &internal)).collect());
     }
@@ -951,7 +1018,7 @@ mod tests {
         let known = strings(&["wedding", "family"]);
         let tags = strings(&["family"]);
         let update = XmpUpdate {
-            keywords: Some(Keywords { tags: &tags, known: &known }),
+            keywords: Some(Keywords { tags: &tags, known: &known, hierarchical: None }),
             ..Default::default()
         };
         let merged = merge_xmp(DARKTABLE_XMP, &update).unwrap();
@@ -962,7 +1029,7 @@ mod tests {
 
         // Removing the last Photon tag keeps the foreign one.
         let update = XmpUpdate {
-            keywords: Some(Keywords { tags: &[], known: &known }),
+            keywords: Some(Keywords { tags: &[], known: &known, hierarchical: None }),
             ..Default::default()
         };
         let merged = merge_xmp(&merged, &update).unwrap();
@@ -1016,7 +1083,7 @@ mod tests {
         let tags = strings(&["client"]);
         let merged = merge_xmp(
             &merged,
-            &XmpUpdate { keywords: Some(Keywords { tags: &tags, known: &tags }), ..Default::default() },
+            &XmpUpdate { keywords: Some(Keywords { tags: &tags, known: &tags, hierarchical: None }), ..Default::default() },
         )
         .unwrap();
         assert!(merged.contains(r#"xmlns:dc="http://purl.org/dc/elements/1.1/""#));
@@ -1045,7 +1112,7 @@ mod tests {
             &XmpUpdate {
                 rating: Some(4),
                 rejected: Some(false),
-                keywords: Some(Keywords { tags: &tags, known: &tags }),
+                keywords: Some(Keywords { tags: &tags, known: &tags, hierarchical: None }),
                 title: Some("Golden Hour"),
                 description: None,
                 ..Default::default()
@@ -1200,7 +1267,7 @@ mod tests {
         let tags = strings(&["wedding", "family"]);
         let merged = merge_xmp(
             DARKTABLE_TAGGED,
-            &XmpUpdate { keywords: Some(Keywords { tags: &tags, known: &known }), ..Default::default() },
+            &XmpUpdate { keywords: Some(Keywords { tags: &tags, known: &known, hierarchical: None }), ..Default::default() },
         )
         .unwrap();
         let (s, e) = element(&merged, "dc:subject").unwrap();
@@ -1208,6 +1275,46 @@ mod tests {
         for kept in ["darktable", "format", "orf", "changed", "wedding", "family"] {
             assert!(items.iter().any(|i| i == kept), "{kept} in {items:?}");
         }
+    }
+
+    #[test]
+    fn hierarchical_keywords_write_and_read_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("IMG_001.ORF");
+        std::fs::write(&img, b"raw").unwrap();
+
+        let tags = strings(&["Paris"]);
+        let known = strings(&["Paris", "Places", "France"]);
+        let hierarchical = strings(&["Places|France|Paris"]);
+
+        let update = XmpUpdate {
+            keywords: Some(Keywords {
+                tags: &tags,
+                known: &known,
+                hierarchical: Some(&hierarchical),
+            }),
+            ..Default::default()
+        };
+
+        let xmp_path = sync_xmp_metadata(&img, &update).unwrap();
+        let xml = std::fs::read_to_string(&xmp_path).unwrap();
+
+        // Check lr:hierarchicalSubject
+        let (s, e) = element(&xml, "lr:hierarchicalSubject").expect("has lr:hierarchicalSubject");
+        let h_items = list_items(&xml[s..e]);
+        assert_eq!(h_items, vec!["Places|France|Paris"]);
+
+        // Check dc:subject has leaf and ancestors
+        let (s, e) = element(&xml, "dc:subject").expect("has dc:subject");
+        let dc_items = list_items(&xml[s..e]);
+        assert!(dc_items.contains(&"Paris".to_string()));
+        assert!(dc_items.contains(&"France".to_string()));
+        assert!(dc_items.contains(&"Places".to_string()));
+
+        // Read it back
+        let read = read_xmp_metadata(&xmp_path).unwrap();
+        assert_eq!(read.hierarchical_tags, Some(vec!["Places|France|Paris".to_string()]));
+        assert!(read.tags.is_some());
     }
 
     #[test]
