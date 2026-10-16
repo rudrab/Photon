@@ -66,6 +66,9 @@ pub struct Image {
     pub color_label: ColorLabel,
     /// Micro-preview representation (~25-30 bytes) for instant placeholder rendering.
     pub thumbhash: Option<Vec<u8>>,
+    /// Edited in darktable or external editor (R-15).
+    #[serde(default)]
+    pub edited: bool,
 }
 
 impl Image {
@@ -503,6 +506,10 @@ pub struct TimelineItem {
     pub versions: u32,
     /// One of the other files is a RAW.
     pub has_raw_version: bool,
+    /// Edited in darktable (R-15).
+    pub is_edited: bool,
+    /// A GIMP project (`<stem>.xcf`) sits next to the file.
+    pub has_xcf: bool,
 }
 
 impl TimelineItem {
@@ -891,6 +898,8 @@ pub struct XmpReadResult {
     pub tags: Option<Vec<String>>,
     /// Hierarchical keywords from `lr:hierarchicalSubject` (e.g. `["Places|France|Paris"]`).
     pub hierarchical_tags: Option<Vec<String>>,
+    /// Darktable history detected in XMP (R-15).
+    pub is_edited: Option<bool>,
 }
 
 #[cfg(test)]

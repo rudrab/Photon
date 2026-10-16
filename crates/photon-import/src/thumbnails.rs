@@ -105,6 +105,129 @@ impl ThumbnailGenerator {
         invalidate_cache(&self.cache_root, hash);
     }
 
+    /// Re-render the Large (2560px) and Grid (640px) thumbnails for a RAW image using darktable-cli (R-15),
+    /// updating the thumbnail cache and returning the new ThumbHash.
+    pub fn re_render_darktable_thumbnails(
+        &self,
+        raw_path: &Path,
+        xmp_path: Option<&Path>,
+        hash: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let preview = crate::raw::render_darktable_preview(raw_path, xmp_path, ThumbSize::Large.long_edge())?;
+        let rgb = preview.into_rgb8();
+
+        // 1. Save Large thumbnail (2560px)
+        let large_out = thumb_path(&self.cache_root, ThumbSize::Large, hash);
+        if let Some(dir) = large_out.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let large_tmp = large_out.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
+        {
+            let mut writer = BufWriter::new(File::create(&large_tmp)?);
+            JpegEncoder::new_with_quality(&mut writer, ThumbSize::Large.quality()).encode_image(&rgb)?;
+            writer.into_inner().map_err(|e| e.into_error())?;
+            fs::rename(&large_tmp, &large_out)?;
+        }
+
+        // 2. Resize to Grid (640px) and save
+        let grid_rgb = resize(rgb, ThumbSize::Grid.long_edge())?;
+        let th = compute_thumbhash(&grid_rgb);
+        let grid_out = thumb_path(&self.cache_root, ThumbSize::Grid, hash);
+        if let Some(dir) = grid_out.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let grid_tmp = grid_out.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
+        {
+            let mut writer = BufWriter::new(File::create(&grid_tmp)?);
+            JpegEncoder::new_with_quality(&mut writer, ThumbSize::Grid.quality()).encode_image(&grid_rgb)?;
+            writer.into_inner().map_err(|e| e.into_error())?;
+            fs::rename(&grid_tmp, &grid_out)?;
+        }
+
+        Ok(th)
+    }
+
+    /// Re-render a RAW through darktable after its sidecar changed and store the
+    /// new ThumbHash. Does not clear the thumbnail cache: that would delete the
+    /// files just written.
+    pub fn refresh_after_darktable_edit(
+        &self,
+        conn: &rusqlite::Connection,
+        id: i64,
+        raw_path: &Path,
+        xmp_path: &Path,
+        hash: &str,
+    ) -> Result<()> {
+        if let Some(thumbhash) = self.re_render_darktable_thumbnails(raw_path, Some(xmp_path), hash)? {
+            photon_core::db::queries::save_thumbhash(conn, id, &thumbhash)?;
+        }
+        Ok(())
+    }
+
+    /// Evict the Large thumbnails read longest ago (by modification time on
+    /// filesystems mounted `noatime`/`relatime`) if the total size of `large/`
+    /// exceeds `max_bytes` in `large/` exceeds `max_bytes` (R-12).
+    /// Returns the number of files deleted.
+    pub fn evict_large_cache(&self, max_bytes: u64) -> Result<usize> {
+        let large_dir = self.cache_root.join(ThumbSize::Large.dir());
+        if !large_dir.is_dir() {
+            return Ok(0);
+        }
+        let mut entries = Vec::new();
+        let mut total_bytes = 0u64;
+
+        for shard in fs::read_dir(&large_dir)? {
+            let Ok(shard_entry) = shard else { continue };
+            let shard_path = shard_entry.path();
+            if !shard_path.is_dir() {
+                continue;
+            }
+            for file in fs::read_dir(&shard_path)? {
+                let Ok(file_entry) = file else { continue };
+                let path = file_entry.path();
+                if path.extension().is_some_and(|ext| ext == "jpg") {
+                    if let Ok(meta) = file_entry.metadata() {
+                        let len = meta.len();
+                        total_bytes += len;
+                        let accessed = meta
+                            .accessed()
+                            .or_else(|_| meta.modified())
+                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                        entries.push((path, len, accessed));
+                    }
+                }
+            }
+        }
+
+        if total_bytes <= max_bytes {
+            return Ok(0);
+        }
+
+        // Sort oldest accessed first
+        entries.sort_by_key(|e| e.2);
+
+        let mut evicted = 0;
+        let mut bytes_freed = 0u64;
+        let target_freed = total_bytes.saturating_sub(max_bytes);
+
+        for (path, len, _) in entries {
+            if bytes_freed >= target_freed {
+                break;
+            }
+            if fs::remove_file(&path).is_ok() {
+                bytes_freed += len;
+                evicted += 1;
+            }
+        }
+        if evicted > 0 {
+            log::info!(
+                "Evicted {evicted} Large thumbnails ({:.1} MB freed)",
+                bytes_freed as f64 / 1_048_576.0
+            );
+        }
+        Ok(evicted)
+    }
+
     /// Delete the old id-keyed cache (`small/`, `medium/`). Its files belong to
     /// whatever photo had that id in some earlier library, so they are wrong.
     pub fn remove_legacy_cache(&self) {

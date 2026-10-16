@@ -2277,6 +2277,20 @@ fn rebuild_tile_badges(badges_box: &GtkBox, item: &TimelineItem) {
         reject_label.add_css_class("photon-tile-reject-badge");
         badges_box.append(&reject_label);
     }
+    if item.is_edited {
+        let edit_label = Label::new(Some("✎"));
+        edit_label.add_css_class("photon-tile-badge");
+        edit_label.add_css_class("photon-tile-edited-badge");
+        edit_label.set_tooltip_text(Some("Edited in darktable"));
+        badges_box.append(&edit_label);
+    }
+    if item.has_xcf {
+        let xcf_label = Label::new(Some("XCF"));
+        xcf_label.add_css_class("photon-tile-badge");
+        xcf_label.add_css_class("photon-tile-xcf-badge");
+        xcf_label.set_tooltip_text(Some("A GIMP project (.xcf) sits next to this photo"));
+        badges_box.append(&xcf_label);
+    }
 }
 
 fn render_quality_badge(

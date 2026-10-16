@@ -29,6 +29,15 @@ pub fn find_xmp(path: &Path) -> Option<PathBuf> {
     replaced.exists().then_some(replaced)
 }
 
+/// The GIMP project (`<stem>.xcf`, any case) saved beside `path`, if any.
+pub fn find_xcf(path: &Path) -> Option<PathBuf> {
+    let stem = path.file_stem()?.to_str()?.to_lowercase();
+    std::fs::read_dir(path.parent()?).ok()?.flatten().map(|e| e.path()).find(|p| {
+        p.extension().is_some_and(|e| e.eq_ignore_ascii_case("xcf"))
+            && p.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.to_lowercase() == stem)
+    })
+}
+
 /// Where the XMP for `src` should live once `src` has been placed at `dest`.
 pub fn xmp_destination(src: &Path, xmp: &Path, dest: &Path) -> PathBuf {
     if xmp.extension().is_some() && xmp.file_stem() == src.file_name() {
@@ -658,7 +667,40 @@ pub fn read_xmp_metadata(path: &Path) -> std::io::Result<XmpReadResult> {
         result.tags = Some(items.into_iter().filter(|tag| !is_darktable_keyword(tag, &internal)).collect());
     }
 
+    // Only a sidecar that carries darktable's edit data says anything about
+    // editing; one Photon wrote for a JPG must not clear the flag.
+    if doc.contains("darktable:history") {
+        result.is_edited = Some(is_darktable_edited(&doc));
+    }
+
     Ok(result)
+}
+
+/// Does this darktable sidecar hold edits made by the user, as opposed to the
+/// modules darktable applies on its own to every RAW?
+///
+/// darktable 4.x hashes the history before (`history_auto_hash`) and after
+/// (`history_current_hash`) the user's changes, so when both are present they
+/// decide. Older sidecars have no hashes; then only modules that darktable
+/// never applies automatically count.
+pub fn is_darktable_edited(doc: &str) -> bool {
+    if let (Some(current), Some(auto)) = (
+        property(doc, "darktable:history_current_hash"),
+        property(doc, "darktable:history_auto_hash"),
+    ) {
+        if !current.is_empty() && !auto.is_empty() {
+            return current != auto;
+        }
+    }
+    // Modules the user adds by hand; darktable's defaults (exposure, filmic,
+    // sigmoid, colorbalancergb, sharpen, denoiseprofile …) are left out.
+    const USER_MODULES: &[&str] = &[
+        "crop", "clipping", "ashift", "retouch", "vignette", "monochrome", "watermark", "grain", "toneequal",
+        "colorequal", "bilat", "diffuse",
+    ];
+    let Some((s, e)) = element(doc, "darktable:history") else { return false };
+    let history = &doc[s..e];
+    USER_MODULES.iter().any(|op| history.contains(&format!(r#"darktable:operation="{op}""#)))
 }
 
 /// Seconds since the epoch at which `path` was last modified.
@@ -808,6 +850,43 @@ pub fn reconcile_shots(conn: &mut rusqlite::Connection) -> anyhow::Result<usize>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn finds_the_gimp_project_beside_a_photo() {
+        let dir = tempfile::tempdir().unwrap();
+        let jpg = dir.path().join("P6030189.JPG");
+        std::fs::write(&jpg, b"").unwrap();
+        assert_eq!(find_xcf(&jpg), None);
+        std::fs::write(dir.path().join("P6030189.XCF"), b"").unwrap();
+        std::fs::write(dir.path().join("P6030190.xcf"), b"").unwrap();
+        assert_eq!(find_xcf(&jpg), Some(dir.path().join("P6030189.XCF")));
+    }
+
+    fn dt_doc(attrs: &str, ops: &[&str]) -> String {
+        let items: String =
+            ops.iter().map(|op| format!(r#"<rdf:li darktable:operation="{op}" darktable:enabled="1"/>"#)).collect();
+        format!(
+            r#"<rdf:Description rdf:about="" {attrs}><darktable:history><rdf:Seq>{items}</rdf:Seq></darktable:history></rdf:Description>"#
+        )
+    }
+
+    #[test]
+    fn darktable_edit_detection_uses_hashes_when_present() {
+        let auto_only = dt_doc(
+            r#"darktable:history_auto_hash="aa" darktable:history_current_hash="aa""#,
+            &["sigmoid", "colorbalancergb", "sharpen"],
+        );
+        assert!(!is_darktable_edited(&auto_only));
+        let edited = dt_doc(r#"darktable:history_auto_hash="aa" darktable:history_current_hash="bb""#, &["exposure"]);
+        assert!(is_darktable_edited(&edited));
+    }
+
+    #[test]
+    fn darktable_edit_detection_without_hashes_ignores_default_modules() {
+        assert!(!is_darktable_edited(&dt_doc("", &["sigmoid", "colorbalancergb", "sharpen", "denoiseprofile"])));
+        assert!(is_darktable_edited(&dt_doc("", &["sigmoid", "crop"])));
+        assert!(!is_darktable_edited("<x:xmpmeta/>"));
+    }
+
     use super::*;
 
     /// An ORF and its JPG, one shot, with files on disk.

@@ -122,7 +122,7 @@ fn sweep_interrupted_imports(window: &ui::window::MainWindow, started: std::time
             }) {
                 Ok(images) => {
                     let parents: std::collections::HashSet<_> =
-                        images.into_iter().filter_map(|(_, path, _, _)| path.parent().map(|p| p.to_path_buf())).collect();
+                        images.into_iter().filter_map(|row| row.path.parent().map(|p| p.to_path_buf())).collect();
                     parents.into_iter().collect()
                 }
                 Err(e) => {

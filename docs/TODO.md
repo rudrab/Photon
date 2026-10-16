@@ -88,6 +88,23 @@ Useful tools installed on the dev machine: `xmllint`, `exiv2`, `darktable-cli`,
 7. **Tags:** use `queries::ensure_tag`, never `create_tag` (which returns a wrong
    id when the tag already exists).
 
+### Done (2026-10-16) — don't redo
+
+- Review fixes: darktable edit detection by history hashes (defaults no longer count; reset clears the flag); re-render no longer deletes its own thumbnails; renders run after the library check, not in it; full-res cache invalidated on the UI thread; scale benchmark is `#[ignore]` (wall-clock limits).
+- GIMP project awareness (see R-15).
+
+### Done (2026-10-15) — don't redo
+
+- Import safety on the road (R-21): GTK inhibit for logout/suspend during import (`ui/import_guard.rs`);
+  close confirmation dialog while active; resume/recovery reporting interrupted batches; deduplication
+  adopting identical files at destination; configurable Photo Library destination folder in Preferences
+  with writability checks.
+- Hierarchical keywords (R-8): migration 018 (`tags.parent_id`), path queries (`ensure_tag_path`),
+  collapsible sidebar tree with recursive count rollups, two-way sync with darktable's
+  `lr:hierarchicalSubject` ('|' separated).
+- Batch keywording (R-19): selection bar and `Ctrl+T` tag popover (`ui/batch_tags.rs`) with autocomplete,
+  flowbox chips, selection counters, shot-wide tag propagation, and 1-action undo/redo.
+
 ### Done (2026-09-29) — don't redo
 
 - Phase 1 (harden): PART 3 bugs, R-13, R-14. See those tasks for what and where.
@@ -420,24 +437,23 @@ A gio `FileMonitor` (or the `notify` crate) on the library root and folders impo
 - Renamed or moved → relink.
 - Deleted → mark missing.
 
-### 🔴 R-12 · Scale testing and performance targets · M
+### 🟠 R-12 · Scale testing and performance targets · M
 
-Build a synthetic library generator (a test or bench) with 200k image rows plus a few thousand real files. Measure and keep in `benches/`:
+Still to do: import of 2,000 JPEG+RAW from a USB 3 card (throughput, CPU/IO); cold start < 2 s and 60 fps scroll
+measurements; size-aware `FULL_RES` for 60 MP bodies; `quick_check` time on a large DB (move to idle if slow);
+on focus, check only recently viewed folders (startup scans everything); the bench lives in `benches/` or
+`tests/scale_benchmark.rs` (`--ignored`, release).
 
-- Cold start to first paint < 2 s; timeline scroll at 60 fps; filter/search < 200 ms.
-- Import of 2,000 JPEG+RAW from a USB 3 card: throughput and CPU/IO.
-- Disk usage of the thumbnail cache (add a cap and eviction for `Large`); memory of `FULL_RES` (3 × ~60 MB at 20 MP; make it size-aware for 60 MP bodies).
-- `quick_check` time on a large DB: if too slow for startup, move to idle time.
-- 🔴 **The library check polls every file** (found 2026-09-30). `window.rs::check_library` runs at
-  startup and on every window focus (throttled to 30 s): for each photo, one thread stats the
-  file, looks for a sidecar (`find_xmp`, up to 2 more stats) and reads it if changed, then
-  `reconcile_shots` scans the shots. Instant at 600 photos; at 100k on an external HDD it's
-  ~300k stats per focus, keeping the disk busy (and spinning up sleeping drives). Fix:
-  - list each folder once (`read_dir`) instead of stat'ing each photo and sidecar;
-  - skip folders on offline mounts (R-10 already tells offline from missing);
-  - check the whole library at startup only, in batches off the UI thread; on focus, only
-    recently viewed folders; later, replace polling with R-11's file monitor;
-  - measure it in the R-12 benchmark (target: < 1 s at 100k on SSD, no work on focus beyond that).
+Done 2026-10-15:
+- 🟢 **Synthetic scale benchmark** (`crates/photon-core/tests/scale_benchmark.rs`): tests 200,000 synthetic library rows.
+  - Timeline query with version collapsing: **227 ms** across all 200k images; **19 ms** for filtered timeline (3★+ Picks).
+  - FTS5 search across 200k images: **61.8 ms** (**meets the < 200 ms target**; down from >400 ms).
+  - Indexed edited query: **14 ms**.
+- 🟢 **Offloaded timeline query from UI thread**: `MainWindow::show_timeline` executes `timeline_items_with_filters` in `gio::spawn_blocking` with `timeline_generation` tracking, eliminating all UI thread stutter during filtering, album browsing, and searches.
+- 🟢 **Fixed startup/focus stat storm**: `MainWindow::check_library` groups photos by directory and performs a single `std::fs::read_dir` per folder instead of ~300k individual `stat()` calls across 100k+ library; skips checking offline mounts (`photon_core::is_path_offline`).
+- 🟢 **Optimized FTS5 index**: Migration 019 rebuilt `images_fts` excluding large `metadata_json` blobs and indexing `(filename, camera_make, camera_model, lens_model, title, description)` with automated triggers and `'rebuild'`.
+- 🟢 **Optimized timeline SELECT**: Conditionally fetches `metadata_json` only for video formats (`format IN ('mp4','mov','avi','mkv','webm')`), eliminating multi-megabyte JSON allocations for standard photos.
+- 🟢 **Thumbnail cache eviction**: Enforced disk usage capping for Large previews (`ThumbnailGenerator::evict_large_cache(5GB)`), pruning oldest accessed Large thumbnails when exceeding limit.
 
 **Measured 2026-09-30** (Core Ultra 5 125H, NVMe/btrfs, release build; synthetic libraries are
 RAW+JPG pairs, files absent, so stat numbers are warm-cache only):
@@ -558,12 +574,14 @@ Done 2026-10-15 (for a photo trip: a laptop, memory cards, hotel power).
 - 🟢 Preferences → Library Database → "Restore from Backup": lists local and mirrored backups with date, photo count and size. Restore is **staged** (`db::stage_restore` checks the copy with `quick_check`), then applied at the next start before the DB opens (`db::apply_staged_restore`); the replaced DB and its `-wal`/`-shm` are kept in `backups/before-restore-…/`. The app offers "Quit Photon" to finish.
 - 🟢 "Back Up Now" in the same group, with the last backup's time.
 
-### 🔴 R-15 · darktable round trip in the grid · M
+### 🟢 R-15 · darktable round trip in the grid · M
 
-- After "Open in darktable" (`detail.rs::open_in_editor`), watch the sidecar.
-- When its history changes, re-render the Grid and Large thumbnails with `darktable-cli --width 2560` so the grid shows the edited look (the way Lightroom shows develop changes).
-- Mark edited photos with a badge.
-- Serialize renders (the `raw.rs` mutex exists).
+Done 2026-10-15:
+- 🟢 Detected darktable edits from sidecars: `history_current_hash != history_auto_hash`; for old sidecars without hashes, only user-added modules (crop, retouch, …) count, not darktable's defaults. Reset history clears the flag. RAWs only are re-rendered.
+- 🟢 Re-render Large (2560px) and Grid (640px) thumbnails via `darktable-cli --width 2560` serialized with `DarktableTurn` when darktable history changes, computing and updating the new ThumbHash.
+- 🟢 Displayed edited badge (`✎`, `.photon-tile-edited-badge`) on grid tiles for edited photos with tooltip "Edited in darktable".
+- 🟢 GIMP: a `<stem>.xcf` beside the photo (any case) sets `images.has_xcf` (migration 020) during the library check, which already lists each folder; tiles show an `XCF` badge. "Open in editor" reopens that XCF when the raster editor is GIMP (`find_xcf`), because GIMP 3.2 itself opens the flat JPG (checked headless: 1 layer). 🔴 Not done: import GIMP's exported JPG/PNG as a version of the shot; per-photo choice between the project and the flat file.
+- 🟢 Monitored sidecar in `detail.rs::open_in_editor` on editor process exit and in `check_library` on window focus/startup, re-rendering thumbnails and marking `edited = 1` in SQLite (migration 019).
 
 ### 🔴 R-16 · Culling power features · M
 
@@ -583,9 +601,9 @@ Done 2026-10-15 (for a photo trip: a laptop, memory cards, hotel power).
 - 🟢 Continuous zoom in the 1-up viewer (`ui/photo_view.rs`): log slider, Fit / 1:1 buttons, Ctrl+wheel and pinch anchored at the pointer, +/−, drag to pan, double-click toggles Fit ↔ 1:1 at the clicked point. Full resolution loads only once the zoom needs more pixels than the Large preview.
 - 🟢 Sharpness score & burst rejects: variance of the Laplacian (4×4 tile max + global), exposure clipping, burst detection (≤ 2 s), "Photo Quality" results dialog with grouped bursts, XMP Rating="-1" sync, viewer info panel sharpness, timeline "Possibly blurred" filter, and parallel rayon quality backfill (see AI-7).
 
-### 🟠 R-17 · Stacks · S–M
+### 🟠 R-17 · Stacks (RAW+JPG, Bracketed HDR, Panoramas, and Manual Stacks) · M
 
-`group_hash` groups RAW+JPG+edits.
+`group_hash` groups RAW+JPG+edits. Expand beyond companion files to multi-shot sequences and user-created stacks:
 
 - 🟢 One tile per shot (`queries::collapse_versions`): the JPG is the cover; a "RAW+JPG"
   (or "N versions") badge. Sidebar/date counts count shots. The 1-up viewer steps
@@ -595,6 +613,18 @@ Done 2026-10-15 (for a photo trip: a laptop, memory cards, hotel power).
 - 🔴 Rotation still applies to the file on screen only; make it shot-wide.
 - 🟢 Tags are shot-wide (implemented with R-19): tags added or removed apply to all companion files (RAW + JPG) and sidecars, with undo/redo per batch.
 - 🔴 Choose which version is the cover; expand a stack in the grid.
+- 🔴 **Auto-detect bracketed exposures (HDR sequences):**
+  - Detect Auto Exposure Bracketing (AEB): sequence of at least 3 consecutive shots from the same camera, at most 2 s apart, with stepping exposure bias (`ExposureCompensation` or varying shutter speeds at fixed aperture/ISO).
+  - Collapsed into one tile with a `"Bracket [3]"` or `"HDR [5]"` badge.
+  - Middle / 0 EV exposure is the default cover; 1-up viewer allows stepping through exposure steps.
+  - Export / Handoff option: "Merge to HDR in darktable / Hugin".
+- 🔴 **Auto-detect panorama sweeps:**
+  - Sequence of at least 3 consecutive shots within at most 3 s of each other with identical exposure settings, focal length, and camera orientation.
+  - Collapsed into one tile with a `"Pano [N]"` badge.
+- 🔴 **Manual user stacks:**
+  - Select photos -> `Ctrl+G` ("Group into Stack") / `Ctrl+Shift+G` ("Unstack").
+  - Explicit database schema: `stacks(id, name, cover_image_id)` and `stack_images(stack_id, image_id, position)`.
+  - Grid tile badge shows stack depth; context menu offers "Set as Stack Cover", "Remove from Stack", "Expand / Collapse Stack".
 
 ### 🟢 R-19 · Batch keywording · S–M
 
@@ -605,11 +635,67 @@ Done 2026-10-15 (for a photo trip: a laptop, memory cards, hotel power).
 - Non-blocking background XMP sidecar sync across all companion files (`undo::sync_tags_xmp`).
 - 1-action undo/redo integration via `UndoAction::TagAdd` and `UndoAction::TagRemove` with notification toasts and library refresh.
 
+### 🔴 R-22 · Capture time shift and multi-camera clock synchronization · S
+
+- **Why:** On photo trips across time zones or when shooting with two camera bodies (or camera + smartphone), camera clocks drift or are set incorrectly. Photos interleave out of chronological order in the timeline, and GPX geotagging maps photos to incorrect locations.
+- **Where:**
+  - `crates/photon-app/src/ui/time_shift_dialog.rs`
+  - `crates/photon-core/src/db/queries.rs` (`batch_shift_capture_time`)
+  - `crates/photon-import/src/sidecar.rs` (`sync_xmp_metadata`)
+  - `crates/photon-app/src/ui/undo.rs` (`UndoAction::TimeShift`)
+- **Approach:**
+  - Selection bar / menu action: "Adjust Date and Time…" (`Ctrl+Shift+T`).
+  - Two modes:
+    1. **Fixed offset:** add/subtract `±HH:MM:SS` or pick a time zone offset delta.
+    2. **Sync to reference photo:** choose one photo in the selection, enter its actual correct capture date/time, and shift all selected photos by the calculated difference.
+  - Updates `images.captured_at` in SQLite and writes `exif:DateTimeOriginal` to XMP sidecars (preserving darktable history).
+  - Invalidates timeline date groups and refreshes section headers. Fully undoable.
+- **Acceptance:** Shifting 50 photos by +2 hours updates their timeline positions, updates their XMP sidecars, and survives restart.
+
+### 🔴 R-23 · GPX geotagging and map view · M
+
+- **Why:** Most DSLRs and mirrorless bodies lack built-in GPS. Photographers track routes with smartphones or GPS loggers into `.gpx` files. Needs automatic timestamp matching and a visual map.
+- **Where:**
+  - `crates/photon-import/src/gpx.rs` (GPX XML parser for trackpoints: time, lat, lon, elevation)
+  - `crates/photon-app/src/ui/geotag_dialog.rs`
+  - `crates/photon-app/src/ui/map_view.rs` (`libshumate` OpenStreetMap tile widget)
+  - `crates/photon-import/src/sidecar.rs`
+- **Approach:**
+  - Dialog "Geotag from GPX…":
+    - Select `.gpx` file.
+    - Set camera clock time zone / offset if camera was not on UTC/local GPS time.
+    - Match algorithm: linear interpolation of coordinates between surrounding trackpoints for each photo's capture time. Maximum time gap threshold (e.g. 15 minutes max gap).
+    - Preview matched photos with coordinates and confidence before applying.
+  - Write coordinates to XMP sidecars (`exif:GPSLatitude`, `exif:GPSLongitude`, `exif:GPSAltitude`, `exif:GPSLatitudeRef`, `exif:GPSLongitudeRef`) and update SQLite `images` table (add `latitude REAL, longitude REAL, altitude REAL`).
+  - Map View:
+    - 1-up / info panel mini map showing the photo pin.
+    - Timeline header / sidebar "Map" view displaying the route polyline and thumbnail clusters.
+- **Acceptance:** A 500-photo trip matched against a GPX file writes valid GPS tags readable by `exiv2`, displays pins on the map, and allows filtering photos by geographic region.
+
+### 🔴 R-24 · Ingest renaming templates and metadata presets · S–M
+
+- **Why:** Offloading cards leaves generic camera names (`_DSC0001.JPG`, `P1010001.ORF`) that collide across card rolls. Furthermore, photographers want copyright, creator info (R-9), and trip keywords applied automatically on ingest rather than repeating manual tagging every evening.
+- **Where:**
+  - `crates/photon-import/src/library.rs` (`DestinationPlanner`)
+  - `crates/photon-app/src/handlers/import_handler.rs` (pre-import review dialog)
+  - `crates/photon-import/src/engine.rs` (`ImportConfig`)
+  - `crates/photon-app/src/ui/preferences.rs`
+- **Approach:**
+  - Import dialog adds a "File Renaming" expander with template tokens:
+    - `{date:%Y%m%d}`, `{time:%H%M%S}`, `{camera}`, `{orig_name}`, `{seq:04}`.
+    - Example: `{date}_{camera}_{seq}` -> `20261015_OM-1_0001.ORF`.
+    - Companion files (RAW + JPG + existing XMP) share the exact same stem.
+  - "Metadata at Import" expander:
+    - Apply default copyright & creator preset (R-9).
+    - Add initial trip keywords (e.g. `Trip|2026|Scotland`) directly to the imported batch.
+  - Preferences option to set default naming pattern and metadata template for all future imports.
+- **Acceptance:** Importing a card with RAW+JPG pairs renames both files identically with sequence numbers, embeds creator/copyright metadata, and adds specified trip tags.
+
 ### 🟡 R-18 · Nice to have for pros · L
 
 - 🟡 Tethered shooting: a `gphoto2` capture into a watched folder (R-11).
 - 🟡 Client proofing: a static HTML gallery export with a pick/comment form (or a contact-sheet PDF).
-- 🟡 Map view and geotagging from GPX.
+- 🟡 Map view and geotagging from GPX: moved to R-23.
 - Faces: moved to AI-3 / AI-4 (PART 5).
 
 ---
@@ -663,17 +749,17 @@ digiKam is the bar for "serious open-source DAM". Photon is past Shotwell for
 culling, RAW, XMP round trip and export; these are the gaps, biggest first.
 Several already have tasks above.
 
-- 🔴 **Search and collections:** smart collections (R-5), hierarchical keywords (R-8),
-  colour labels (R-6), a search builder over every field (camera, lens, focal
+- 🔴 **Search and collections:** smart collections (🟢 R-5), hierarchical keywords (🟢 R-8),
+  colour labels (🟢 R-6), batch keywording (🟢 R-19), and a search builder over every field (camera, lens, focal
   length, ISO, date range, rating, label, tag, path) with saved searches.
 - 🔴 **Map and geolocation:** a map view of GPS photos (libshumate), geotag from
-  GPX tracks, reverse geocoding to place names as searchable tags (R-18).
+  GPX tracks, reverse geocoding to place names as searchable tags (R-23).
 - 🔴 **Faces:** see AI-3 (detection, digiKam import) and AI-4 (recognition).
 - 🔴 **Similarity and duplicates:** a perceptual hash per photo for near-duplicate
   finding and "find similar" (digiKam's fuzzy search). Exact duplicates by BLAKE3 exist.
 - 🔴 **Metadata editor:** edit EXIF/IPTC/XMP fields (capture date shift for a
-  wrong camera clock, GPS, creator/copyright — R-9) on a selection.
-- 🔴 **Batch tools:** rename by template, date shift, batch convert/resize (the export
+  wrong camera clock — R-22, GPS — R-23, creator/copyright — R-9) on a selection.
+- 🔴 **Batch tools:** rename by template on ingest/selection (R-24), date shift (R-22), batch convert/resize (the export
   pipeline covers much of this), and a queue for them.
 - 🔴 **Folder view:** browse the library by folder on disk, not only by date/event,
   with multiple roots including removable and network drives (R-10, R-11).
@@ -885,20 +971,21 @@ undo restoring the sidecars. Check on a copy of the library.
   (`sidecar.rs`, the schema, the viewer) is opened once, and so every task's
   prerequisites land before it.
 
-  1. **Harden (≈1–1.5 wk):** P-0 hand checks → PART 3 bugs → R-14 → R-13
-     (incl. the stale `.photon-part` sweep). *Why first:* everything after this
-     writes more metadata; make failures loud and backups restorable before that.
-  2. **Metadata model (≈2–3 wk):** R-6 colour labels → R-7 decide picks → R-19
-     batch keywording with shot-wide tags (R-17) → R-8 hierarchical keywords → R-9 copyright template → metadata editor (PART 4:
-     date shift, GPS, creator). *Why together:* all of them are schema +
-     `sidecar.rs` + XMP read-back work. R-8 is also needed by AI-4 (`People|…`)
-     and AI-6 (suggested tags).
-  3. **Find (≈1.5 wk):** R-5 smart collections + the search builder (PART 4).
+  1. **Harden (≈1–1.5 wk):** P-0 hand checks (🟢) → PART 3 bugs (🟢) → R-14 (🟢) → R-13
+     (🟢) (incl. the stale `.photon-part` sweep) → R-21 import safety on the road (🟢).
+     *Why first:* everything after this writes more metadata; make failures loud, field offloads resilient,
+     and backups restorable before that.
+  2. **Metadata & Road Readiness (≈2–3 wk):** R-6 colour labels (🟢) → R-7 decide picks (🟢) → R-19
+     batch keywording with shot-wide tags (🟢) → R-8 hierarchical keywords (🟢) → R-22 capture date shift &
+     multi-camera sync → R-24 ingest renaming & metadata presets → R-9 copyright template → R-23 GPX
+     geotagging & map view. *Why together:* all of them are schema + `sidecar.rs` + XMP read-back work.
+     R-8 is also needed by AI-4 (`People|…`) and AI-6 (suggested tags).
+  3. **Find (≈1.5 wk):** R-5 smart collections (🟢) + the search builder (PART 4).
      *Why here:* labels and keywords now exist to search on.
   4. **Cull and versions (≈2 wk):** R-16 rest (full-res compare with synced
-     zoom, preload) + AI-7's classical sharpness score → R-17 stacks → R-15
-     darktable round trip. *Why:* R-17 is the home for AI-1/AI-2's derivative
-     files; the viewer code is fresh from the zoom work.
+     zoom, preload) + AI-7's classical sharpness score (🟢) → R-17 stacks (RAW+JPG, bracketed HDR,
+     panoramas, manual stacks) → R-15 darktable round trip. *Why:* R-17 is the home for AI-1/AI-2's
+     derivative files; the viewer code is fresh from the zoom work.
   5. **AI foundation + faces (≈3 wk):** AI-3 part 1 (import digiKam/XMP face
      regions, no model) → AI-0 with the benchmark → AI-3 detection → AI-4
      recognition and People.

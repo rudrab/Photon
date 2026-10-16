@@ -709,9 +709,16 @@ pub fn build_viewer(
     let prefs_open = prefs.clone();
     let image_open = current_image.clone();
     let notify_open = share_ctx.notify.clone();
+    let cache_open = cache.to_path_buf();
+    let show_open = show.clone();
+    let idx_open = current_idx.clone();
     open_btn.connect_clicked(move |_| {
         if let Some(image) = image_open.borrow().as_ref() {
-            if let Err(e) = open_in_editor(image, &prefs_open, &db_open) {
+            let show_c = show_open.clone();
+            let idx_c = idx_open.clone();
+            if let Err(e) = open_in_editor(image, &prefs_open, &db_open, &cache_open, move || {
+                show_c(idx_c.get());
+            }) {
                 notify_open(&e);
             }
         }
@@ -1823,14 +1830,26 @@ fn populate_info_panel(
 
 /// Open in the appropriate editor based on format. The error says why the
 /// editor couldn't be started, for the user.
-fn open_in_editor(image: &Image, prefs: &Preferences, db: &Database) -> Result<(), String> {
+fn open_in_editor(
+    image: &Image,
+    prefs: &Preferences,
+    db: &Database,
+    cache_dir: &Path,
+    on_change: impl Fn() + 'static,
+) -> Result<(), String> {
     let is_raw = image.format.as_ref().map(|f| f.is_raw()).unwrap_or(false);
     let cmd = if is_raw {
         &prefs.raw_editor
     } else {
         &prefs.raster_editor
     };
-    Command::new(cmd).arg(&image.path).spawn().map_err(|e| {
+    // Reopen a photo already edited in GIMP from its project, so the layers are still there.
+    let target = if !is_raw && cmd.to_lowercase().contains("gimp") {
+        photon_import::find_xcf(&image.path).unwrap_or_else(|| image.path.clone())
+    } else {
+        image.path.clone()
+    };
+    let mut child = Command::new(cmd).arg(&target).spawn().map_err(|e| {
         log::warn!("Starting {cmd} for {}: {e}", image.path.display());
         if e.kind() == std::io::ErrorKind::NotFound {
             format!("Couldn't open the editor: “{cmd}” isn't installed (Preferences → Editors)")
@@ -1844,6 +1863,48 @@ fn open_in_editor(image: &Image, prefs: &Preferences, db: &Database) -> Result<(
             log::warn!("Recording the edit of photo {id}: {e}");
         }
     }
+
+    // R-15: Monitor editor exit and update sidecar / re-render darktable preview
+    let image_path = image.path.clone();
+    let image_hash = image.hash.clone();
+    let image_id = image.id;
+    let db = db.clone();
+    let cache_dir = cache_dir.to_path_buf();
+    let (tx_change, rx_change) = async_channel::bounded::<()>(1);
+
+    let hash_ui = image_hash.clone();
+    glib::spawn_future_local(async move {
+        if rx_change.recv().await.is_ok() {
+            // The pixels changed: drop the full-resolution texture (thread-local, so here).
+            invalidate_full_res(&hash_ui);
+            on_change();
+        }
+    });
+
+    std::thread::spawn(move || {
+        let _ = child.wait();
+        let Some(id) = image_id else { return };
+        let Some(xmp_path) = photon_import::find_xmp(&image_path) else { return };
+        let meta = match photon_import::read_xmp_metadata(&xmp_path) {
+            Ok(meta) => meta,
+            Err(e) => return log::warn!("Reading {} after editing: {e}", xmp_path.display()),
+        };
+        let Ok(mut conn) = db.conn() else { return };
+        let mtime = photon_import::file_mtime(&xmp_path).unwrap_or(0);
+        if let Err(e) = queries::update_from_xmp(&mut conn, id, &meta, mtime) {
+            return log::warn!("Recording the edit of photo {id}: {e}");
+        }
+        if meta.is_edited == Some(true) && is_raw {
+            let thumbs = photon_import::thumbnails::ThumbnailGenerator::new(cache_dir);
+            match thumbs.refresh_after_darktable_edit(&conn, id, &image_path, &xmp_path, &image_hash) {
+                Ok(()) => {
+                    let _ = tx_change.send_blocking(());
+                }
+                Err(e) => log::warn!("Re-rendering {} after editing: {e:#}", image_path.display()),
+            }
+        }
+    });
+
     Ok(())
 }
 

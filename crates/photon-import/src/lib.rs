@@ -26,8 +26,8 @@ pub use quality::{
     QUALITY_LONG_EDGE, QUALITY_VERSION,
 };
 pub use sidecar::{
-    read_image_xmp, reconcile_shots, repair_darktable_keyword_tags, sync_xmp_metadata, write_image_xmp, Keywords,
-    XmpUpdate,
+    file_mtime, find_xcf, find_xmp, is_darktable_edited, read_image_xmp, read_xmp_metadata, reconcile_shots,
+    repair_darktable_keyword_tags, sync_xmp_metadata, write_image_xmp, Keywords, XmpUpdate,
 };
 pub use sources::{DiskSource, ImportSource};
 pub use thumbnails::{compute_histogram, HistogramData};

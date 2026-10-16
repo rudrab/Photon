@@ -249,6 +249,16 @@ button.destructive-action {
     background-color: rgba(50, 20, 0, 0.88);
 }
 
+.photon-tile-xcf-badge {
+    color: #f5c211;
+    background-color: rgba(30, 30, 30, 0.88);
+}
+
+.photon-tile-edited-badge {
+    color: #3584e4;
+    background-color: rgba(30, 30, 30, 0.88);
+}
+
 /* Tile quality ring badge (bottom-right, opposite metadata badges) */
 .photon-tile-quality {
     margin: 6px;

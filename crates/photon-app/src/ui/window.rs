@@ -34,7 +34,7 @@ use photon_core::db::Database;
 use photon_core::models::{ColorLabel, Image, Preferences, TimelineItem, UIAction};
 use photon_import::ImportEngine;
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -78,6 +78,8 @@ pub struct MainWindow {
     library_check: Rc<Cell<(Option<std::time::Instant>, bool)>>,
     /// The user said "Not Now" to downloading the face model, this session.
     face_model_declined: Rc<Cell<bool>>,
+    /// Generation counter for timeline loads to ignore out-of-order queries.
+    pub timeline_generation: Rc<Cell<u64>>,
     /// Imports running now. Closing the window while one runs asks first.
     pub active_imports: Rc<Cell<usize>>,
 }
@@ -459,6 +461,7 @@ impl MainWindow {
             library_check: Rc::new(Cell::new((None, false))),
             face_model_declined: Rc::new(Cell::new(false)),
             active_imports: Rc::new(Cell::new(0)),
+            timeline_generation: Rc::new(Cell::new(0)),
             rating_filter,
             cull_flag,
             color_filter,
@@ -751,7 +754,8 @@ impl MainWindow {
         self.library_check.set((Some(std::time::Instant::now()), true));
 
         let db_bg = self.db.clone();
-        let (tx_bg, rx_bg) = async_channel::bounded::<bool>(1);
+        let cache_dir = self.cache_dir.clone();
+        let (tx_bg, rx_bg) = async_channel::bounded::<(bool, Vec<(i64, PathBuf, PathBuf, String)>)>(1);
         std::thread::spawn(move || {
             let changed = (|| {
                 let mut conn = db_bg.conn().ok()?;
@@ -766,24 +770,134 @@ impl MainWindow {
                 }
                 let images_to_check = queries::get_all_images_for_integrity_check(&conn).ok()?;
 
+                // R-12: Group images by directory to avoid O(N) stat calls on 100k+ library.
+                let mut by_dir: std::collections::HashMap<PathBuf, Vec<queries::IntegrityRow>> =
+                    std::collections::HashMap::new();
+                for item in images_to_check {
+                    if let Some(parent) = item.path.parent() {
+                        by_dir.entry(parent.to_path_buf()).or_default().push(item);
+                    }
+                }
+
                 let mut to_mark_missing = Vec::new();
                 let mut to_mark_found = Vec::new();
+                let mut xcf_on = Vec::new();
+                let mut xcf_off = Vec::new();
+                let mut to_rerender: Vec<(i64, PathBuf, PathBuf, String)> = Vec::new();
+                let thumbs = photon_import::thumbnails::ThumbnailGenerator::new(cache_dir.clone());
 
-                for (id, path, xmp_mtime, was_missing) in images_to_check {
-                    let exists = path.exists();
-                    if !exists && !was_missing {
-                        to_mark_missing.push(id);
-                    } else if exists && was_missing {
-                        to_mark_found.push(id);
+                for (dir, dir_images) in by_dir {
+                    // Skip checking offline drives
+                    if photon_core::is_path_offline(&dir) {
+                        continue;
                     }
 
-                    if exists {
-                        match photon_import::read_image_xmp(&mut conn, id, &path, xmp_mtime) {
-                            Ok(applied) => changed |= applied,
-                            Err(e) => log::warn!("Reading XMP for {}: {e}", path.display()),
+                    // Single read_dir per folder
+                    let read_result = std::fs::read_dir(&dir);
+                    let mut dir_entries = std::collections::HashMap::new();
+                    let dir_missing = match read_result {
+                        Ok(entries) => {
+                            for entry in entries.flatten() {
+                                let mtime = entry
+                                    .metadata()
+                                    .ok()
+                                    .and_then(|m| m.modified().ok())
+                                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                    .map(|d| d.as_secs() as i64);
+                                dir_entries.insert(entry.file_name(), mtime);
+                            }
+                            false
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                        Err(_) => false,
+                    };
+
+                    // Stems (lower case) of the GIMP projects in this folder.
+                    let xcf_stems: std::collections::HashSet<String> = dir_entries
+                        .keys()
+                        .filter_map(|name| {
+                            let p = Path::new(name);
+                            p.extension()
+                                .is_some_and(|e| e.eq_ignore_ascii_case("xcf"))
+                                .then(|| p.file_stem()?.to_str().map(str::to_lowercase))
+                                .flatten()
+                        })
+                        .collect();
+
+                    for row in dir_images {
+                        let queries::IntegrityRow { id, path, hash, xmp_mtime, missing: was_missing, has_xcf } = row;
+                        if dir_missing {
+                            if !was_missing {
+                                to_mark_missing.push(id);
+                            }
+                            continue;
+                        }
+
+                        let filename = match path.file_name() {
+                            Some(f) => f,
+                            None => continue,
+                        };
+
+                        let has_project = path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .is_some_and(|stem| xcf_stems.contains(&stem.to_lowercase()));
+                        if has_project && !has_xcf {
+                            xcf_on.push(id);
+                        } else if !has_project && has_xcf {
+                            xcf_off.push(id);
+                        }
+
+                        let exists = dir_entries.contains_key(filename);
+                        if !exists && !was_missing {
+                            to_mark_missing.push(id);
+                        } else if exists && was_missing {
+                            to_mark_found.push(id);
+                        }
+
+                        if exists {
+                            // Find sidecar in dir_entries
+                            let mut appended = filename.to_os_string();
+                            appended.push(".xmp");
+                            let replaced = PathBuf::from(filename).with_extension("xmp").into_os_string();
+
+                            let xmp_info = if let Some(&mtime) = dir_entries.get(&appended) {
+                                Some((dir.join(&appended), mtime))
+                            } else if let Some(&mtime) = dir_entries.get(&replaced) {
+                                Some((dir.join(&replaced), mtime))
+                            } else {
+                                None
+                            };
+
+                            if let Some((xmp_path, Some(mtime))) = xmp_info {
+                                if xmp_mtime.is_none() || mtime > xmp_mtime.unwrap() {
+                                    if let Ok(xmp) = photon_import::read_xmp_metadata(&xmp_path) {
+                                        if let Ok(()) = queries::update_from_xmp(&mut conn, id, &xmp, mtime) {
+                                            changed = true;
+                                            // R-15: re-render RAWs whose edit history changed, after this scan.
+                                            let is_raw = path.extension()
+                                                .and_then(|e| e.to_str())
+                                                .is_some_and(|e| photon_core::models::ImageFormat::from_extension(e).is_raw());
+                                            if xmp.is_edited == Some(true) && is_raw {
+                                                to_rerender.push((id, path.clone(), xmp_path.clone(), hash.clone()));
+                                            }
+                                            let cull = xmp.rating.is_some() || xmp.rejected.is_some();
+                                            let color = xmp.color_label.is_some();
+                                            if cull || color {
+                                                let _ = photon_import::sidecar::spread_cull_to_shot(
+                                                    &mut conn, id, cull, color,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
+
+                // R-12: Cap large thumbnail cache disk usage (e.g. 5GB default limit)
+                let _ = thumbs.evict_large_cache(5 * 1024 * 1024 * 1024);
 
                 // One rating per shot: repair shots whose files disagree.
                 match photon_import::reconcile_shots(&mut conn) {
@@ -795,6 +909,12 @@ impl MainWindow {
                     Err(e) => log::warn!("Reconciling shots: {e:#}"),
                 }
 
+                for (ids, on) in [(&xcf_on, true), (&xcf_off, false)] {
+                    if !ids.is_empty() && queries::set_has_xcf(&conn, ids, on).is_ok() {
+                        changed = true;
+                    }
+                }
+
                 for (ids, missing) in [(&to_mark_missing, true), (&to_mark_found, false)] {
                     if ids.is_empty() {
                         continue;
@@ -804,17 +924,42 @@ impl MainWindow {
                         Err(e) => log::warn!("Marking {} photos missing={missing}: {e}", ids.len()),
                     }
                 }
-                Some(changed)
+                Some((changed, to_rerender))
             })();
-            let _ = tx_bg.send_blocking(changed.unwrap_or(false));
+            let _ = tx_bg.send_blocking(changed.unwrap_or((false, Vec::new())));
         });
 
         let mw = self.clone();
         gtk4::glib::MainContext::default().spawn_local(async move {
-            let changed = rx_bg.recv().await.unwrap_or(false);
+            let (changed, rerender) = rx_bg.recv().await.unwrap_or_default();
             let (started, _) = mw.library_check.get();
             mw.library_check.set((started, false));
             if changed {
+                mw.refresh();
+            }
+            if rerender.is_empty() {
+                return;
+            }
+            // darktable renders are slow: run them after the check, one by one.
+            let (db, cache_dir) = (mw.db.clone(), mw.cache_dir.clone());
+            let done = gio::spawn_blocking(move || {
+                let thumbs = photon_import::thumbnails::ThumbnailGenerator::new(cache_dir);
+                let Ok(conn) = db.conn() else { return Vec::new() };
+                let mut hashes = Vec::new();
+                for (id, path, xmp_path, hash) in rerender {
+                    match thumbs.refresh_after_darktable_edit(&conn, id, &path, &xmp_path, &hash) {
+                        Ok(()) => hashes.push(hash),
+                        Err(e) => log::warn!("Re-rendering {}: {e:#}", path.display()),
+                    }
+                }
+                hashes
+            })
+            .await
+            .unwrap_or_default();
+            if !done.is_empty() {
+                for hash in &done {
+                    crate::ui::photo_view::invalidate_full_res(hash);
+                }
                 mw.refresh();
             }
         });
@@ -1033,72 +1178,118 @@ impl MainWindow {
     /// Show `filter` in the virtualized timeline. Reuses the loaded timeline
     /// (and its scroll position) when nothing changed.
     fn show_timeline(&self, filter: TimelineFilter, title: String) {
-        let effective_filter = if self.blur_filter.get() {
-            // The same threshold as Analyse Photo Quality uses outside bursts.
-            let median = self
-                .db
-                .conn()
-                .ok()
-                .and_then(|c| queries::library_sharpness_median(&c, photon_import::QUALITY_VERSION).ok().flatten());
-            TimelineFilter::Blurred(median.map_or(photon_import::quality::BLUR_SHARPNESS_FLOOR, |m| {
-                m * photon_import::quality::BLUR_RATIO_OF_LIBRARY_MEDIAN
-            }))
-        } else {
-            filter.clone()
-        };
+        let same = self.timeline_filter.borrow().as_ref() == Some(&filter);
+        if same && !self.timeline_stale.get() {
+            let count = self.current_photos.borrow().len();
+            let count_str = if count == 1 { "1 photo" } else { &format!("{count} photos") };
+            let is_filtered = self.rating_filter.get() != RatingFilter::Any
+                || self.cull_flag.get().is_some()
+                || self.color_filter.get().is_some()
+                || self.blur_filter.get();
+            let filter_tag = if is_filtered { " · Filtered" } else { "" };
+            let subtitle = format!("{title} · {count_str}{filter_tag}");
+            self.window_title.set_subtitle(&subtitle);
+            self.status_label.set_text(&subtitle);
+            self.update_bottom_bar_status(&subtitle);
+            self.set_bottom_bar_revealed(true);
 
-        let same = self.timeline_filter.borrow().as_ref() == Some(&effective_filter);
-        if !same || self.timeline_stale.get() {
+            if count == 0 {
+                self.show_cards();
+                let msg = match self.last_grid_action.borrow().clone() {
+                    UIAction::ShowAll => "No photos yet. Import some!".to_string(),
+                    UIAction::Search(t) => format!("No results for \"{t}\""),
+                    _ => format!("No photos on {title}"),
+                };
+                return self.show_empty(&msg);
+            }
+            self.clear_viewer();
+            self.clear_timeline();
+            self.stack.set_visible_child_name("timeline");
+            return;
+        }
+
+        // R-12: Offload timeline query from GTK main UI thread
+        let gen = self.timeline_generation.get().wrapping_add(1);
+        self.timeline_generation.set(gen);
+
+        let is_blur = self.blur_filter.get();
+        let rating = self.rating_filter.get();
+        let flag = self.cull_flag.get();
+        let color = self.color_filter.get();
+        let db = self.db.clone();
+        let filter_c = filter.clone();
+        let mw = self.clone();
+
+        glib::spawn_future_local(async move {
             let started = std::time::Instant::now();
-            let items = match self.db.conn() {
-                Ok(conn) => {
-                    queries::timeline_items_with_filters(
-                        &conn,
-                        &effective_filter,
-                        self.rating_filter.get(),
-                        self.cull_flag.get(),
-                        self.color_filter.get(),
-                    ).unwrap_or_else(|e| {
-                        log::error!("Timeline query failed: {e}");
-                        Vec::new()
-                    })
+            let result = gio::spawn_blocking(move || -> Result<(TimelineFilter, Vec<TimelineItem>), String> {
+                let conn = db.conn().map_err(|e| e.to_string())?;
+                let effective_filter = if is_blur {
+                    let median = queries::library_sharpness_median(&conn, photon_import::QUALITY_VERSION)
+                        .ok()
+                        .flatten();
+                    TimelineFilter::Blurred(median.map_or(photon_import::quality::BLUR_SHARPNESS_FLOOR, |m| {
+                        m * photon_import::quality::BLUR_RATIO_OF_LIBRARY_MEDIAN
+                    }))
+                } else {
+                    filter_c
+                };
+                let items = queries::timeline_items_with_filters(
+                    &conn,
+                    &effective_filter,
+                    rating,
+                    flag,
+                    color,
+                ).map_err(|e| e.to_string())?;
+                Ok((effective_filter, items))
+            })
+            .await;
+
+            if mw.timeline_generation.get() != gen {
+                return;
+            }
+
+            match result {
+                Ok(Ok((effective_filter, items))) => {
+                    let same = mw.timeline_filter.borrow().as_ref() == Some(&effective_filter);
+                    let count = items.len();
+                    let items = Rc::new(items);
+                    *mw.current_photos.borrow_mut() = items.clone();
+                    mw.timeline.set_items(items, true, same);
+                    log::debug!("Timeline: {count} photos loaded and laid out in {:?}", started.elapsed());
+                    *mw.timeline_filter.borrow_mut() = Some(effective_filter);
+                    mw.timeline_stale.set(false);
+
+                    let count_str = if count == 1 { "1 photo" } else { &format!("{count} photos") };
+                    let is_filtered = rating != RatingFilter::Any
+                        || flag.is_some()
+                        || color.is_some()
+                        || is_blur;
+                    let filter_tag = if is_filtered { " · Filtered" } else { "" };
+                    let subtitle = format!("{title} · {count_str}{filter_tag}");
+                    mw.window_title.set_subtitle(&subtitle);
+                    mw.status_label.set_text(&subtitle);
+                    mw.update_bottom_bar_status(&subtitle);
+                    mw.set_bottom_bar_revealed(true);
+
+                    if count == 0 {
+                        mw.show_cards();
+                        let msg = match mw.last_grid_action.borrow().clone() {
+                            UIAction::ShowAll => "No photos yet. Import some!".to_string(),
+                            UIAction::Search(t) => format!("No results for \"{t}\""),
+                            _ => format!("No photos on {title}"),
+                        };
+                        mw.show_empty(&msg);
+                    } else {
+                        mw.clear_viewer();
+                        mw.clear_timeline();
+                        mw.stack.set_visible_child_name("timeline");
+                    }
                 }
-                Err(e) => return self.show_error(&e.to_string()),
-            };
-            let items = Rc::new(items);
-            *self.current_photos.borrow_mut() = items.clone();
-            let count = items.len();
-            self.timeline.set_items(items, true, same);
-            log::debug!("Timeline: {count} photos loaded and laid out in {:?}", started.elapsed());
-            *self.timeline_filter.borrow_mut() = Some(effective_filter);
-            self.timeline_stale.set(false);
-        }
-
-        let count = self.current_photos.borrow().len();
-        let count_str = if count == 1 { "1 photo" } else { &format!("{count} photos") };
-        let is_filtered = self.rating_filter.get() != RatingFilter::Any
-            || self.cull_flag.get().is_some()
-            || self.color_filter.get().is_some()
-            || self.blur_filter.get();
-        let filter_tag = if is_filtered { " · Filtered" } else { "" };
-        let subtitle = format!("{title} · {count_str}{filter_tag}");
-        self.window_title.set_subtitle(&subtitle);
-        self.status_label.set_text(&subtitle);
-        self.update_bottom_bar_status(&subtitle);
-        self.set_bottom_bar_revealed(true);
-
-        if count == 0 {
-            self.show_cards();
-            let msg = match self.last_grid_action.borrow().clone() {
-                UIAction::ShowAll => "No photos yet. Import some!".to_string(),
-                UIAction::Search(t) => format!("No results for \"{t}\""),
-                _ => format!("No photos on {title}"),
-            };
-            return self.show_empty(&msg);
-        }
-        self.clear_viewer();
-        self.clear_timeline(); // drop a viewer we are returning from
-        self.stack.set_visible_child_name("timeline");
+                Ok(Err(e)) => mw.show_error(&e),
+                Err(_) => mw.show_error("Timeline loader panicked"),
+            }
+        });
     }
 
     // ── Views ───────────────────────────────────────────

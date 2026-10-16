@@ -42,6 +42,8 @@ pub fn run_migrations(conn: &Connection) -> Result<(), PhotonError> {
         (16, MIGRATION_016_FACE_SHARPNESS),
         (17, MIGRATION_017_COLOR_LABELS_AND_SMART_COLLECTIONS),
         (18, MIGRATION_018_HIERARCHICAL_TAGS),
+        (19, MIGRATION_019_DARKTABLE_EDITED_AND_FTS_OPT),
+        (20, MIGRATION_020_XCF_PROJECT),
     ];
 
     for (version, sql) in migrations {
@@ -378,6 +380,59 @@ CREATE TABLE IF NOT EXISTS smart_collections (
 const MIGRATION_018_HIERARCHICAL_TAGS: &str = "
 ALTER TABLE tags ADD COLUMN parent_id INTEGER REFERENCES tags(id) ON DELETE CASCADE;
 CREATE INDEX IF NOT EXISTS idx_tags_parent ON tags(parent_id);
+";
+
+// ---------------------------------------------------------------------------
+// Migration 019: darktable edited badge (R-15) & FTS index optimization (R-12)
+// ---------------------------------------------------------------------------
+const MIGRATION_019_DARKTABLE_EDITED_AND_FTS_OPT: &str = "
+ALTER TABLE images ADD COLUMN edited INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_images_edited ON images(edited) WHERE edited > 0;
+
+-- Drop old FTS triggers and table to eliminate large metadata_json indexing (R-12)
+DROP TRIGGER IF EXISTS images_ai;
+DROP TRIGGER IF EXISTS images_ad;
+DROP TRIGGER IF EXISTS images_au;
+DROP TABLE IF EXISTS images_fts;
+
+-- Recreate FTS5 indexing only fields people search (filename, camera_make, camera_model, lens_model, title, description)
+CREATE VIRTUAL TABLE IF NOT EXISTS images_fts USING fts5(
+    filename,
+    camera_make,
+    camera_model,
+    lens_model,
+    title,
+    description,
+    content = 'images',
+    content_rowid = 'id'
+);
+
+CREATE TRIGGER IF NOT EXISTS images_ai AFTER INSERT ON images BEGIN
+    INSERT INTO images_fts(rowid, filename, camera_make, camera_model, lens_model, title, description)
+    VALUES (new.id, new.filename, new.camera_make, new.camera_model, new.lens_model, new.title, new.description);
+END;
+
+CREATE TRIGGER IF NOT EXISTS images_ad AFTER DELETE ON images BEGIN
+    INSERT INTO images_fts(images_fts, rowid, filename, camera_make, camera_model, lens_model, title, description)
+    VALUES ('delete', old.id, old.filename, old.camera_make, old.camera_model, old.lens_model, old.title, old.description);
+END;
+
+CREATE TRIGGER IF NOT EXISTS images_au AFTER UPDATE ON images BEGIN
+    INSERT INTO images_fts(images_fts, rowid, filename, camera_make, camera_model, lens_model, title, description)
+    VALUES ('delete', old.id, old.filename, old.camera_make, old.camera_model, old.lens_model, old.title, old.description);
+    INSERT INTO images_fts(rowid, filename, camera_make, camera_model, lens_model, title, description)
+    VALUES (new.id, new.filename, new.camera_make, new.camera_model, new.lens_model, new.title, new.description);
+END;
+
+-- Rebuild FTS index from existing images
+INSERT INTO images_fts(images_fts) VALUES('rebuild');
+";
+
+// ---------------------------------------------------------------------------
+// Migration 020: a GIMP project (.xcf) with the photo's stem sits beside it
+// ---------------------------------------------------------------------------
+const MIGRATION_020_XCF_PROJECT: &str = "
+ALTER TABLE images ADD COLUMN has_xcf INTEGER NOT NULL DEFAULT 0;
 ";
 
 #[cfg(test)]

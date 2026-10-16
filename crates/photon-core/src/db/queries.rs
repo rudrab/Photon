@@ -24,14 +24,14 @@ pub fn insert_image(tx: &Transaction, img: &Image) -> Result<Option<i64>, Photon
             camera_make, camera_model, lens_model, focal_length, aperture, shutter_speed, iso,
             latitude, longitude, location_name,
             rating, flagged, hidden, title, description, group_hash, orientation, original_filename,
-            thumbhash, color_label
+            thumbhash, color_label, edited
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6,
             ?7, ?8, ?9, ?10, ?11, ?12,
             ?13, ?14, ?15, ?16, ?17, ?18, ?19,
             ?20, ?21, ?22,
             ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-            ?31, ?32
+            ?31, ?32, ?33
         )",
     )?;
     let changed = stmt.execute(params![
@@ -67,6 +67,7 @@ pub fn insert_image(tx: &Transaction, img: &Image) -> Result<Option<i64>, Photon
             img.original_filename,
             img.thumbhash,
             img.color_label.as_i32(),
+            img.edited as i32,
     ])?;
 
     if changed > 0 {
@@ -226,7 +227,7 @@ pub fn duplicate_keys(conn: &Connection) -> Result<HashSet<DuplicateKey>, Photon
 // 19: iso         20: latitude     21: longitude    22: location_name
 // 23: rating      24: flagged      25: hidden       26: title
 // 27: description 28: group_hash 29: orientation 30: original_filename
-// 31: thumbhash 32: xmp_mtime 33: missing 34: color_label
+// 31: thumbhash 32: xmp_mtime 33: missing 34: color_label 35: edited
 
 const IMAGE_SELECT: &str = "SELECT id, hash, path, filename, size_bytes, width, height,
             created_at, imported_at, format, has_sidecar, metadata_json, thumbnail_hash,
@@ -234,7 +235,7 @@ const IMAGE_SELECT: &str = "SELECT id, hash, path, filename, size_bytes, width, 
             latitude, longitude, location_name,
             rating, flagged, hidden, title, description, group_hash, orientation,
             original_filename, thumbhash, xmp_mtime, COALESCE(missing, 0) as missing,
-            COALESCE(color_label, 0) as color_label
+            COALESCE(color_label, 0) as color_label, COALESCE(edited, 0) as edited
      FROM images";
 
 fn row_to_image(row: &rusqlite::Row) -> rusqlite::Result<Image> {
@@ -275,6 +276,7 @@ fn row_to_image(row: &rusqlite::Row) -> rusqlite::Result<Image> {
         xmp_mtime: row.get(32)?,
         missing: row.get::<_, i32>(33).unwrap_or(0) != 0,
         color_label: crate::models::ColorLabel::from_i32(row.get::<_, i32>(34).unwrap_or(0)),
+        edited: row.get::<_, i32>(35).unwrap_or(0) != 0,
         is_video: false,
         duration: None,
     })
@@ -428,15 +430,28 @@ pub fn collapse_versions(items: Vec<TimelineItem>) -> Vec<TimelineItem> {
                 let kept = &mut out[i];
                 let versions = kept.versions.max(1) + 1;
                 let any_raw = kept.is_raw || kept.has_raw_version || item.is_raw;
+                let any_edited = kept.is_edited || item.is_edited;
+                let any_xcf = kept.has_xcf || item.has_xcf;
                 if kept.is_raw && !item.is_raw {
                     *kept = item;
                 }
                 kept.versions = versions;
                 kept.has_raw_version = any_raw && !kept.is_raw;
+                kept.is_edited = any_edited;
+                kept.has_xcf = any_xcf;
             }
         }
     }
     out
+}
+
+/// Set the `edited` status of an image.
+pub fn set_image_edited(conn: &Connection, id: i64, edited: bool) -> Result<(), PhotonError> {
+    conn.execute(
+        "UPDATE images SET edited = ?1 WHERE id = ?2",
+        params![if edited { 1 } else { 0 }, id],
+    )?;
+    Ok(())
 }
 
 /// `ids` and every other file of the same shots (same `group_hash`).
@@ -501,7 +516,7 @@ pub fn timeline_items_with_filters(
     flag: Option<i32>,
     color: Option<ColorLabel>,
 ) -> Result<Vec<TimelineItem>, PhotonError> {
-    const COLS: &str = "SELECT id, hash, created_at, width, height, orientation, thumbhash, rating, flagged, format, metadata_json, COALESCE(missing, 0), group_hash, COALESCE(color_label, 0) FROM images";
+    const COLS: &str = "SELECT id, hash, created_at, width, height, orientation, thumbhash, rating, flagged, format, CASE WHEN format IN ('mp4','mov','avi','mkv','webm') THEN metadata_json ELSE NULL END, COALESCE(missing, 0), group_hash, COALESCE(color_label, 0), COALESCE(edited, 0), COALESCE(has_xcf, 0) FROM images";
     const ORDER: &str = "ORDER BY COALESCE(created_at, imported_at) DESC, id DESC";
 
     let map = |r: &rusqlite::Row| -> rusqlite::Result<TimelineItem> {
@@ -512,6 +527,8 @@ pub fn timeline_items_with_filters(
         let duration = meta_json.as_deref().and_then(parse_duration_from_meta);
         let missing_val: i32 = r.get(11).unwrap_or(0);
         let color_val: i32 = r.get(13).unwrap_or(0);
+        let edited_val: i32 = r.get(14).unwrap_or(0);
+        let xcf_val: i32 = r.get(15).unwrap_or(0);
         Ok(TimelineItem {
             id: r.get(0)?,
             hash: r.get(1)?,
@@ -530,6 +547,8 @@ pub fn timeline_items_with_filters(
             is_raw: format.map_or(false, |f| f.is_raw()),
             versions: 1,
             has_raw_version: false,
+            is_edited: edited_val != 0,
+            has_xcf: xcf_val != 0,
         })
     };
 
@@ -2418,6 +2437,9 @@ pub fn update_from_xmp(
     if let Some(cl) = xmp.color_label {
         tx.execute("UPDATE images SET color_label = ?1 WHERE id = ?2", params![cl.as_i32(), id])?;
     }
+    if let Some(edited) = xmp.is_edited {
+        tx.execute("UPDATE images SET edited = ?1 WHERE id = ?2", params![if edited { 1 } else { 0 }, id])?;
+    }
     tx.execute("UPDATE images SET xmp_mtime = ?1 WHERE id = ?2", params![xmp_mtime, id])?;
 
     // A sidecar with keywords has all of the photo's tags (every tag change
@@ -2495,18 +2517,42 @@ pub fn relink_image(conn: &Connection, id: i64, new_path: &str) -> Result<(), Ph
     Ok(())
 }
 
-pub fn get_all_images_for_integrity_check(
-    conn: &Connection,
-) -> Result<Vec<(i64, PathBuf, Option<i64>, bool)>, PhotonError> {
-    let mut stmt = conn.prepare("SELECT id, path, xmp_mtime, missing FROM images WHERE hidden = 0")?;
+/// What the library check needs of each visible photo.
+pub struct IntegrityRow {
+    pub id: i64,
+    pub path: PathBuf,
+    pub hash: String,
+    pub xmp_mtime: Option<i64>,
+    pub missing: bool,
+    pub has_xcf: bool,
+}
+
+pub fn get_all_images_for_integrity_check(conn: &Connection) -> Result<Vec<IntegrityRow>, PhotonError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, path, hash, xmp_mtime, COALESCE(missing, 0), COALESCE(has_xcf, 0) FROM images WHERE hidden = 0",
+    )?;
     let rows = stmt.query_map([], |row| {
-        let id: i64 = row.get(0)?;
-        let path_str: String = row.get(1)?;
-        let xmp_mtime: Option<i64> = row.get(2)?;
-        let missing_val: i32 = row.get(3).unwrap_or(0);
-        Ok((id, PathBuf::from(path_str), xmp_mtime, missing_val != 0))
+        Ok(IntegrityRow {
+            id: row.get(0)?,
+            path: PathBuf::from(row.get::<_, String>(1)?),
+            hash: row.get(2)?,
+            xmp_mtime: row.get(3)?,
+            missing: row.get::<_, i32>(4)? != 0,
+            has_xcf: row.get::<_, i32>(5)? != 0,
+        })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Record whether a GIMP project sits beside each of `ids`.
+pub fn set_has_xcf(conn: &Connection, ids: &[i64], has_xcf: bool) -> Result<(), PhotonError> {
+    for chunk in ids.chunks(1000) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!("UPDATE images SET has_xcf = {} WHERE id IN ({placeholders})", has_xcf as i32);
+        let params: Vec<&dyn rusqlite::types::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        conn.prepare(&sql)?.execute(params.as_slice())?;
+    }
+    Ok(())
 }
 
 /// Save export preset `name`, replacing one of the same name. `config_json`

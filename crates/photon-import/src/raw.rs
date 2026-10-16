@@ -211,6 +211,53 @@ pub fn render_with_darktable(raw: &Path, xmp: Option<&Path>, space: ColorSpace, 
     image::open(&out).context("Reading darktable's render")
 }
 
+/// Render `raw` through darktable downsampled to `max_width` (for Large/Grid preview generation, R-15).
+/// Upright, sRGB, using private config and serialized with DarktableTurn.
+pub fn render_darktable_preview(raw: &Path, xmp: Option<&Path>, max_width: u32) -> Result<DynamicImage> {
+    let cli = darktable_cli().context("darktable-cli is not installed")?;
+    let _turn = DarktableTurn::take();
+
+    let work = tempfile::Builder::new().prefix("photon-darktable-thumb-").tempdir()?;
+    let configdir = private_darktable_config(work.path())?;
+    let out = work.path().join("preview.jpg");
+
+    let mut cmd = Command::new(cli);
+    cmd.arg(raw);
+    if let Some(xmp) = xmp {
+        cmd.arg(xmp);
+    }
+    let width_str = max_width.to_string();
+    cmd.arg(&out)
+        .args(["--width", &width_str, "--core", "--configdir"])
+        .arg(&configdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().context("Starting darktable-cli")?;
+
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() > DARKTABLE_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("darktable-cli took over {} s; abandoned", DARKTABLE_TIMEOUT.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    if !status.success() || !out.exists() {
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = std::io::Read::read_to_string(&mut pipe, &mut stderr);
+        }
+        let last = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no output");
+        bail!("darktable-cli preview failed ({status}): {}", last.trim());
+    }
+    image::open(&out).context("Reading darktable's preview render")
+}
+
 /// Most darktable renders running at once.
 fn darktable_slots() -> usize {
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
