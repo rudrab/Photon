@@ -103,6 +103,7 @@ impl Form {
             sharpening: SHARPENING[self.sharpening.selected() as usize % SHARPENING.len()].1,
             watermark,
             color_space: ColorSpace::ALL[self.color_space.selected() as usize % ColorSpace::ALL.len()],
+            copyright: Default::default(),
         }
     }
 
@@ -230,6 +231,7 @@ pub fn show(
     parent: &impl IsA<Window>,
     db: Database,
     images: Vec<Image>,
+    copyright: photon_core::models::CopyrightInfo,
     on_start: impl Fn(usize) + 'static,
     on_progress: impl Fn(usize, usize) + 'static,
     on_done: impl Fn(ExportReport) + 'static,
@@ -564,7 +566,8 @@ pub fn show(
     let done_cb = Rc::new(on_done);
     let d = dialog.clone();
     export_btn.connect_clicked(move |_| {
-        let config = form.read();
+        let mut config = form.read();
+        config.copyright = copyright.clone();
         if let Some(wm) = &config.watermark {
             if wm.text.is_none() && wm.image_path.is_none() {
                 form.wm_text.grab_focus();

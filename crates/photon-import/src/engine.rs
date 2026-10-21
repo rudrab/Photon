@@ -31,7 +31,7 @@ use crate::thumbnails::{ThumbSize, ThumbnailGenerator};
 use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
 use photon_core::db::queries::{self, DuplicateKey};
 use photon_core::db::Database;
-use photon_core::models::{FolderImportMode, Image, ImportBatch, ImportProgress};
+use photon_core::models::{CopyrightInfo, FolderImportMode, Image, ImportBatch, ImportProgress};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -71,6 +71,9 @@ pub struct ImportConfig {
     /// them in [`ImportBatch::removable_sources`] so the caller (e.g. the GUI)
     /// can ask for confirmation before deleting them from the SD card / source.
     pub defer_source_removal: bool,
+    /// Creator and copyright written to each new photo's sidecar (only the
+    /// fields the sidecar doesn't already have). Empty: no sidecar is touched.
+    pub copyright: CopyrightInfo,
     pub cancel: CancelToken,
 }
 
@@ -87,6 +90,7 @@ impl Default for ImportConfig {
             verify: true,
             backup_dir: None,
             defer_source_removal: false,
+            copyright: CopyrightInfo::default(),
             cancel: CancelToken::default(),
         }
     }
@@ -386,6 +390,12 @@ impl ImportEngine {
                 if let Some(id) = img.id {
                     if let Err(e) = crate::sidecar::read_image_xmp(&mut conn, id, &img.path, None) {
                         log::warn!("Could not update image {id} from XMP: {e}");
+                    }
+                    if !config.copyright.is_empty() {
+                        let update = crate::sidecar::XmpUpdate { copyright: Some(&config.copyright), ..Default::default() };
+                        if let Err(e) = crate::sidecar::write_image_xmp(&conn, id, &img.path, &update) {
+                            log::warn!("Could not write the copyright to the sidecar of image {id}: {e}");
+                        }
                     }
                     // Only after the database transaction commits (setting `img.id`)
                     // may a Move import remove or queue removal of the original file.

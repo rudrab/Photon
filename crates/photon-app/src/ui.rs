@@ -1,6 +1,7 @@
 //! UI components for the Photon application.
 
 pub mod batch_tags;
+pub mod time_shift_dialog;
 pub mod compare;
 pub mod detail;
 pub mod export_dialog;

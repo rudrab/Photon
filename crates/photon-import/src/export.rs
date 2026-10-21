@@ -16,7 +16,7 @@ use fast_image_resize::{PixelType, ResizeOptions, Resizer};
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::{ColorType, DynamicImage, ImageEncoder, Rgb, RgbImage, RgbaImage};
-use photon_core::models::Image;
+use photon_core::models::{CopyrightInfo, Image};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
@@ -153,6 +153,10 @@ pub struct ExportConfig {
     pub sharpening: Sharpening,
     pub watermark: Option<WatermarkConfig>,
     pub color_space: ColorSpace,
+    /// Creator and copyright to embed where the photo has none (with
+    /// `preserve_metadata`). From Preferences, not part of a saved preset.
+    #[serde(skip)]
+    pub copyright: CopyrightInfo,
 }
 
 /// How RAW files are turned into pixels for export.
@@ -182,6 +186,7 @@ impl Default for ExportConfig {
             raw_renderer: RawRenderer::default(),
             sharpening: Sharpening::None,
             watermark: None,
+            copyright: CopyrightInfo::default(),
             color_space: ColorSpace::default(),
         }
     }
@@ -246,6 +251,7 @@ pub fn export_single_with_warning(
         title: image.title.as_deref().filter(|t| !t.is_empty()),
         description: image.description.as_deref().filter(|d| !d.is_empty()),
         keywords,
+        copyright: &config.copyright,
     };
     let tmp_path = dest_path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
     let result = (|| -> Result<Vec<String>> {
@@ -272,6 +278,7 @@ pub fn export_single_with_warning(
             title: embed.title,
             description: embed.description,
             keywords: (!keywords.is_empty()).then_some(sidecar::Keywords { tags: keywords, known: keywords, hierarchical: None }),
+            copyright: Some(&config.copyright),
             ..Default::default()
         };
         if let Err(e) = sidecar::sync_xmp_metadata(&dest_path, &update) {
@@ -755,11 +762,16 @@ struct Embed<'a> {
     title: Option<&'a str>,
     description: Option<&'a str>,
     keywords: &'a [String],
+    copyright: &'a CopyrightInfo,
 }
 
 impl Embed<'_> {
     fn has_library_fields(&self) -> bool {
-        self.rating > 0 || self.title.is_some() || self.description.is_some() || !self.keywords.is_empty()
+        self.rating > 0
+            || self.title.is_some()
+            || self.description.is_some()
+            || !self.keywords.is_empty()
+            || !self.copyright.is_empty()
     }
 }
 
@@ -860,7 +872,44 @@ fn embed_metadata(out: &Path, format: ExportFormat, e: &Embed) -> Result<Vec<Str
         )),
         Err(err) => warnings.push(format!("Metadata not embedded: exiftool: {err}")),
     }
+    if e.metadata {
+        if let Some(w) = embed_copyright(out, e.copyright) {
+            warnings.push(w);
+        }
+    }
     Ok(warnings)
+}
+
+/// Add the creator and copyright to `out` with exiftool, only where the file
+/// (which has just received the source's metadata) doesn't already have them
+/// (`-wm cg`: create tags, never overwrite).
+fn embed_copyright(out: &Path, c: &CopyrightInfo) -> Option<String> {
+    if c.is_empty() {
+        return None;
+    }
+    let mut cmd = std::process::Command::new("exiftool");
+    cmd.args(["-q", "-q", "-m", "-overwrite_original", "-wm", "cg", "-charset", "iptc=UTF8", "-IPTC:CodedCharacterSet=UTF8"]);
+    let (creator, notice, terms) = (c.creator.trim(), c.notice.trim(), c.usage_terms.trim());
+    if !creator.is_empty() {
+        cmd.args([format!("-XMP-dc:Creator={creator}"), format!("-IPTC:By-line={creator}"), format!("-EXIF:Artist={creator}")]);
+    }
+    if !notice.is_empty() {
+        cmd.args([format!("-XMP-dc:Rights={notice}"), format!("-IPTC:CopyrightNotice={notice}"), format!("-EXIF:Copyright={notice}")]);
+    }
+    if !terms.is_empty() {
+        cmd.arg(format!("-XMP-xmpRights:UsageTerms={terms}"));
+    }
+    if !c.contact_email.trim().is_empty() {
+        cmd.arg(format!("-XMP-iptcCore:CreatorWorkEmail={}", c.contact_email.trim()));
+    }
+    if !c.contact_url.trim().is_empty() {
+        cmd.arg(format!("-XMP-iptcCore:CreatorWorkURL={}", c.contact_url.trim()));
+    }
+    match cmd.arg(out).output() {
+        Ok(o) if o.status.success() => None,
+        Ok(o) => Some(format!("Copyright not embedded: exiftool: {}", String::from_utf8_lossy(&o.stderr).trim())),
+        Err(err) => Some(format!("Copyright not embedded: exiftool: {err}")),
+    }
 }
 
 pub fn exiftool_installed() -> bool {
@@ -908,6 +957,7 @@ fn embed_jpeg_metadata(out: &Path, e: &Embed) -> Result<bool> {
             description: e.description,
             keywords: (!e.keywords.is_empty()).then_some(sidecar::Keywords { tags: e.keywords, known: e.keywords, hierarchical: None }),
             orientation: xmp.is_some().then_some(1),
+            copyright: Some(e.copyright),
             ..Default::default()
         };
         xmp = sidecar::merged_xmp(xmp.as_deref(), &update);
@@ -1418,6 +1468,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn export_carries_the_copyright_template() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_with_exif(&dir.path().join("src.jpg"));
+        let config = ExportConfig {
+            destination_dir: dir.path().join("out"),
+            preserve_metadata: true,
+            copyright: CopyrightInfo {
+                creator: "Jane Doe".into(),
+                notice: "© 2026 Jane Doe".into(),
+                usage_terms: "All rights reserved".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let out = export_single(&src, &config).unwrap();
+        let bytes = fs::read(&out).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("Jane Doe"), "creator is in the file");
+        assert!(text.contains("© 2026 Jane Doe") || text.contains("\u{a9} 2026 Jane Doe") || text.contains("2026 Jane Doe"));
+        assert!(text.contains("All rights reserved"));
+    }
+
+    static NO_COPYRIGHT: CopyrightInfo = CopyrightInfo {
+        creator: String::new(),
+        notice: String::new(),
+        contact_email: String::new(),
+        contact_url: String::new(),
+        usage_terms: String::new(),
+    };
+
     fn embed_for<'a>(source: &'a std::path::Path, keywords: &'a [String]) -> Embed<'a> {
         Embed {
             source,
@@ -1429,6 +1510,7 @@ mod tests {
             title: None,
             description: None,
             keywords,
+            copyright: &NO_COPYRIGHT,
         }
     }
 

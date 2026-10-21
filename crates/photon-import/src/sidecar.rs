@@ -10,7 +10,7 @@
 //! opened in Adobe or Darktable workflows. Rejects, by contrast, use the
 //! universal `xmp:Rating="-1"` convention and ARE written to sidecars.
 
-use photon_core::models::{strip_edit_suffix, ColorLabel};
+use photon_core::models::{strip_edit_suffix, ColorLabel, CopyrightInfo};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -103,6 +103,13 @@ pub struct XmpUpdate<'a> {
     pub description: Option<&'a str>,
     /// EXIF orientation tag (1–8), written as `tiff:Orientation`.
     pub orientation: Option<u16>,
+    /// Capture time as the library keeps it (the camera's wall-clock time as a
+    /// Unix timestamp, no zone). Written as `exif:DateTimeOriginal`.
+    pub capture_time: Option<i64>,
+    /// Creator, copyright and contact (`dc:creator`, `dc:rights`,
+    /// `xmpRights:UsageTerms`, `Iptc4xmpCore:CreatorContactInfo`). Only fields
+    /// the file doesn't have yet are filled: another creator's notice is kept.
+    pub copyright: Option<&'a CopyrightInfo>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -114,6 +121,9 @@ pub struct Keywords<'a> {
 
 const XMP_NS: &str = "http://ns.adobe.com/xap/1.0/";
 const DC_NS: &str = "http://purl.org/dc/elements/1.1/";
+const XMP_RIGHTS_NS: &str = "http://ns.adobe.com/xap/1.0/rights/";
+const IPTC_CORE_NS: &str = "http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/";
+const EXIF_NS: &str = "http://ns.adobe.com/exif/1.0/";
 const TIFF_NS: &str = "http://ns.adobe.com/tiff/1.0/";
 const DARKTABLE_NS: &str = "http://darktable.sf.net/";
 const LR_NS: &str = "http://ns.adobe.com/lightroom/1.0/";
@@ -236,7 +246,68 @@ fn merge_xmp(doc: &str, update: &XmpUpdate) -> Option<String> {
         set_simple(&mut doc, "tiff:Orientation", &orientation.to_string());
         ensure_namespace(&mut doc, "tiff", TIFF_NS);
     }
+    if let Some(time) = update.capture_time.and_then(|t| chrono::DateTime::from_timestamp(t, 0)) {
+        let text = time.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string();
+        set_simple(&mut doc, "exif:DateTimeOriginal", &text);
+        ensure_namespace(&mut doc, "exif", EXIF_NS);
+    }
+    if let Some(info) = update.copyright {
+        fill_copyright(&mut doc, info);
+    }
     Some(doc)
+}
+
+/// Does the file already say something for element or attribute `name`?
+fn has_value(doc: &str, name: &str) -> bool {
+    if property(doc, name).is_some_and(|v| !v.trim().is_empty()) {
+        return true;
+    }
+    element(doc, name).is_some_and(|(s, e)| list_items(&doc[s..e]).iter().any(|i| !i.trim().is_empty()))
+}
+
+/// Add the creator and copyright fields that `doc` doesn't have yet.
+fn fill_copyright(doc: &mut String, info: &CopyrightInfo) {
+    let alt = |name: &str, text: &str| {
+        format!(
+            "   <{name}>\n    <rdf:Alt>\n     <rdf:li xml:lang=\"x-default\">{}</rdf:li>\n    </rdf:Alt>\n   </{name}>\n",
+            xml_escape(text)
+        )
+    };
+    let creator = info.creator.trim();
+    if !creator.is_empty() && !has_value(doc, "dc:creator") {
+        let xml = format!(
+            "   <dc:creator>\n    <rdf:Seq>\n     <rdf:li>{}</rdf:li>\n    </rdf:Seq>\n   </dc:creator>\n",
+            xml_escape(creator)
+        );
+        replace_or_insert(doc, "dc:creator", &xml);
+    }
+    let notice = info.notice.trim();
+    if !notice.is_empty() && !has_value(doc, "dc:rights") {
+        replace_or_insert(doc, "dc:rights", &alt("dc:rights", notice));
+    }
+    let terms = info.usage_terms.trim();
+    if !terms.is_empty() && !has_value(doc, "xmpRights:UsageTerms") {
+        replace_or_insert(doc, "xmpRights:UsageTerms", &alt("xmpRights:UsageTerms", terms));
+        ensure_namespace(doc, "xmpRights", XMP_RIGHTS_NS);
+    }
+    let (email, url) = (info.contact_email.trim(), info.contact_url.trim());
+    let has_contact = element(doc, "Iptc4xmpCore:CreatorContactInfo").is_some()
+        || has_value(doc, "Iptc4xmpCore:CiEmailWork")
+        || has_value(doc, "Iptc4xmpCore:CiUrlWork");
+    if (!email.is_empty() || !url.is_empty()) && !has_contact {
+        let mut fields = String::new();
+        if !email.is_empty() {
+            fields.push_str(&format!("     <Iptc4xmpCore:CiEmailWork>{}</Iptc4xmpCore:CiEmailWork>\n", xml_escape(email)));
+        }
+        if !url.is_empty() {
+            fields.push_str(&format!("     <Iptc4xmpCore:CiUrlWork>{}</Iptc4xmpCore:CiUrlWork>\n", xml_escape(url)));
+        }
+        let xml = format!(
+            "   <Iptc4xmpCore:CreatorContactInfo rdf:parseType=\"Resource\">\n{fields}   </Iptc4xmpCore:CreatorContactInfo>\n"
+        );
+        replace_or_insert(doc, "Iptc4xmpCore:CreatorContactInfo", &xml);
+        ensure_namespace(doc, "Iptc4xmpCore", IPTC_CORE_NS);
+    }
 }
 
 fn set_keywords(doc: &mut String, keywords: Keywords) {
@@ -1224,6 +1295,67 @@ mod tests {
         let xml = std::fs::read_to_string(&xmp).unwrap();
         assert_eq!(history(&xml), history(DARKTABLE_XMP));
         assert_eq!(property(&xml, "xmp:Rating").as_deref(), Some("5"));
+    }
+
+    #[test]
+    fn capture_time_is_written_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("P1010002.ORF");
+        std::fs::write(&img, b"raw").unwrap();
+        let xmp = dir.path().join("P1010002.ORF.xmp");
+        std::fs::write(&xmp, DARKTABLE_XMP).unwrap();
+
+        // 2026-10-21 14:02:11, camera wall-clock time.
+        let t = chrono::NaiveDate::from_ymd_opt(2026, 10, 21)
+            .unwrap()
+            .and_hms_opt(14, 2, 11)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        let written = sync_xmp_metadata(&img, &XmpUpdate { capture_time: Some(t), ..Default::default() }).unwrap();
+        let xml = std::fs::read_to_string(&written).unwrap();
+        assert_eq!(property(&xml, "exif:DateTimeOriginal").as_deref(), Some("2026-10-21T14:02:11"));
+        assert!(xml.contains(r#"xmlns:exif="http://ns.adobe.com/exif/1.0/""#));
+        assert_eq!(history(&xml), history(DARKTABLE_XMP));
+
+        // Shifting again replaces the value instead of adding a second one.
+        sync_xmp_metadata(&img, &XmpUpdate { capture_time: Some(t + 7200), ..Default::default() }).unwrap();
+        let xml = std::fs::read_to_string(&written).unwrap();
+        assert_eq!(property(&xml, "exif:DateTimeOriginal").as_deref(), Some("2026-10-21T16:02:11"));
+        assert_eq!(xml.matches("DateTimeOriginal").count(), 1);
+    }
+
+    #[test]
+    fn copyright_fills_only_what_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("P1010003.ORF");
+        std::fs::write(&img, b"raw").unwrap();
+        let xmp = dir.path().join("P1010003.ORF.xmp");
+        std::fs::write(&xmp, DARKTABLE_XMP).unwrap();
+        let info = CopyrightInfo {
+            creator: "Jane & Co".into(),
+            notice: "© 2026 Jane".into(),
+            contact_email: "jane@example.com".into(),
+            contact_url: "https://example.com".into(),
+            usage_terms: "All rights reserved".into(),
+        };
+
+        let written = sync_xmp_metadata(&img, &XmpUpdate { copyright: Some(&info), ..Default::default() }).unwrap();
+        let xml = std::fs::read_to_string(&written).unwrap();
+        let items = |name: &str| list_items(&xml[element(&xml, name).unwrap().0..element(&xml, name).unwrap().1]);
+        assert_eq!(items("dc:creator"), ["Jane & Co"]);
+        assert_eq!(items("dc:rights"), ["© 2026 Jane"]);
+        assert_eq!(items("xmpRights:UsageTerms"), ["All rights reserved"]);
+        assert!(xml.contains("<Iptc4xmpCore:CiEmailWork>jane@example.com</Iptc4xmpCore:CiEmailWork>"));
+        assert!(xml.contains(r#"xmlns:xmpRights="http://ns.adobe.com/xap/1.0/rights/""#));
+        assert!(xml.contains(r#"xmlns:Iptc4xmpCore="#));
+        assert_eq!(history(&xml), history(DARKTABLE_XMP));
+
+        // A second run, or another creator's notice, is never overwritten.
+        let other = CopyrightInfo { creator: "Someone Else".into(), notice: "© Else".into(), ..info.clone() };
+        sync_xmp_metadata(&img, &XmpUpdate { copyright: Some(&other), ..Default::default() }).unwrap();
+        let again = std::fs::read_to_string(&written).unwrap();
+        assert_eq!(again, xml);
     }
 
     #[test]

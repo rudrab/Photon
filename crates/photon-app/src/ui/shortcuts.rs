@@ -111,6 +111,9 @@ const UI: &str = r#"
               <property name="title">Rotate left / right</property>
               <property name="accelerator">bracketleft bracketright &lt;ctrl&gt;r</property></object></child>
             <child><object class="GtkShortcutsShortcut">
+              <property name="title">Tags… / Adjust date and time…</property>
+              <property name="accelerator">&lt;ctrl&gt;t &lt;ctrl&gt;&lt;shift&gt;t</property></object></child>
+            <child><object class="GtkShortcutsShortcut">
               <property name="title">Hold Shift to also go to the next photo</property>
               <property name="accelerator">&lt;shift&gt;1...5 &lt;shift&gt;p</property></object></child>
           </object>

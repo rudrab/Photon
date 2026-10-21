@@ -615,6 +615,29 @@ pub struct Preferences {
     /// folder, where Linux keeps photos.
     #[serde(default)]
     pub library_dir: Option<PathBuf>,
+    /// Creator and copyright written to new imports and embedded in exports.
+    #[serde(default)]
+    pub copyright: CopyrightInfo,
+}
+
+/// Who made the photos and under what terms (R-9). Empty fields are left out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CopyrightInfo {
+    pub creator: String,
+    /// e.g. "© 2026 Jane Doe. All rights reserved."
+    pub notice: String,
+    pub contact_email: String,
+    pub contact_url: String,
+    pub usage_terms: String,
+}
+
+impl CopyrightInfo {
+    pub fn is_empty(&self) -> bool {
+        [&self.creator, &self.notice, &self.contact_email, &self.contact_url, &self.usage_terms]
+            .iter()
+            .all(|f| f.trim().is_empty())
+    }
 }
 
 fn default_true() -> bool {
@@ -697,6 +720,7 @@ impl Default for Preferences {
             verify_imports: true,
             import_backup_dir: None,
             library_dir: None,
+            copyright: CopyrightInfo::default(),
         }
     }
 }

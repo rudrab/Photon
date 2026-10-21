@@ -882,6 +882,19 @@ pub fn set_orientation(conn: &Connection, id: i64, orientation: u16) -> Result<(
 }
 
 /// Batch update orientation for multiple photos in a single transaction.
+/// Set the capture time of many photos at once (`(id, Unix time)` pairs).
+pub fn batch_set_created_at(conn: &mut Connection, updates: &[(i64, i64)]) -> Result<(), PhotonError> {
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare_cached("UPDATE images SET created_at = ?1 WHERE id = ?2")?;
+        for (id, time) in updates {
+            stmt.execute(params![time, id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 pub fn batch_set_orientation(
     conn: &mut Connection,
     updates: &[(i64, u16)],

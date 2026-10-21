@@ -226,6 +226,29 @@ pub fn show(
 
     page.add(&group_import);
 
+    // ── Creator and copyright ───────────────────────────
+    let group_copyright = adw::PreferencesGroup::builder()
+        .title("Creator and Copyright")
+        .description(
+            "Written to the sidecar of each newly imported photo, and embedded in exports that \
+             include metadata. A creator or notice a photo already has is kept. Press Enter or \
+             the check mark to save a field.",
+        )
+        .build();
+    let entry_row = |title: &str, text: &str| {
+        let row = adw::EntryRow::builder().title(title).show_apply_button(true).build();
+        row.set_text(text);
+        group_copyright.add(&row);
+        row
+    };
+    let cr = &current_prefs.copyright;
+    let creator_row = entry_row("Creator", &cr.creator);
+    let notice_row = entry_row("Copyright notice", &cr.notice);
+    let email_row = entry_row("Contact email", &cr.contact_email);
+    let url_row = entry_row("Contact web page", &cr.contact_url);
+    let terms_row = entry_row("Usage terms", &cr.usage_terms);
+    page.add(&group_copyright);
+
     // ── Library database ────────────────────────────────
     let group_catalog = adw::PreferencesGroup::builder()
         .title("Library Database")
@@ -353,6 +376,8 @@ pub fn show(
         let verify_row = verify_row.clone();
         let backup_dir = backup_dir.clone();
         let library_dir = library_dir.clone();
+        let (creator_row, notice_row, email_row, url_row, terms_row) =
+            (creator_row.clone(), notice_row.clone(), email_row.clone(), url_row.clone(), terms_row.clone());
         let on_save = on_save.clone();
         let db = db_clone.clone();
 
@@ -373,6 +398,13 @@ pub fn show(
                 verify_imports: verify_row.is_active(),
                 import_backup_dir: backup_dir.borrow().clone(),
                 library_dir: library_dir.borrow().clone(),
+                copyright: photon_core::models::CopyrightInfo {
+                    creator: creator_row.text().trim().to_string(),
+                    notice: notice_row.text().trim().to_string(),
+                    contact_email: email_row.text().trim().to_string(),
+                    contact_url: url_row.text().trim().to_string(),
+                    usage_terms: terms_row.text().trim().to_string(),
+                },
             };
 
             *prefs.borrow_mut() = new_prefs.clone();
@@ -407,6 +439,11 @@ pub fn show(
 
     let sc7 = save_changes.clone();
     verify_row.connect_active_notify(move |_| sc7());
+
+    for row in [&creator_row, &notice_row, &email_row, &url_row, &terms_row] {
+        let sc = save_changes.clone();
+        row.connect_apply(move |_| sc());
+    }
 
     let set_library_dir = {
         let library_dir = library_dir.clone();

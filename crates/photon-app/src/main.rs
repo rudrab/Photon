@@ -99,6 +99,7 @@ fn build_ui(app: &adw::Application) {
     handlers::import_handler::generate_missing_thumbnails(&window);
     sweep_interrupted_imports(&window, started);
     handlers::import_handler::report_interrupted_import(&window);
+    handlers::import_handler::offer_pending_removals(&window);
     if let Some(message) = restore_message {
         (window.share_context().notify)(&message);
     }

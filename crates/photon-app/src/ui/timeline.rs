@@ -418,6 +418,7 @@ struct Inner {
     notify: RefCell<Option<Rc<dyn Fn(&str)>>>,
     /// Batch tagging callback for selected photos.
     on_batch_tag: RefCell<Option<Rc<dyn Fn(Vec<i64>)>>>,
+    on_time_shift: RefCell<Option<Rc<dyn Fn(Vec<i64>)>>>,
     /// Quality gauge reading cache: `image_id` -> `Some((percent, grade, tooltip))` if scored, or `None` if unscored.
     quality_cache: RefCell<HashMap<i64, Option<(f64, photon_import::quality::Grade, String)>>>,
 }
@@ -567,6 +568,7 @@ impl Timeline {
             on_start_slideshow: RefCell::new(None),
             notify: RefCell::new(None),
             on_batch_tag: RefCell::new(None),
+            on_time_shift: RefCell::new(None),
             quality_cache: RefCell::new(HashMap::new()),
         });
 
@@ -772,6 +774,11 @@ impl Timeline {
     /// Connect a handler for batch tagging selected photo IDs (e.g. via Ctrl+T).
     pub fn connect_batch_tag(&self, f: impl Fn(Vec<i64>) + 'static) {
         *self.inner.on_batch_tag.borrow_mut() = Some(Rc::new(f));
+    }
+
+    /// Connect a handler for adjusting the capture time of the selected photo IDs (Ctrl+Shift+T).
+    pub fn connect_time_shift(&self, f: impl Fn(Vec<i64>) + 'static) {
+        *self.inner.on_time_shift.borrow_mut() = Some(Rc::new(f));
     }
 
     /// Called when selection mode is entered or left.
@@ -1642,7 +1649,8 @@ impl Inner {
                     drop(items);
                     drop(sel);
                     if !ids.is_empty() {
-                        if let Some(cb) = this.on_batch_tag.borrow().as_ref() {
+                        let slot = if is_shift { &this.on_time_shift } else { &this.on_batch_tag };
+                        if let Some(cb) = slot.borrow().as_ref() {
                             cb(ids);
                             return glib::Propagation::Stop;
                         }

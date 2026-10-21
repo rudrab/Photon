@@ -7,6 +7,7 @@ pub mod dedup;
 pub mod device;
 pub mod engine;
 pub mod library;
+pub mod pending_removal;
 pub mod metadata;
 pub mod raw;
 pub mod export;

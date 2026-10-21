@@ -18,6 +18,7 @@ use gtk4::{
 };
 use photon_core::models::{FolderImportMode, ImportProgress};
 use photon_import::engine::ImportConfig;
+use photon_import::pending_removal;
 use photon_import::sources::disk::DiskSource;
 use photon_import::sources::digikam::{self, DigikamSource};
 use photon_import::sources::shotwell::ShotwellSource;
@@ -333,6 +334,7 @@ pub(crate) fn show_import_options_dialog(mw: &MainWindow, source_path: PathBuf, 
                 verify: prefs.verify_imports,
                 backup_dir: prefs.import_backup_dir,
                 defer_source_removal: mode == FolderImportMode::Move,
+                copyright: prefs.copyright.clone(),
                 ..ImportConfig::default()
             };
 
@@ -837,7 +839,8 @@ fn run_import(
         mw.progress_bar.set_fraction(1.0);
 
         if !removable_sources.is_empty() {
-            confirm_delete_imported_sources(&mw, &source_path, removable_sources, verified);
+            let state = if verified { "copied, verified" } else { "copied (verification is off)" };
+            confirm_delete_imported_sources(&mw, &source_path, removable_sources, state);
         }
 
         if let Some(id) = cancel_handler.take() {
@@ -858,7 +861,44 @@ fn confirm_delete_imported_sources(
     mw: &MainWindow,
     source_path: &str,
     sources: Vec<(PathBuf, Option<PathBuf>)>,
-    verified: bool,
+    state: &str,
+) {
+    // Written to disk first: if Photon closes before the answer, the next start asks again.
+    let pending_file = crate::catalog::pending_removals_path();
+    let entry_id = match pending_removal::add(&pending_file, source_path, &sources) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            log::warn!("Could not remember the originals awaiting deletion: {e}");
+            None
+        }
+    };
+    present_delete_dialog(mw, source_path, sources, state, entry_id);
+}
+
+/// At startup: ask again about originals of an earlier Move import that were
+/// never answered (Photon was closed with the dialog open).
+pub fn offer_pending_removals(mw: &MainWindow) {
+    let pending_file = crate::catalog::pending_removals_path();
+    let mw = mw.clone();
+    glib::idle_add_local_once(move || {
+        for entry in pending_removal::load(&pending_file) {
+            present_delete_dialog(
+                &mw,
+                &entry.source_path,
+                entry.sources,
+                "copied and added to your library",
+                Some(entry.id),
+            );
+        }
+    });
+}
+
+fn present_delete_dialog(
+    mw: &MainWindow,
+    source_path: &str,
+    sources: Vec<(PathBuf, Option<PathBuf>)>,
+    state: &str,
+    entry_id: Option<u64>,
 ) {
     let count = sources.len();
     let noun = if count == 1 { "photo" } else { "photos" };
@@ -867,7 +907,6 @@ fn confirm_delete_imported_sources(
     let location = if from_card { "SD card" } else { "source folder" };
 
     let heading = format!("{count} {noun} imported — delete from {location}?");
-    let state = if verified { "copied, verified" } else { "copied (verification is off)" };
     let body = format!(
         "{count} {noun} {state} and added to your library.\n\n\
          Delete the original files from {source_path}?"
@@ -882,6 +921,11 @@ fn confirm_delete_imported_sources(
 
     let mw = mw.clone();
     dialog.connect_response(None, move |_, response| {
+        if let Some(id) = entry_id {
+            if let Err(e) = pending_removal::resolve(&crate::catalog::pending_removals_path(), id) {
+                log::warn!("Could not forget the answered deletion prompt: {e}");
+            }
+        }
         if response != "delete" {
             return;
         }

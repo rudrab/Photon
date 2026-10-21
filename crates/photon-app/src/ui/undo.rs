@@ -46,6 +46,12 @@ pub enum UndoAction {
         tag_id: i64,
         tag_name: String,
     },
+    /// Capture times moved by `delta_secs` (Adjust Date and Time).
+    TimeShift {
+        /// (image_id, capture time before)
+        previous: Vec<(i64, i64)>,
+        delta_secs: i64,
+    },
     Trash {
         images: Vec<Image>,
         /// (image_id, tag_id)
@@ -140,6 +146,16 @@ impl UndoManager {
                     let n = queries::count_distinct_shots(&conn, &ids).unwrap_or(ids.len());
                     self.regen_ids.extend(ids);
                     Ok(format!("Undid: Rotation ({} photo{})", n, if n == 1 { "" } else { "s" }))
+                }
+                UndoAction::TimeShift { previous, .. } => {
+                    let mut conn = db.conn()?;
+                    queries::batch_set_created_at(&mut conn, previous)?;
+                    for &(id, _) in previous {
+                        sync_capture_time_xmp(&conn, id);
+                    }
+                    let n = queries::count_distinct_shots(&conn, &previous.iter().map(|p| p.0).collect::<Vec<_>>())
+                        .unwrap_or(previous.len());
+                    Ok(format!("Undid: Date and time change ({} photo{})", n, if n == 1 { "" } else { "s" }))
                 }
                 UndoAction::TagAdd { image_ids, tag_id, tag_name } => {
                     let mut conn = db.conn()?;
@@ -281,6 +297,17 @@ impl UndoManager {
                     self.regen_ids.extend(ids);
                     Ok(format!("Redid: Rotation ({} photo{})", n, if n == 1 { "" } else { "s" }))
                 }
+                UndoAction::TimeShift { previous, delta_secs } => {
+                    let mut conn = db.conn()?;
+                    let shifted: Vec<(i64, i64)> = previous.iter().map(|&(id, t)| (id, t + delta_secs)).collect();
+                    queries::batch_set_created_at(&mut conn, &shifted)?;
+                    for &(id, _) in &shifted {
+                        sync_capture_time_xmp(&conn, id);
+                    }
+                    let n = queries::count_distinct_shots(&conn, &shifted.iter().map(|p| p.0).collect::<Vec<_>>())
+                        .unwrap_or(shifted.len());
+                    Ok(format!("Redid: Date and time change ({} photo{})", n, if n == 1 { "" } else { "s" }))
+                }
                 UndoAction::TagAdd { image_ids, tag_id, tag_name } => {
                     let mut conn = db.conn()?;
                     queries::batch_tag_images(&mut conn, image_ids, *tag_id)?;
@@ -390,6 +417,17 @@ fn sync_orientation_xmp(conn: &rusqlite::Connection, id: i64, orient: u16) {
     if let Ok(Some(img)) = queries::get_image(conn, id) {
         let update = XmpUpdate {
             orientation: Some(orient),
+            ..Default::default()
+        };
+        log_xmp_error(&img.path, write_image_xmp(conn, id, &img.path, &update));
+    }
+}
+
+/// Write the photo's capture time, as the library has it now, to its sidecar.
+pub fn sync_capture_time_xmp(conn: &rusqlite::Connection, id: i64) {
+    if let Ok(Some(img)) = queries::get_image(conn, id) {
+        let update = XmpUpdate {
+            capture_time: img.created_at,
             ..Default::default()
         };
         log_xmp_error(&img.path, write_image_xmp(conn, id, &img.path, &update));
@@ -700,6 +738,28 @@ mod tests {
             let conn = db.conn().unwrap();
             assert_eq!(queries::get_image(&conn, id).unwrap().unwrap().orientation, Some(6));
         }
+    }
+
+    #[test]
+    fn undo_and_redo_time_shift() {
+        let (db, cache_dir) = make_test_db();
+        let id = {
+            let mut conn = db.conn().unwrap();
+            let id = insert_sample_image(&mut conn);
+            queries::batch_set_created_at(&mut conn, &[(id, 1_000_000)]).unwrap();
+            id
+        };
+        let mut um = UndoManager::new();
+        {
+            let mut conn = db.conn().unwrap();
+            queries::batch_set_created_at(&mut conn, &[(id, 1_007_200)]).unwrap();
+        }
+        um.push(UndoAction::TimeShift { previous: vec![(id, 1_000_000)], delta_secs: 7200 });
+
+        um.undo(&db, &cache_dir).unwrap();
+        assert_eq!(queries::get_image(&db.conn().unwrap(), id).unwrap().unwrap().created_at, Some(1_000_000));
+        um.redo(&db, &cache_dir).unwrap();
+        assert_eq!(queries::get_image(&db.conn().unwrap(), id).unwrap().unwrap().created_at, Some(1_007_200));
     }
 
     #[test]

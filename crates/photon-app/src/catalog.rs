@@ -19,6 +19,11 @@ pub fn db_path() -> PathBuf {
     data_dir().join("photon.db")
 }
 
+/// Originals of a Move import still waiting for the "delete from the card?" answer.
+pub fn pending_removals_path() -> PathBuf {
+    data_dir().join("pending_removals.json")
+}
+
 pub fn backups_dir() -> PathBuf {
     data_dir().join("backups")
 }

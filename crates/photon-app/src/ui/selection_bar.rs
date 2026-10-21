@@ -209,6 +209,12 @@ pub fn attach(timeline: &Timeline, ctx: Context) -> BottomBarHandle {
             crate::ui::batch_tags::show_batch_tags_popover(&tag_b, ids, &c);
         }
     });
+    let time_btn = button(&organise, "preferences-system-time-symbolic", "Adjust Date and Time… (Ctrl+Shift+T)");
+    let (w, c) = (weak.clone(), ctx.clone());
+    time_btn.connect_clicked(move |_| {
+        let ids: Vec<i64> = selected_images(&w, &c.db).iter().filter_map(|i| i.id).collect();
+        crate::ui::time_shift_dialog::show(&c, ids);
+    });
     let remove_album_btn = button(&organise, "list-remove-symbolic", "Remove from Album");
     let (w, c) = (weak.clone(), ctx.clone());
     remove_album_btn.connect_clicked(move |_| {
@@ -310,6 +316,18 @@ pub fn attach(timeline: &Timeline, ctx: Context) -> BottomBarHandle {
         }
     });
     overflow_extra.append(&tag_item);
+    let time_item = Button::with_label("Adjust Date and Time…");
+    time_item.add_css_class("flat");
+    if let Some(l) = time_item.child().and_downcast::<Label>() {
+        l.set_xalign(0.0);
+    }
+    let (w, c, pop) = (weak.clone(), ctx.clone(), overflow_pop.clone());
+    time_item.connect_clicked(move |_| {
+        pop.popdown();
+        let ids: Vec<i64> = selected_images(&w, &c.db).iter().filter_map(|i| i.id).collect();
+        crate::ui::time_shift_dialog::show(&c, ids);
+    });
+    overflow_extra.append(&time_item);
     menu_item(&overflow_extra, "Open in Editor", &open);
     menu_item(&overflow_extra, "Show in Files", &show);
     overflow_extra.append(&gtk4::Separator::new(Orientation::Horizontal));
@@ -319,6 +337,8 @@ pub fn attach(timeline: &Timeline, ctx: Context) -> BottomBarHandle {
     timeline.connect_batch_tag(move |ids| {
         crate::ui::batch_tags::show_batch_tags_popover(&tag_anchor, ids, &c_bt);
     });
+    let c_ts = ctx.clone();
+    timeline.connect_time_shift(move |ids| crate::ui::time_shift_dialog::show(&c_ts, ids));
     let remove = Button::new();
     remove.connect_clicked({
         let (w, c) = (weak.clone(), ctx.clone());

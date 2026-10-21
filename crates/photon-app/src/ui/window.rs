@@ -1517,6 +1517,7 @@ impl MainWindow {
             &self.window,
             self.db.clone(),
             images,
+            self.prefs.borrow().copyright.clone(),
             on_start,
             on_progress,
             on_done,

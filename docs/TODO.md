@@ -412,7 +412,10 @@ Ordered by importance. R-1 to R-4 are the minimum before recommending Photon for
 - Reads `lr:hierarchicalSubject` back during library refresh/XMP read.
 - digiKam tag tree import: reconstructs full hierarchical keyword paths via `pid` traversal and exports hierarchical tags in sidecars.
 
-### 🔴 R-9 · Copyright / IPTC template at import · S
+### 🟢 R-9 · Copyright / IPTC template at import · S
+
+Done 2026-10-21 (not checked by hand in the GUI: Preferences → Creator and Copyright, an import, an export). `models::CopyrightInfo` in `Preferences.copyright`; `XmpUpdate.copyright` fills only the fields a sidecar lacks (`sidecar::fill_copyright`); `ImportConfig.copyright` writes it to each new photo's sidecar (folder imports only, not Shotwell/digiKam); exports embed it with a second exiftool pass `-wm cg` (create, never overwrite) or the JPEG/sidecar fallback. No DB column: the sidecar and the file carry it.
+
 
 - Preferences: creator, copyright notice, contact email/URL, usage terms.
 - Applied on import to the DB + XMP (`dc:creator`, `dc:rights`, `xmpRights:UsageTerms`, `Iptc4xmpCore:CreatorContactInfo`) and to exports: add them to `export.rs::Embed` (exiftool args and the no-exiftool XMP packet).
@@ -554,7 +557,7 @@ Done 2026-10-15 (for a photo trip: a laptop, memory cards, hotel power).
   chosen, e.g. an external SSD). `Preferences.library_dir`, `library::library_root`, a writable check
   (`library::is_writable_dir`) with a warning in the import dialog. Existing libraries are not moved
   (paths are stored per photo).
-- 🟢 **Move deletes the card's copy only after database commit and user confirmation.** `Move` stage-copies the photo and XMP sidecar into the library (and backup folder when configured) without touching the source in the I/O stage; source removal only happens after `commit_stream` commits the rows to SQLite, and in the GUI (`defer_source_removal: true`) a post-import confirmation dialog (*"N photos imported — delete from SD card / source folder?"*) asks before removing the committed originals. Move is now copy-then-delete, so on the same disk it is slower and needs temporary space (it was a rename). 🔴 The list of originals to delete is only in memory: if the app closes before the answer, the originals stay and are not offered again.
+- 🟢 **Move deletes the card's copy only after database commit and user confirmation.** `Move` stage-copies the photo and XMP sidecar into the library (and backup folder when configured) without touching the source in the I/O stage; source removal only happens after `commit_stream` commits the rows to SQLite, and in the GUI (`defer_source_removal: true`) a post-import confirmation dialog (*"N photos imported — delete from SD card / source folder?"*) asks before removing the committed originals. Move is now copy-then-delete, so on the same disk it is slower and needs temporary space (it was a rename). 🟢 The list of originals to delete is saved (`pending_removal.rs`, `~/.local/share/photon/pending_removals.json`) before the dialog opens and offered again at the next start (2026-10-21; not checked by hand).
 - Not verified by hand in the GUI: the Preferences row, the import dialog's folder line, the dialogs'
   looks. Verified with a throw-away harness driving the real app (real Copy import, quit mid-way, next
   start, import again).
@@ -633,7 +636,10 @@ Done 2026-10-15:
 - Non-blocking background XMP sidecar sync across all companion files (`undo::sync_tags_xmp`).
 - 1-action undo/redo integration via `UndoAction::TagAdd` and `UndoAction::TagRemove` with notification toasts and library refresh.
 
-### 🔴 R-22 · Capture time shift and multi-camera clock synchronization · S
+### 🟢 R-22 · Capture time shift and multi-camera clock synchronization · S
+
+Done 2026-10-21 (GUI not checked by hand): `ui/time_shift_dialog.rs`, `Ctrl+Shift+T`, selection bar button and overflow entry; shift by an amount or set one photo's correct time; shot-wide; `images.created_at` + `exif:DateTimeOriginal` in sidecars (`XmpUpdate.capture_time`); `UndoAction::TimeShift`. 🔴 No time-zone picker (shift by the difference instead).
+
 
 - **Why:** On photo trips across time zones or when shooting with two camera bodies (or camera + smartphone), camera clocks drift or are set incorrectly. Photos interleave out of chronological order in the timeline, and GPX geotagging maps photos to incorrect locations.
 - **Where:**
