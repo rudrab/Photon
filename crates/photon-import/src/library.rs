@@ -441,7 +441,11 @@ mod tests {
         assert!(is_writable_dir(dir.path()));
         assert!(is_writable_dir(&dir.path().join("not/yet/created")));
         assert!(!is_writable_dir(Path::new("/proc/sys")));
-        assert!(!is_writable_dir(Path::new("/nonexistent-drive/Pictures")));
+        // Root (as in CI containers) may create folders under "/", so a missing
+        // drive only counts as unwritable for ordinary users.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(!is_writable_dir(Path::new("/nonexistent-drive/Pictures")));
+        }
     }
 
     #[test]
