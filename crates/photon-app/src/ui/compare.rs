@@ -294,12 +294,35 @@ impl Compare {
                 follower.follow(moved.state());
             }
             c.syncing.set(false);
+            c.update_preloads();
         });
         pane.holder.append(view.widget());
         *pane.view.borrow_mut() = Some(view);
         self.counter.set_text(&format!("{} / {}", self.index_of(1) + 1, self.photos.len()));
         if self.face_step.get().is_some() {
             self.show_faces(&[side]);
+        }
+        self.update_preloads();
+    }
+
+    fn update_preloads(&self) {
+        let zoomed = self.face_step.get().is_some()
+            || self
+                .panes
+                .iter()
+                .any(|p| p.view.borrow().as_ref().is_some_and(|v| v.is_detail_zoom()));
+        if zoomed {
+            let cand = self.candidate.get();
+            let mut neighbors = Vec::with_capacity(2);
+            if let Some(next) = self.neighbour(cand, 1).and_then(|i| self.photos.get(i)) {
+                neighbors.push(next);
+            }
+            if let Some(prev) = self.neighbour(cand, -1).and_then(|i| self.photos.get(i)) {
+                neighbors.push(prev);
+            }
+            crate::ui::photo_view::preload_neighbors(&self.ctx.db, &neighbors);
+        } else {
+            crate::ui::photo_view::cancel_preloads();
         }
     }
 

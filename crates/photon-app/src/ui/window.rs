@@ -1410,6 +1410,7 @@ impl MainWindow {
             _ => return self.toast("Select 2 photos to compare, or 3–9 to survey"),
         };
         self.clear_viewer();
+        self.timeline_stale.set(true);
         self.viewer_container.append(&view);
         self.stack.set_visible_child_name("viewer");
         self.set_bottom_bar_revealed(false);
@@ -1424,6 +1425,7 @@ impl MainWindow {
         let prefs = self.prefs.borrow();
 
         self.clear_viewer();
+        self.timeline_stale.set(true);
         let this = self.clone();
         let on_export = Some(Rc::new(move |images| this.start_export(images)) as Rc<dyn Fn(Vec<Image>)>);
         let viewer = detail::build_viewer(
@@ -1524,6 +1526,7 @@ impl MainWindow {
     // ── Helpers ─────────────────────────────────────────
 
     fn clear_viewer(&self) {
+        crate::ui::photo_view::cancel_preloads();
         while let Some(c) = self.viewer_container.first_child() {
             self.viewer_container.remove(&c);
         }
@@ -1612,11 +1615,20 @@ impl MainWindow {
         self.toasts.add_toast(adw::Toast::new(text));
     }
 
+    /// Rebuild the thumbnails an orientation undo/redo left stale, in the background.
+    fn regenerate_after_undo(&self) {
+        let ids = self.undo_manager.borrow_mut().take_thumbnail_regen();
+        let mw = self.clone();
+        crate::ui::detail::regenerate_grid_thumbnails(&self.db, &self.cache_dir, ids, move || mw.refresh());
+    }
+
     pub fn undo(&self) {
-        match self.undo_manager.borrow_mut().undo(&self.db, &self.cache_dir) {
+        let result = self.undo_manager.borrow_mut().undo(&self.db, &self.cache_dir);
+        match result {
             Ok(Some(desc)) => {
                 self.toast(&desc);
                 self.refresh();
+                self.regenerate_after_undo();
             }
             Ok(None) => {
                 self.toast("Nothing to undo");
@@ -1631,10 +1643,12 @@ impl MainWindow {
     }
 
     pub fn redo(&self) {
-        match self.undo_manager.borrow_mut().redo(&self.db, &self.cache_dir) {
+        let result = self.undo_manager.borrow_mut().redo(&self.db, &self.cache_dir);
+        match result {
             Ok(Some(desc)) => {
                 self.toast(&desc);
                 self.refresh();
+                self.regenerate_after_undo();
             }
             Ok(None) => {
                 self.toast("Nothing to redo");

@@ -300,10 +300,19 @@ pub fn build_viewer(
     // Set while the controls follow the view, so the slider doesn't zoom back.
     let syncing_zoom = Rc::new(Cell::new(false));
 
+    // Which face the view is zoomed to (see `faces::pick`); `None` when not
+    // zoomed to a face. Kept across photos, so stepping through a burst
+    // stays on the same person.
+    let face_step: Rc<Cell<Option<isize>>> = Rc::default();
+
     let sync_zoom_ui: Rc<dyn Fn(&PhotoView)> = Rc::new(glib::clone!(
         #[weak] zoom_scale,
         #[weak] fit_btn,
         #[strong] syncing_zoom,
+        #[strong] photos,
+        #[strong] current_idx,
+        #[strong] face_step,
+        #[strong] db,
         move |view: &PhotoView| {
             let scale = view.scale();
             syncing_zoom.set(true);
@@ -315,6 +324,22 @@ pub fn build_viewer(
             fit_btn.set_active(view.zoom() == Zoom::Fit);
             syncing_zoom.set(false);
             zoom_scale.set_tooltip_text(Some(&format!("Zoom {:.0}% (Ctrl+scroll, + / −)", scale * 100.0)));
+
+            if view.is_detail_zoom() || face_step.get().is_some() {
+                let idx = current_idx.get();
+                let mut neighbors = Vec::with_capacity(2);
+                if let Some(next) = photos.get(idx + 1) {
+                    neighbors.push(next);
+                }
+                if idx > 0 {
+                    if let Some(prev) = photos.get(idx - 1) {
+                        neighbors.push(prev);
+                    }
+                }
+                crate::ui::photo_view::preload_neighbors(&db, &neighbors);
+            } else {
+                crate::ui::photo_view::cancel_preloads();
+            }
         }
     ));
 
@@ -327,10 +352,6 @@ pub fn build_viewer(
             }
         }
     };
-    // Which face the view is zoomed to (see `faces::pick`); `None` when not
-    // zoomed to a face. Kept across photos, so stepping through a burst
-    // stays on the same person.
-    let face_step: Rc<Cell<Option<isize>>> = Rc::default();
     let toggle_zoom: Rc<dyn Fn()> = {
         let with_view = with_view.clone();
         let face_step = face_step.clone();
@@ -564,12 +585,17 @@ pub fn build_viewer(
 
     let step = {
         let show = show.clone();
+        let step_faces = step_faces.clone();
+        let face_step = face_step.clone();
         let current_idx = current_idx.clone();
         let len = photos.len();
         Rc::new(move |delta: isize| {
             let target = current_idx.get() as isize + delta;
             if (0..len as isize).contains(&target) {
                 show(target as usize);
+                if face_step.get().is_some() {
+                    step_faces(0);
+                }
             }
         })
     };
@@ -596,61 +622,40 @@ pub fn build_viewer(
         let db = db.clone();
         let photos = photos.clone();
         let current_idx = current_idx.clone();
-        let current_image = current_image.clone();
         let show = show.clone();
         let cache_dir = cache.clone();
         let um_rot = undo_manager.clone();
         let current_view = current_view.clone();
+        let face_step = face_step.clone();
         Rc::new(move |cw: bool| {
             let idx = current_idx.get();
             let Some(item) = photos.get(idx) else { return };
-            let img_id = item.id;
 
-            let (path, hash, old_orient, next_orient) = {
-                let img_borrow = current_image.borrow();
-                let Some(img) = img_borrow.as_ref() else { return };
-                if img.format.as_ref().map_or(false, |f| f.is_video()) {
+            let res = db.conn().map_err(Into::into).and_then(|mut conn| {
+                rotate_shots(&mut conn, &[item.id], cw)
+            });
+            let (previous, rotated) = match res {
+                Ok(pair) => pair,
+                Err(e) => {
+                    log::error!("Failed to rotate shot {}: {e}", item.id);
                     return;
                 }
-                let old_orient = img.orientation;
-                let next = photon_core::models::rotate_orientation(img.orientation, cw);
-                (img.path.clone(), img.hash.clone(), old_orient, next)
             };
-
-            let save_res = (|| -> Result<(), photon_core::PhotonError> {
-                let mut conn = db.conn()?;
-                queries::set_orientation(&mut conn, img_id, next_orient)?;
-                Ok(())
-            })();
-
-            if let Err(e) = save_res {
-                log::error!("Failed to save orientation for photo {img_id}: {e}");
+            if rotated.is_empty() {
                 return;
-            }
-
-            if let Some(img) = current_image.borrow_mut().as_mut() {
-                img.orientation = Some(next_orient);
             }
 
             if let Some(ref um) = um_rot {
                 um.borrow_mut().push(crate::ui::undo::UndoAction::Orientation {
-                    previous: vec![(img_id, old_orient, hash.clone())],
+                    previous,
                     cw,
                 });
             }
 
-            // Invalidate disk thumbnail cache and memory full-res cache
-            photon_import::thumbnails::invalidate_cache(&cache_dir, &hash);
-            invalidate_full_res(&hash);
-            // The old position means nothing on the rotated photo.
+            // The old position and face box mean nothing on the rotated photo.
+            face_step.set(None);
             current_view.borrow_mut().take();
-
-            if let Ok(conn) = db.conn() {
-                let p = path.clone();
-                thread::spawn(move || {
-                    sync_image_xmp(&conn, img_id, &p, XmpChange::Orientation(next_orient));
-                });
-            }
+            apply_rotated_shots(&db, &cache_dir, rotated, || {});
 
             show(idx);
         })
@@ -1958,6 +1963,173 @@ fn format_size(bytes: i64) -> String {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     } else {
         format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+/// Rotate every non-video member file of the shots identified by `shot_ids`
+/// (e.g. both the RAW and JPG of a paired shot). Updates SQLite in one
+/// transaction and returns `(previous_orientations_for_undo, rotated_images)`.
+pub(crate) fn rotate_shots(
+    conn: &mut rusqlite::Connection,
+    shot_ids: &[i64],
+    cw: bool,
+) -> Result<(Vec<(i64, Option<u16>, String)>, Vec<(Image, u16)>), photon_core::PhotonError> {
+    let member_ids = queries::shot_member_ids(conn, shot_ids)?;
+    let mut previous = Vec::with_capacity(member_ids.len());
+    let mut updates = Vec::with_capacity(member_ids.len());
+    let mut rotated = Vec::with_capacity(member_ids.len());
+
+    for id in member_ids {
+        let Some(mut img) = queries::get_image(conn, id)? else {
+            continue;
+        };
+        if img.format.is_some_and(|f| f.is_video()) {
+            continue;
+        }
+        let old_orient = img.orientation;
+        let next = photon_core::models::rotate_orientation(old_orient, cw);
+        img.orientation = Some(next);
+        previous.push((id, old_orient, img.hash.clone()));
+        updates.push((id, next));
+        rotated.push((img, next));
+    }
+
+    if !updates.is_empty() {
+        queries::batch_set_orientation(conn, &updates)?;
+    }
+    Ok((previous, rotated))
+}
+
+/// Rebuild the Grid thumbnails and ThumbHashes of `ids` on a worker thread,
+/// then drop their cached tile textures and call `on_done` on the UI thread.
+pub(crate) fn regenerate_grid_thumbnails(
+    db: &Database,
+    cache_dir: &Path,
+    ids: Vec<i64>,
+    on_done: impl FnOnce() + 'static,
+) {
+    if ids.is_empty() {
+        return;
+    }
+    let db = db.clone();
+    let cache_dir = cache_dir.to_path_buf();
+    let (tx, rx) = async_channel::bounded::<Vec<String>>(1);
+    thread::spawn(move || {
+        let thumb_gen = photon_import::thumbnails::ThumbnailGenerator::new(cache_dir);
+        let mut hashes = Vec::with_capacity(ids.len());
+        if let Ok(conn) = db.conn() {
+            for id in ids {
+                let Ok(Some(img)) = queries::get_image(&conn, id) else { continue };
+                if img.path.exists() {
+                    match thumb_gen.ensure_grid(&img) {
+                        Ok((_, Some(th))) => {
+                            let _ = queries::save_thumbhash(&conn, id, &th);
+                        }
+                        Ok((_, None)) => {}
+                        Err(e) => log::warn!("Failed to regen grid thumbnail for {id}: {e}"),
+                    }
+                }
+                hashes.push(img.hash);
+            }
+        }
+        let _ = tx.send_blocking(hashes);
+    });
+    glib::spawn_future_local(async move {
+        if let Ok(hashes) = rx.recv().await {
+            for h in &hashes {
+                crate::ui::timeline::invalidate_texture(h);
+            }
+            on_done();
+        }
+    });
+}
+
+/// After [`rotate_shots`] commits to SQLite: invalidate disk/memory caches on
+/// the UI thread for every member, then write XMP sidecars and regenerate grid
+/// thumbnails + thumbhashes on a worker thread, invoking `on_done` on the UI
+/// thread once thumbnails are ready.
+pub(crate) fn apply_rotated_shots(
+    db: &Database,
+    cache_dir: &Path,
+    rotated: Vec<(Image, u16)>,
+    on_done: impl FnOnce() + 'static,
+) {
+    for (img, _) in &rotated {
+        photon_import::thumbnails::invalidate_cache(cache_dir, &img.hash);
+        invalidate_full_res(&img.hash);
+    }
+    let db = db.clone();
+    let cache_dir = cache_dir.to_path_buf();
+    let (tx, rx) = async_channel::bounded::<Vec<String>>(1);
+    thread::spawn(move || {
+        let thumb_gen = photon_import::thumbnails::ThumbnailGenerator::new(cache_dir);
+        let mut hashes = Vec::with_capacity(rotated.len());
+        if let Ok(conn) = db.conn() {
+            for (img, next_orient) in &rotated {
+                if let Some(id) = img.id {
+                    sync_image_xmp(&conn, id, &img.path, XmpChange::Orientation(*next_orient));
+                }
+                if img.path.exists() {
+                    match thumb_gen.ensure_grid(img) {
+                        Ok((_, Some(th))) => {
+                            if let Some(id) = img.id {
+                                let _ = queries::save_thumbhash(&conn, id, &th);
+                            }
+                        }
+                        Ok((_, None)) => {}
+                        Err(e) => {
+                            log::warn!("Failed to regen grid thumbnail for {}: {e}", img.id.unwrap_or(0))
+                        }
+                    }
+                }
+                hashes.push(img.hash.clone());
+            }
+        }
+        let _ = tx.send_blocking(hashes);
+    });
+    glib::spawn_future_local(async move {
+        if let Ok(hashes) = rx.recv().await {
+            for h in &hashes {
+                crate::ui::timeline::invalidate_texture(h);
+            }
+            on_done();
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use photon_core::models::ImageFormat;
+
+    #[test]
+    fn rotate_shots_rotates_all_files_of_a_raw_plus_jpg_shot() {
+        let db = Database::open_in_memory().unwrap();
+        let mut conn = db.conn().unwrap();
+
+        let mut jpg = Image::new(PathBuf::from("/p/DSC_0001.JPG"), "hash_jpg".into(), 100);
+        jpg.format = Some(ImageFormat::Jpeg);
+        jpg.orientation = Some(1);
+        jpg.group_hash = Some("shot_1".into());
+
+        let mut raw = Image::new(PathBuf::from("/p/DSC_0001.NEF"), "hash_raw".into(), 500);
+        raw.format = Some(ImageFormat::from_extension("nef"));
+        raw.orientation = Some(1);
+        raw.group_hash = Some("shot_1".into());
+
+        let mut imgs = vec![jpg, raw];
+        queries::batch_insert_images(&mut conn, &mut imgs).unwrap();
+        let jpg_id = imgs[0].id.unwrap();
+        let raw_id = imgs[1].id.unwrap();
+
+        let (prev, rotated) = rotate_shots(&mut conn, &[jpg_id], true).unwrap();
+        assert_eq!(prev.len(), 2);
+        assert_eq!(rotated.len(), 2);
+
+        let jpg_after = queries::get_image(&conn, jpg_id).unwrap().unwrap();
+        let raw_after = queries::get_image(&conn, raw_id).unwrap().unwrap();
+        assert_eq!(jpg_after.orientation, Some(6));
+        assert_eq!(raw_after.orientation, Some(6));
     }
 }
 

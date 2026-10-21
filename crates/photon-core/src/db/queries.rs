@@ -1348,6 +1348,7 @@ pub fn running_import_batches(conn: &Connection) -> Result<Vec<ImportBatch>, Pho
             status: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
             started_at: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
             completed_at: r.get(9)?,
+            removable_sources: Vec::new(),
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)

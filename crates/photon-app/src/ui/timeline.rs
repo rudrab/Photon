@@ -346,6 +346,16 @@ impl TextureCache {
     }
 }
 
+thread_local! {
+    static TEXTURES: RefCell<TextureCache> = RefCell::new(TextureCache::new());
+}
+
+/// Drop the cached grid tile texture for `hash` (called on the UI thread when
+/// a photo is rotated or re-rendered).
+pub fn invalidate_texture(hash: &str) {
+    TEXTURES.with(|t| t.borrow_mut().remove(hash));
+}
+
 // ---------------------------------------------------------------------------
 // Widget
 // ---------------------------------------------------------------------------
@@ -393,7 +403,6 @@ struct Inner {
     row_height: Cell<i32>,
     relayout_generation: Cell<u64>,
     cache_dir: PathBuf,
-    textures: RefCell<TextureCache>,
     db: RefCell<Option<Database>>,
     on_activate: RefCell<Option<ActivateFn>>,
     on_selection_changed: RefCell<Option<SelectionFn>>,
@@ -547,7 +556,6 @@ impl Timeline {
             row_height: Cell::new(row_height),
             relayout_generation: Cell::new(0),
             cache_dir,
-            textures: RefCell::new(TextureCache::new()),
             db: RefCell::new(None),
             on_activate: RefCell::new(None),
             on_selection_changed: RefCell::new(None),
@@ -1237,18 +1245,39 @@ impl Inner {
             return;
         }
 
-        let mut updates: Vec<(i64, u16)> = Vec::new();
-        let mut affected: Vec<(i64, String, u16)> = Vec::new();
-        let mut previous = Vec::new();
+        let Some(db) = this.db.borrow().clone() else { return };
+        let shot_ids: Vec<i64> = {
+            let items = this.items.borrow();
+            selected
+                .iter()
+                .filter_map(|&idx| items.get(idx).filter(|i| !i.is_video).map(|i| i.id))
+                .collect()
+        };
+        if shot_ids.is_empty() {
+            return;
+        }
+
+        let res = db.conn().map_err(Into::into).and_then(|mut conn| {
+            crate::ui::detail::rotate_shots(&mut conn, &shot_ids, cw)
+        });
+        let (previous, rotated) = match res {
+            Ok(pair) => pair,
+            Err(e) => {
+                log::error!("Failed to rotate selected shots: {e}");
+                return;
+            }
+        };
+        if rotated.is_empty() {
+            return;
+        }
+
         {
             let mut items_clone = (**this.items.borrow()).clone();
             for &idx in &selected {
                 if let Some(item) = items_clone.get_mut(idx) {
-                    previous.push((item.id, item.orientation, item.hash.clone()));
-                    let next_orient = photon_core::models::rotate_orientation(item.orientation, cw);
-                    item.orientation = Some(next_orient);
-                    updates.push((item.id, next_orient));
-                    affected.push((item.id, item.hash.clone(), next_orient));
+                    if !item.is_video {
+                        item.orientation = Some(photon_core::models::rotate_orientation(item.orientation, cw));
+                    }
                 }
             }
             *this.items.borrow_mut() = Rc::new(items_clone);
@@ -1261,54 +1290,20 @@ impl Inner {
             });
         }
 
-        // Invalidate the grid textures, the disk thumbnails and the viewer's 1:1 renders
-        for (_, hash, _) in &affected {
-            this.textures.borrow_mut().remove(hash);
-            photon_import::thumbnails::invalidate_cache(&this.cache_dir, hash);
-            crate::ui::detail::invalidate_full_res(hash);
-        }
-
-        // Relayout immediately so tile aspect ratios update
+        // Relayout immediately so tile aspect ratios update, then write XMP and
+        // regenerate grid thumbnails for all shot members in the background.
         this.relayout();
 
-        // Asynchronously update DB, sync XMP sidecars, and regenerate grid thumbnails
-        if let Some(db) = this.db.borrow().as_ref() {
-            let db = db.clone();
-            let cache_dir = this.cache_dir.clone();
-            let weak_inner = Rc::downgrade(this);
-            glib::spawn_future_local(async move {
-                gio::spawn_blocking(move || {
-                    match db.conn() {
-                        Ok(mut conn) => {
-                            if let Err(e) = queries::batch_set_orientation(&mut conn, &updates) {
-                                log::error!("Failed to save batch orientation: {e}");
-                            } else {
-                                sync_orientation_to_xmp(&conn, &updates);
-                            }
-
-                            // Regenerate grid thumbnails
-                            let thumb_gen = photon_import::thumbnails::ThumbnailGenerator::new(cache_dir);
-                            for &(id, _) in &updates {
-                                if let Ok(Some(image)) = queries::get_image(&conn, id) {
-                                    if let Err(e) = thumb_gen.ensure_grid(&image) {
-                                        log::warn!("Failed to regenerate thumbnail for photo {id}: {e}");
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            log::error!("Failed to acquire database connection for batch orientation: {e}");
-                        }
-                    }
-                })
-                .await
-                .ok();
-
-                if let Some(inner) = weak_inner.upgrade() {
+        let weak_inner = Rc::downgrade(this);
+        crate::ui::detail::apply_rotated_shots(&db, &this.cache_dir, rotated, move || {
+            if let Some(inner) = weak_inner.upgrade() {
+                if let Some(ref cb) = *inner.on_refresh.borrow() {
+                    cb();
+                } else {
                     inner.relayout();
                 }
-            });
-        }
+            }
+        });
     }
 
     /// Bring the row holding photo `item_index` into view. `ListView::scroll_to`
@@ -2029,7 +2024,7 @@ impl Inner {
             Self::load_quality_later(this, &quality_box, item.id, item.group_hash.clone());
         }
 
-        if let Some(texture) = this.textures.borrow_mut().get(&item.hash) {
+        if let Some(texture) = TEXTURES.with(|t| t.borrow_mut().get(&item.hash)) {
             picture.set_paintable(Some(&texture));
         } else {
             if let Some(ref th_bytes) = item.thumbhash {
@@ -2157,7 +2152,6 @@ impl Inner {
 
     fn load_texture_later(this: &Rc<Self>, picture: &Picture, hash: String) {
         let path = thumb_path(&this.cache_dir, ThumbSize::Grid, &hash);
-        let weak_inner = Rc::downgrade(this);
         let weak_picture = picture.downgrade();
 
         glib::timeout_add_local_once(LOAD_DELAY, move || {
@@ -2170,9 +2164,7 @@ impl Inner {
                 let Ok(Ok(texture)) = loaded else {
                     return; // no thumbnail yet: keep the placeholder
                 };
-                if let Some(inner) = weak_inner.upgrade() {
-                    inner.textures.borrow_mut().put(hash, texture.clone());
-                }
+                TEXTURES.with(|t| t.borrow_mut().put(hash, texture.clone()));
                 if let Some(picture) = weak_picture.upgrade() {
                     picture.set_paintable(Some(&texture));
                 }
@@ -2648,18 +2640,4 @@ pub(crate) fn sync_cull_to_xmp(conn: &rusqlite::Connection, ids: &[i64], fields:
         }
     }
     failed
-}
-
-/// Write updated EXIF orientation of photos into their XMP sidecars.
-fn sync_orientation_to_xmp(conn: &rusqlite::Connection, updates: &[(i64, u16)]) {
-    for &(id, orientation) in updates {
-        let Ok(Some(image)) = queries::get_image(conn, id) else { continue };
-        let update = photon_import::XmpUpdate {
-            orientation: Some(orientation),
-            ..Default::default()
-        };
-        if let Err(e) = photon_import::write_image_xmp(conn, id, &image.path, &update) {
-            log::warn!("Writing XMP orientation for {}: {e}", image.path.display());
-        }
-    }
 }

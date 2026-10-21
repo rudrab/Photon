@@ -234,6 +234,11 @@ impl PhotoView {
         self.double_click_zoom.set(on);
     }
 
+    /// Whether the view is currently zoomed past Fit (`Zoom::Scale`).
+    pub fn is_detail_zoom(&self) -> bool {
+        matches!(self.zoom.get(), Zoom::Scale(_))
+    }
+
     /// `zoom` within what the view shows: no smaller than Fit, no larger than [`MAX_ZOOM`].
     fn clamped(&self, zoom: Zoom) -> Zoom {
         match zoom {
@@ -248,6 +253,9 @@ impl PhotoView {
     fn show_at(self: &Rc<Self>, zoom: Zoom, frac: (f64, f64), anchor: (f64, f64)) {
         self.pending_center.set(None);
         self.zoom.set(zoom);
+        if matches!(zoom, Zoom::Fit) && !self.has_full.get() {
+            self.spinner.set_visible(false);
+        }
         self.apply_size();
         self.scroll_to(frac, anchor);
         self.ensure_detail();
@@ -547,16 +555,21 @@ impl PhotoView {
         });
     }
 
+    /// Whether the current zoom level shows more pixels than the loaded preview.
+    fn needs_detail_pixels(&self) -> bool {
+        if self.has_full.get() {
+            return false;
+        }
+        let Zoom::Scale(s) = self.zoom.get() else { return false };
+        let Some((w, _)) = self.size.get() else { return false };
+        let have = self.picture.paintable().map_or(0, |p| p.intrinsic_width()) as f64;
+        !(self.size_real.get() && have + 1.0 >= (w * s).min(w))
+    }
+
     /// Load the full-resolution render if the zoom shows more pixels than
     /// the preview has.
     fn ensure_detail(self: &Rc<Self>) {
-        if self.full_requested.get() || self.has_full.get() {
-            return;
-        }
-        let Zoom::Scale(s) = self.zoom.get() else { return };
-        let Some((w, _)) = self.size.get() else { return };
-        let have = self.picture.paintable().map_or(0, |p| p.intrinsic_width()) as f64;
-        if self.size_real.get() && have + 1.0 >= (w * s).min(w) {
+        if self.full_requested.get() || !self.needs_detail_pixels() {
             return;
         }
         self.full_requested.set(true);
@@ -622,23 +635,175 @@ fn with(weak: &Weak<PhotoView>, f: impl FnOnce(&Rc<PhotoView>)) {
 
 // ── Full-resolution renders ─────────────────────────────
 
-/// Full-resolution renders of the last few photos zoomed into, so stepping
-/// back and forth while checking focus doesn't render them again.
-/// (A 20 MP render is ~60 MB.)
-const FULL_RES_CACHE: usize = 3;
+/// Full-resolution renders of the current photo plus neighboring photos
+/// (next/previous) while zoomed in, so stepping back and forth while checking
+/// focus doesn't render them again. (A 20 MP render is ~60 MB.)
+const FULL_RES_CACHE: usize = 4;
+
+/// Maximum concurrent full-resolution renders. Developing a RAW file uses all
+/// CPU cores via Rayon and ~300 MB of temporary buffers; capping at 2 keeps
+/// Survey face-zoom (`F` across 9 RAWs) from spiking memory by ~2.7 GB.
+const MAX_CONCURRENT_FULL_RES: usize = 2;
+
+struct InFlight {
+    id: u64,
+    views: Vec<Weak<PhotoView>>,
+}
+
+#[derive(Default)]
+struct RenderSemaphore {
+    active: usize,
+    high_waiters: std::collections::VecDeque<async_channel::Sender<()>>,
+    low_waiters: std::collections::VecDeque<async_channel::Sender<()>>,
+}
+
+struct RenderPermit;
+
+impl Drop for RenderPermit {
+    fn drop(&mut self) {
+        RENDER_SEM.with(|sem| {
+            let mut sem = sem.borrow_mut();
+            while let Some(tx) = sem
+                .high_waiters
+                .pop_front()
+                .or_else(|| sem.low_waiters.pop_front())
+            {
+                if tx.try_send(()).is_ok() {
+                    return;
+                }
+            }
+            sem.active = sem.active.saturating_sub(1);
+        });
+    }
+}
+
+async fn acquire_render_permit(preload: bool) -> RenderPermit {
+    let rx = RENDER_SEM.with(|sem| {
+        let mut sem = sem.borrow_mut();
+        if sem.active < MAX_CONCURRENT_FULL_RES {
+            sem.active += 1;
+            None
+        } else {
+            let (tx, rx) = async_channel::bounded(1);
+            if preload {
+                sem.low_waiters.push_back(tx);
+            } else {
+                sem.high_waiters.push_back(tx);
+            }
+            Some(rx)
+        }
+    });
+    if let Some(rx) = rx {
+        let _ = rx.recv().await;
+    }
+    RenderPermit
+}
 
 thread_local! {
     static FULL_RES: RefCell<std::collections::VecDeque<(String, gdk::Texture)>> = Default::default();
+    static IN_FLIGHT: RefCell<std::collections::HashMap<String, InFlight>> = Default::default();
+    static NEXT_FLIGHT_ID: Cell<u64> = const { Cell::new(1) };
+    static WANTED_PRELOADS: RefCell<Vec<String>> = Default::default();
+    static RENDER_SEM: RefCell<RenderSemaphore> = Default::default();
 }
 
 pub fn invalidate_full_res(hash: &str) {
-    // Whatever changes the pixels (a rotation) moves the faces too.
+    // Whatever changes the pixels (a rotation) moves the faces and grid tile too.
     crate::ui::faces::invalidate(hash);
+    crate::ui::timeline::invalidate_texture(hash);
     FULL_RES.with(|c| c.borrow_mut().retain(|(h, _)| h != hash));
+    IN_FLIGHT.with(|m| {
+        m.borrow_mut().remove(hash);
+    });
+    WANTED_PRELOADS.with(|w| w.borrow_mut().retain(|h| h != hash));
+}
+
+fn has_cached_full_res(hash: &str) -> bool {
+    FULL_RES.with(|c| c.borrow().iter().any(|(h, _)| h == hash))
 }
 
 fn cached_full_res(hash: &str) -> Option<gdk::Texture> {
-    FULL_RES.with(|c| c.borrow().iter().find(|(h, _)| h == hash).map(|(_, t)| t.clone()))
+    FULL_RES.with(|c| {
+        let mut cache = c.borrow_mut();
+        let idx = cache.iter().position(|(h, _)| h == hash)?;
+        let item = cache.remove(idx)?;
+        let tex = item.1.clone();
+        cache.push_front(item);
+        Some(tex)
+    })
+}
+
+/// Cancel any queued background neighbor preloads that haven't started yet.
+pub fn cancel_preloads() {
+    WANTED_PRELOADS.with(|w| w.borrow_mut().clear());
+}
+
+/// Preload full-resolution renders for `neighbors` (typically next and previous
+/// photos) in the background at lower priority than active views.
+pub fn preload_neighbors(
+    db: &photon_core::db::Database,
+    neighbors: &[&photon_core::models::TimelineItem],
+) {
+    let mut wanted = Vec::with_capacity(neighbors.len());
+    let mut to_fetch = Vec::new();
+    for item in neighbors {
+        if item.is_video {
+            continue;
+        }
+        if !wanted.contains(&item.hash) {
+            wanted.push(item.hash.clone());
+        }
+        let already = has_cached_full_res(&item.hash)
+            || IN_FLIGHT.with(|m| m.borrow().contains_key(&item.hash));
+        if !already {
+            to_fetch.push(item.id);
+        }
+    }
+    WANTED_PRELOADS.with(|w| *w.borrow_mut() = wanted);
+    if to_fetch.is_empty() {
+        return;
+    }
+    let Ok(conn) = db.conn() else { return };
+    for id in to_fetch {
+        if let Ok(Some(img)) = photon_core::db::queries::get_image(&conn, id) {
+            preload_full_resolution(img);
+        }
+    }
+}
+
+fn next_flight_id() -> u64 {
+    NEXT_FLIGHT_ID.with(|c| {
+        let id = c.get();
+        c.set(id + 1);
+        id
+    })
+}
+
+fn preload_full_resolution(image: Image) {
+    if image.format.is_some_and(|f| f.is_video() || f == photon_core::models::ImageFormat::Gif) {
+        return;
+    }
+    if has_cached_full_res(&image.hash) {
+        return;
+    }
+    let flight_id = IN_FLIGHT.with(|m| {
+        let mut map = m.borrow_mut();
+        if map.contains_key(&image.hash) {
+            return None;
+        }
+        let id = next_flight_id();
+        map.insert(
+            image.hash.clone(),
+            InFlight {
+                id,
+                views: Vec::new(),
+            },
+        );
+        Some(id)
+    });
+    if let Some(flight_id) = flight_id {
+        spawn_render(image, flight_id, true);
+    }
 }
 
 /// Render the photo's real pixels — RAW files developed from the sensor
@@ -649,21 +814,98 @@ fn load_full_resolution(view: &Rc<PhotoView>) {
         return;
     }
     view.spinner.set_visible(true);
-    let image = view.image.clone();
     let weak = Rc::downgrade(view);
+    let flight_id = IN_FLIGHT.with(|m| {
+        let mut map = m.borrow_mut();
+        if let Some(entry) = map.get_mut(&view.image.hash) {
+            entry.views.push(weak);
+            return None;
+        }
+        let id = next_flight_id();
+        map.insert(
+            view.image.hash.clone(),
+            InFlight {
+                id,
+                views: vec![weak],
+            },
+        );
+        Some(id)
+    });
+    if let Some(flight_id) = flight_id {
+        spawn_render(view.image.clone(), flight_id, false);
+    }
+}
+
+fn spawn_render(image: Image, flight_id: u64, preload: bool) {
     glib::spawn_future_local(async move {
+        let permit = acquire_render_permit(preload).await;
         let hash = image.hash.clone();
-        let rendered = gio::spawn_blocking(move || photon_import::thumbnails::full_resolution(&image)).await;
+
+        // Check whether this render is still needed after waiting for a permit.
+        let still_needed = IN_FLIGHT.with(|m| {
+            let mut map = m.borrow_mut();
+            let Some(entry) = map.get(&hash) else {
+                return false;
+            };
+            if entry.id != flight_id {
+                return false;
+            }
+            let any_view_needs = entry
+                .views
+                .iter()
+                .filter_map(Weak::upgrade)
+                .any(|v| v.needs_detail_pixels());
+            let wanted_preload = WANTED_PRELOADS.with(|w| w.borrow().iter().any(|h| h == &hash));
+            if any_view_needs || wanted_preload {
+                true
+            } else {
+                if let Some(removed) = map.remove(&hash) {
+                    for w in removed.views {
+                        with(&w, |v| {
+                            v.full_requested.set(false);
+                            v.spinner.set_visible(false);
+                        });
+                    }
+                }
+                false
+            }
+        });
+        if !still_needed {
+            drop(permit);
+            return;
+        }
+
+        let rendered =
+            gio::spawn_blocking(move || photon_import::thumbnails::full_resolution(&image)).await;
+        drop(permit);
+
+        let flight = IN_FLIGHT.with(|m| {
+            let mut map = m.borrow_mut();
+            if map.get(&hash).is_some_and(|e| e.id == flight_id) {
+                map.remove(&hash)
+            } else {
+                None
+            }
+        });
+        let Some(flight) = flight else {
+            // Invalidated (e.g. rotated) while the worker was running: discard.
+            return;
+        };
+
         let rgb = match rendered {
             Ok(Ok(rgb)) => rgb,
             Ok(Err(e)) => {
                 log::warn!("Full-resolution render failed: {e:#}");
-                with(&weak, |v| v.show_render_failure(&format!("{e:#}")));
+                for w in &flight.views {
+                    with(w, |v| v.show_render_failure(&format!("{e:#}")));
+                }
                 return;
             }
             Err(_) => {
                 log::warn!("Full-resolution render panicked");
-                with(&weak, |v| v.show_render_failure("the renderer crashed"));
+                for w in &flight.views {
+                    with(w, |v| v.show_render_failure("the renderer crashed"));
+                }
                 return;
             }
         };
@@ -676,11 +918,69 @@ fn load_full_resolution(view: &Rc<PhotoView>) {
             w as usize * 3,
         )
         .upcast();
+
+        let has_active_view = flight.views.iter().any(|w| w.upgrade().is_some());
         FULL_RES.with(|c| {
             let mut cache = c.borrow_mut();
-            cache.push_front((hash, texture.clone()));
+            cache.retain(|(h, _)| h != &hash);
+            if has_active_view || cache.is_empty() {
+                cache.push_front((hash, texture.clone()));
+            } else {
+                // Keep the currently viewed photo at index 0 so preloading both
+                // neighbors never evicts the photo on screen.
+                cache.insert(1, (hash, texture.clone()));
+            }
             cache.truncate(FULL_RES_CACHE);
         });
-        with(&weak, |v| v.show_texture(&texture, true));
+        for w in &flight.views {
+            with(w, |v| v.show_texture(&texture, true));
+        }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_permit_prioritizes_active_views_over_preloads_and_caps_concurrency() {
+        glib::MainContext::default().block_on(async {
+            let p1 = acquire_render_permit(false).await;
+            let p2 = acquire_render_permit(false).await;
+            assert_eq!(RENDER_SEM.with(|s| s.borrow().active), 2);
+
+            let order = Rc::new(RefCell::new(Vec::new()));
+
+            let o_low = order.clone();
+            let low_task = glib::spawn_future_local(async move {
+                let _p = acquire_render_permit(true).await;
+                o_low.borrow_mut().push("preload");
+            });
+
+            let o_high = order.clone();
+            let high_task = glib::spawn_future_local(async move {
+                let p = acquire_render_permit(false).await;
+                o_high.borrow_mut().push("active");
+                p
+            });
+
+            // Let both tasks register in the semaphore queues.
+            glib::timeout_future(std::time::Duration::from_millis(5)).await;
+            assert!(order.borrow().is_empty(), "neither waiter may run while 2 permits are held");
+
+            // Releasing 1 permit while 2 waiters are queued must wake the active
+            // view (`high_task`) even though `low_task` was queued first.
+            drop(p1);
+            let p_high = high_task.await.unwrap();
+            glib::timeout_future(std::time::Duration::from_millis(5)).await;
+            assert_eq!(&*order.borrow(), &["active"], "preload must wait while 2 permits are held");
+
+            drop(p_high);
+            drop(p2);
+            let _ = low_task.await;
+
+            assert_eq!(&*order.borrow(), &["active", "preload"]);
+            assert_eq!(RENDER_SEM.with(|s| s.borrow().active), 0);
+        });
+    }
 }

@@ -437,6 +437,9 @@ pub struct ImportBatch {
     pub status: String,
     pub started_at: i64,
     pub completed_at: Option<i64>,
+    /// Source files (`(photo_path, xmp_path)`) from a `Move` import whose removal
+    /// was deferred until after the user confirms deleting them.
+    pub removable_sources: Vec<(PathBuf, Option<PathBuf>)>,
 }
 
 impl ImportBatch {

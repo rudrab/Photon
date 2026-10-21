@@ -67,6 +67,10 @@ pub struct ImportConfig {
     /// layout, so two copies exist before the card is formatted. A move only
     /// deletes a file from the card once both copies are made.
     pub backup_dir: Option<PathBuf>,
+    /// Move: keep committed source files on disk during the import and return
+    /// them in [`ImportBatch::removable_sources`] so the caller (e.g. the GUI)
+    /// can ask for confirmation before deleting them from the SD card / source.
+    pub defer_source_removal: bool,
     pub cancel: CancelToken,
 }
 
@@ -82,6 +86,7 @@ impl Default for ImportConfig {
             io_threads: 0,
             verify: true,
             backup_dir: None,
+            defer_source_removal: false,
             cancel: CancelToken::default(),
         }
     }
@@ -104,8 +109,9 @@ impl CancelToken {
 
 /// What happened to one file.
 enum FileOutcome {
-    /// Imported; with a problem to report (e.g. no preview could be made).
-    New(Box<Image>, Option<String>),
+    /// Imported; with an optional warning (e.g. no preview could be made) and
+    /// optional `(source_path, source_xmp_path)` to remove after DB commit.
+    New(Box<Image>, Option<String>, Option<(PathBuf, Option<PathBuf>)>),
     Duplicate,
     Failed(String),
 }
@@ -139,6 +145,7 @@ struct Outcome {
     inserted: usize,
     duplicates: usize,
     errors: Vec<String>,
+    removable_sources: Vec<(PathBuf, Option<PathBuf>)>,
 }
 
 /// The import engine. Stateless apart from DB + thumbnail handles.
@@ -263,6 +270,7 @@ impl ImportEngine {
             (Ok(()), false) => "completed",
         }
         .to_string();
+        batch.removable_sources = out.removable_sources;
         queries::complete_import_batch(&*self.db.conn()?, &batch)?;
         result?;
 
@@ -320,7 +328,7 @@ impl ImportEngine {
                     .into_iter()
                     .par_bridge()
                     .for_each_with(ready_tx, |tx, (path, mut outcome)| {
-                        if let (FileOutcome::New(img, warning), Some(thumbs)) = (&mut outcome, thumbs) {
+                        if let (FileOutcome::New(img, warning, _), Some(thumbs)) = (&mut outcome, thumbs) {
                             match thumbs.ensure_grid(img) {
                                 Ok((_, th)) => {
                                     img.thumbhash = th;
@@ -361,23 +369,41 @@ impl ImportEngine {
     ) -> anyhow::Result<()> {
         let mut conn = self.db.conn()?;
         let mut pending: Vec<Image> = Vec::new();
+        let mut pending_sources: Vec<Option<(PathBuf, Option<PathBuf>)>> = Vec::new();
         let mut last_commit = Instant::now();
         let mut processed = 0;
 
-        let mut flush = |pending: &mut Vec<Image>, out: &mut Outcome| -> anyhow::Result<()> {
+        let mut flush = |pending: &mut Vec<Image>,
+                         pending_sources: &mut Vec<Option<(PathBuf, Option<PathBuf>)>>,
+                         out: &mut Outcome|
+         -> anyhow::Result<()> {
             if pending.is_empty() {
                 return Ok(());
             }
             let (inserted, dupes) = queries::batch_insert_images(&mut conn, pending)?;
-            
-            for img in pending.iter() {
+
+            for (img, removable) in pending.iter().zip(pending_sources.drain(..)) {
                 if let Some(id) = img.id {
                     if let Err(e) = crate::sidecar::read_image_xmp(&mut conn, id, &img.path, None) {
                         log::warn!("Could not update image {id} from XMP: {e}");
                     }
+                    // Only after the database transaction commits (setting `img.id`)
+                    // may a Move import remove or queue removal of the original file.
+                    if let Some((src, src_xmp)) = removable {
+                        if config.defer_source_removal {
+                            out.removable_sources.push((src, src_xmp));
+                        } else if let Err(e) = fs::remove_file(&src) {
+                            out.errors.push(format!(
+                                "{}: imported, but not removed from the source: {e}",
+                                src.display()
+                            ));
+                        } else if let Some(xmp) = src_xmp {
+                            let _ = fs::remove_file(xmp);
+                        }
+                    }
                 }
             }
-            
+
             out.inserted += inserted;
             out.duplicates += dupes;
             pending.clear();
@@ -392,8 +418,9 @@ impl ImportEngine {
                 Ok((path, outcome)) => {
                     processed += 1;
                     match outcome {
-                        FileOutcome::New(img, warning) => {
+                        FileOutcome::New(img, warning, removable) => {
                             pending.push(*img);
+                            pending_sources.push(removable);
                             out.errors.extend(warning);
                         }
                         FileOutcome::Duplicate => out.duplicates += 1,
@@ -411,11 +438,11 @@ impl ImportEngine {
             if pending.len() >= config.batch_size.max(1)
                 || (!pending.is_empty() && last_commit.elapsed() >= COMMIT_INTERVAL)
             {
-                flush(&mut pending, out)?;
+                flush(&mut pending, &mut pending_sources, out)?;
                 last_commit = Instant::now();
             }
         }
-        flush(&mut pending, out)
+        flush(&mut pending, &mut pending_sources, out)
     }
 
     /// Generate grid thumbnails for library images that have none (e.g. after
@@ -572,16 +599,50 @@ pub struct PreImportReport {
     pub duplicates: Vec<PreImportItem>,
 }
 
+/// Remove source files (and any companion XMP sidecars) that were deferred
+/// during a `Move` import (`defer_source_removal: true`). Returns the number
+/// of source photos deleted and any error messages for files that could not
+/// be removed.
+pub fn remove_imported_sources(
+    sources: &[(PathBuf, Option<PathBuf>)],
+) -> (usize, Vec<String>) {
+    let mut removed = 0;
+    let mut errors = Vec::new();
+    for (src, src_xmp) in sources {
+        match fs::remove_file(src) {
+            Ok(()) => {
+                removed += 1;
+                if let Some(xmp) = src_xmp {
+                    let _ = fs::remove_file(xmp);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                removed += 1;
+                if let Some(xmp) = src_xmp {
+                    let _ = fs::remove_file(xmp);
+                }
+            }
+            Err(e) => {
+                errors.push(format!("{}: {e}", src.display()));
+            }
+        }
+    }
+    (removed, errors)
+}
+
 /// Decide one file's fate with as little I/O as possible, and place it.
 fn process_file(src: &Path, ctx: &Context) -> FileOutcome {
     match try_process_file(src, ctx) {
-        Ok(Some(img)) => FileOutcome::New(Box::new(img), None),
+        Ok(Some((img, removable))) => FileOutcome::New(Box::new(img), None, removable),
         Ok(None) => FileOutcome::Duplicate,
         Err(e) => FileOutcome::Failed(format!("{}: {e:#}", src.display())),
     }
 }
 
-fn try_process_file(src: &Path, ctx: &Context) -> anyhow::Result<Option<Image>> {
+fn try_process_file(
+    src: &Path,
+    ctx: &Context,
+) -> anyhow::Result<Option<(Image, Option<(PathBuf, Option<PathBuf>)>)>> {
     let config = ctx.config;
     let fs_meta = fs::metadata(src)?;
     if fs_meta.len() == 0 {
@@ -611,10 +672,7 @@ fn try_process_file(src: &Path, ctx: &Context) -> anyhow::Result<Option<Image>> 
         return Ok(None);
     }
 
-    // How the XMP sidecar follows the photo: as the photo did. A move whose
-    // source had to stay (no backup) copies the sidecar, so the photo left
-    // on the card keeps its edits and ratings.
-    let mut sidecar_mode = config.mode;
+    let mut backed_up_ok = true;
 
     // Content identity + placement.
     let (path, hash) = match config.mode {
@@ -625,13 +683,18 @@ fn try_process_file(src: &Path, ctx: &Context) -> anyhow::Result<Option<Image>> 
             }
             (src.to_path_buf(), hash)
         }
-        FolderImportMode::Copy => {
+        FolderImportMode::Copy | FolderImportMode::Move => {
             // The same photo may already sit where it would go: an earlier
             // import was cut short after copying it, before registering it.
             // Adopt that copy rather than make a second one (`IMG_1_1.jpg`).
+            // Move also copies first and only deletes the source after the
+            // database commit (and after user confirmation in the GUI), so an
+            // interrupted import never strands an unindexed photo.
             let len = fs::metadata(src)?.len();
             let natural = ctx.planner.lock().unwrap().natural(src, created_at)?;
-            let adopted = if fs::metadata(&natural).is_ok_and(|m| m.is_file() && m.len() == len) {
+            let adopted = if natural != src
+                && fs::metadata(&natural).is_ok_and(|m| m.is_file() && m.len() == len)
+            {
                 let hash = dedup::blake3_hash_file(src)?;
                 library::is_same_file(&natural, len, &hash).then_some(hash)
             } else {
@@ -641,7 +704,7 @@ fn try_process_file(src: &Path, ctx: &Context) -> anyhow::Result<Option<Image>> 
                 if !ctx.claim(&hash) {
                     return Ok(None);
                 }
-                back_up(ctx, src, &natural, &hash);
+                backed_up_ok = back_up(ctx, src, &natural, &hash);
                 (natural, hash)
             } else {
                 let dest = ctx.planner.lock().unwrap().plan(src, created_at)?;
@@ -652,7 +715,7 @@ fn try_process_file(src: &Path, ctx: &Context) -> anyhow::Result<Option<Image>> 
                 }
                 match staged.commit() {
                     Ok(dest) => {
-                        back_up(ctx, src, &dest, &hash);
+                        backed_up_ok = back_up(ctx, src, &dest, &hash);
                         (dest, hash)
                     }
                     Err(e) => {
@@ -661,39 +724,6 @@ fn try_process_file(src: &Path, ctx: &Context) -> anyhow::Result<Option<Image>> 
                     }
                 }
             }
-        }
-        FolderImportMode::Move => {
-            let hash = dedup::blake3_hash_file(src)?;
-            if !ctx.claim(&hash) {
-                return Ok(None); // the source of a duplicate is left untouched
-            }
-            // Already in place? An earlier import moved this photo and was cut
-            // short before registering it: there is nothing to move, and the
-            // card's copy (kept until now) can go once the backup exists.
-            let natural = ctx.planner.lock().unwrap().natural(src, created_at)?;
-            let (dest, moved) = if library::is_same_file(&natural, fs::metadata(src)?.len(), &hash) {
-                (natural, library::Moved::Copied)
-            } else {
-                let dest = ctx.planner.lock().unwrap().plan(src, created_at)?;
-                match library::move_into_place(src, &dest, Some(&hash), config.verify) {
-                    Ok(moved) => (dest, moved),
-                    Err(e) => {
-                        ctx.release(&hash);
-                        return Err(e.into());
-                    }
-                }
-            };
-            // The card's copy goes only once the library copy (and backup) exist.
-            let backed_up = back_up(ctx, src, &dest, &hash);
-            if moved == library::Moved::Copied {
-                if !backed_up {
-                    sidecar_mode = FolderImportMode::Copy;
-                } else if let Err(e) = fs::remove_file(src) {
-                    ctx.warn(format!("{}: imported, but not removed from the source: {e}", src.display()));
-                    sidecar_mode = FolderImportMode::Copy;
-                }
-            }
-            (dest, hash)
         }
     };
 
@@ -724,20 +754,26 @@ fn try_process_file(src: &Path, ctx: &Context) -> anyhow::Result<Option<Image>> 
         image.has_sidecar = true;
     }
 
+    let mut xmp_src_to_remove = None;
     if let Some(xmp) = sidecar::find_xmp(src) {
         let xmp_path = if config.mode == FolderImportMode::InPlace {
             Some(xmp)
         } else {
             let xmp_dest = sidecar::xmp_destination(src, &xmp, &path);
-            match library::transfer_sidecar(sidecar_mode, &xmp, &xmp_dest) {
+            match library::transfer_sidecar(FolderImportMode::Copy, &xmp, &xmp_dest) {
                 Ok(()) => {
+                    let mut xmp_backed_up = true;
                     if let Some(backup_root) = &config.backup_dir {
                         let backed_up = fs::read(&xmp_dest).map_err(Into::into).and_then(|bytes| {
                             library::back_up(&xmp_dest, &blake3::hash(&bytes).to_hex(), &ctx.library_root, backup_root)
                         });
                         if let Err(e) = backed_up {
                             ctx.warn(format!("{}: XMP sidecar not backed up: {e}", src.display()));
+                            xmp_backed_up = false;
                         }
+                    }
+                    if config.mode == FolderImportMode::Move && xmp_backed_up {
+                        xmp_src_to_remove = Some(xmp);
                     }
                     Some(xmp_dest)
                 }
@@ -760,7 +796,10 @@ fn try_process_file(src: &Path, ctx: &Context) -> anyhow::Result<Option<Image>> 
         image.metadata_json = Some(serde_json::Value::Object(meta_obj).to_string());
     }
 
-    Ok(Some(image))
+    let removable = (config.mode == FolderImportMode::Move && backed_up_ok && path != src)
+        .then(|| (src.to_path_buf(), xmp_src_to_remove));
+
+    Ok(Some((image, removable)))
 }
 
 /// Make the backup copy of newly placed library file `dest` (from `src`),
@@ -1252,5 +1291,69 @@ mod tests {
         // (its bytes are the photo) and nothing aborted.
         assert!(names.contains(&"half.jpg".to_string()), "{names:?}");
         assert_eq!(files_in(card.path()), 5, "a copy import never touches the card");
+    }
+
+    #[test]
+    fn move_on_same_filesystem_keeps_source_until_backed_up_and_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let card = dir.path().join("card");
+        let lib = dir.path().join("lib");
+        fs::create_dir_all(&card).unwrap();
+        fs::create_dir_all(&lib).unwrap();
+
+        let src = card.join("IMG_9.jpg");
+        write_jpeg(&src, &Spec::default());
+        let src_xmp = card.join("IMG_9.jpg.xmp");
+        fs::write(&src_xmp, "<xmp/>").unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        fs::write(&blocker, b"").unwrap();
+
+        let cfg = ImportConfig {
+            backup_dir: Some(blocker.join("backup")),
+            ..config(FolderImportMode::Move, &lib)
+        };
+        let engine = engine();
+        let batch = engine
+            .import(&DiskSource::new(card.clone(), true), &cfg, None)
+            .unwrap();
+
+        assert_eq!(batch.imported_count, 1);
+        assert!(batch.error_count >= 1);
+        assert!(src.exists(), "same-FS move must not delete source when backup fails");
+        assert!(src_xmp.exists(), "sidecar stays with source");
+        assert!(lib.join("2023/07/04/IMG_9.jpg").exists());
+        assert!(lib.join("2023/07/04/IMG_9.jpg.xmp").exists());
+    }
+
+    #[test]
+    fn deferred_move_keeps_sources_until_confirmed() {
+        let card = tempfile::tempdir().unwrap();
+        let lib = tempfile::tempdir().unwrap();
+        let src = card.path().join("IMG_9.jpg");
+        write_jpeg(&src, &Spec::default());
+        let src_xmp = card.path().join("IMG_9.jpg.xmp");
+        fs::write(&src_xmp, "<xmp/>").unwrap();
+
+        let cfg = ImportConfig {
+            defer_source_removal: true,
+            ..config(FolderImportMode::Move, lib.path())
+        };
+        let engine = engine();
+        let batch = engine
+            .import(&DiskSource::new(card.path().to_path_buf(), true), &cfg, None)
+            .unwrap();
+
+        assert_eq!(batch.imported_count, 1);
+        assert_eq!(batch.removable_sources.len(), 1);
+        assert!(src.exists(), "source remains on card until user confirms");
+        assert!(src_xmp.exists(), "sidecar remains on card until user confirms");
+        assert!(lib.path().join("2023/07/04/IMG_9.jpg").exists());
+        assert!(lib.path().join("2023/07/04/IMG_9.jpg.xmp").exists());
+
+        let (removed, errors) = remove_imported_sources(&batch.removable_sources);
+        assert_eq!(removed, 1);
+        assert!(errors.is_empty());
+        assert!(!src.exists());
+        assert!(!src_xmp.exists());
     }
 }

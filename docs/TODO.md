@@ -554,9 +554,7 @@ Done 2026-10-15 (for a photo trip: a laptop, memory cards, hotel power).
   chosen, e.g. an external SSD). `Preferences.library_dir`, `library::library_root`, a writable check
   (`library::is_writable_dir`) with a warning in the import dialog. Existing libraries are not moved
   (paths are stored per photo).
-- 🔴 **Move still deletes the card's copy before the photo is registered in the database** (a crash in the
-  ~0.4 s window leaves the photo safely in the library folder but unknown to Photon; importing the
-  library folder in place registers it). Better: remove the source only after the commit.
+- 🟢 **Move deletes the card's copy only after database commit and user confirmation.** `Move` stage-copies the photo and XMP sidecar into the library (and backup folder when configured) without touching the source in the I/O stage; source removal only happens after `commit_stream` commits the rows to SQLite, and in the GUI (`defer_source_removal: true`) a post-import confirmation dialog (*"N photos imported — delete from SD card / source folder?"*) asks before removing the committed originals. Move is now copy-then-delete, so on the same disk it is slower and needs temporary space (it was a rename). 🔴 The list of originals to delete is only in memory: if the app closes before the answer, the originals stay and are not offered again.
 - Not verified by hand in the GUI: the Preferences row, the import dialog's folder line, the dialogs'
   looks. Verified with a throw-away harness driving the real app (real Copy import, quit mid-way, next
   start, import again).
@@ -583,7 +581,7 @@ Done 2026-10-15:
 - 🟢 GIMP: a `<stem>.xcf` beside the photo (any case) sets `images.has_xcf` (migration 020) during the library check, which already lists each folder; tiles show an `XCF` badge. "Open in editor" reopens that XCF when the raster editor is GIMP (`find_xcf`), because GIMP 3.2 itself opens the flat JPG (checked headless: 1 layer). 🔴 Not done: import GIMP's exported JPG/PNG as a version of the shot; per-photo choice between the project and the flat file.
 - 🟢 Monitored sidecar in `detail.rs::open_in_editor` on editor process exit and in `check_library` on window focus/startup, re-rendering thumbnails and marking `edited = 1` in SQLite (migration 019).
 
-### 🔴 R-16 · Culling power features · M
+### 🟢 R-16 · Culling power features · M
 
 - 🟢 Compare (`ui/compare.rs`, 2 selected): full-resolution panes with zoom and pan in step;
   select vs candidate (← → step the candidate through the timeline, ↑ / "Make Select" keeps
@@ -591,13 +589,13 @@ Done 2026-10-15:
 - 🟢 Survey (`ui/survey.rs`, 3–9 selected): a grid with marks and quality rings per photo;
   ✕ / Backspace drops a photo from the survey, Enter opens it in 1-up. The bar's Compare
   button opens Compare for 2, Survey for 3–9.
-- 🔴 Preload the next and previous full-res renders while zoomed (a background task into `FULL_RES`).
+- 🟢 (unit-tested only, not checked by hand in the GUI) Preload the next and previous full-res renders while zoomed (`photo_view::preload_neighbors` into `FULL_RES` at lower priority than active views).
 - 🟢 Zoom to faces (`ui/faces.rs`, `PhotoView::zoom_to_face`): F zooms to a face, F again the next
-  (Shift+F back), in 1-up, Compare (each pane to its own face) and Survey (every photo, cells are
+  (Shift+F back), in 1-up (persisted across burst stepping), Compare (each pane to its own face) and Survey (every photo, cells are
   now zoomable `PhotoView`s). YuNet on the Large preview on demand, cached per session; faces
   numbered left to right (background faces < 40 % of the largest dropped), so the same person
   across a burst. Not verified by hand in the GUI yet.
-- 🔴 Limit concurrent full-res renders: face zoom in a 9-photo Survey can develop 9 RAWs at once (~300 MB each).
+- 🟢 Limit concurrent full-res renders (`MAX_CONCURRENT_FULL_RES = 2` with `RenderPermit` and `IN_FLIGHT` deduplication; queued renders for dropped or unzoomed views are skipped).
 - 🟢 Continuous zoom in the 1-up viewer (`ui/photo_view.rs`): log slider, Fit / 1:1 buttons, Ctrl+wheel and pinch anchored at the pointer, +/−, drag to pan, double-click toggles Fit ↔ 1:1 at the clicked point. Full resolution loads only once the zoom needs more pixels than the Large preview.
 - 🟢 Sharpness score & burst rejects: variance of the Laplacian (4×4 tile max + global), exposure clipping, burst detection (≤ 2 s), "Photo Quality" results dialog with grouped bursts, XMP Rating="-1" sync, viewer info panel sharpness, timeline "Possibly blurred" filter, and parallel rayon quality backfill (see AI-7).
 
@@ -610,7 +608,7 @@ Done 2026-10-15:
   shot by shot; a button (and **V**) switches to the shot's other files.
 - 🟢 Ratings, picks and rejects apply to every file of the shot (grid and viewer),
   with undo restoring each file's own value; each file's XMP is written.
-- 🔴 Rotation still applies to the file on screen only; make it shot-wide.
+- 🟢 Rotation is shot-wide (`detail::rotate_shots` & `apply_rotated_shots`): rotating in the grid or 1-up viewer rotates every non-video file of the shot (RAW + JPG), writes each file's XMP sidecar, regenerates grid thumbnails/thumbhashes, invalidates caches, and supports shot-wide undo/redo.
 - 🟢 Tags are shot-wide (implemented with R-19): tags added or removed apply to all companion files (RAW + JPG) and sidecars, with undo/redo per batch.
 - 🔴 Choose which version is the cover; expand a stack in the grid.
 - 🔴 **Auto-detect bracketed exposures (HDR sequences):**

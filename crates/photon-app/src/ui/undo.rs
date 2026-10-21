@@ -59,6 +59,9 @@ pub enum UndoAction {
 pub struct UndoManager {
     undo_stack: Vec<UndoAction>,
     redo_stack: Vec<UndoAction>,
+    /// Photos whose Grid thumbnail must be rebuilt after an orientation
+    /// undo/redo; the caller does that off the UI thread (`take_thumbnail_regen`).
+    regen_ids: Vec<i64>,
 }
 
 impl UndoManager {
@@ -72,6 +75,11 @@ impl UndoManager {
         if self.undo_stack.len() > MAX_UNDO_STACK {
             self.undo_stack.remove(0);
         }
+    }
+
+    /// Photos to regenerate Grid thumbnails for after the last undo/redo.
+    pub fn take_thumbnail_regen(&mut self) -> Vec<i64> {
+        std::mem::take(&mut self.regen_ids)
     }
 
     #[allow(dead_code)]
@@ -120,14 +128,17 @@ impl UndoManager {
                 }
                 UndoAction::Orientation { previous, cw: _ } => {
                     let mut conn = db.conn()?;
+                    let mut ids = Vec::with_capacity(previous.len());
                     for &(id, old_o, ref hash) in previous {
+                        ids.push(id);
                         let orient = old_o.unwrap_or(1);
                         queries::set_orientation(&mut conn, id, orient)?;
                         sync_orientation_xmp(&conn, id, orient);
                         photon_import::thumbnails::invalidate_cache(cache_dir, hash);
                         crate::ui::detail::invalidate_full_res(hash);
                     }
-                    let n = previous.len();
+                    let n = queries::count_distinct_shots(&conn, &ids).unwrap_or(ids.len());
+                    self.regen_ids.extend(ids);
                     Ok(format!("Undid: Rotation ({} photo{})", n, if n == 1 { "" } else { "s" }))
                 }
                 UndoAction::TagAdd { image_ids, tag_id, tag_name } => {
@@ -257,14 +268,17 @@ impl UndoManager {
                 }
                 UndoAction::Orientation { previous, cw } => {
                     let mut conn = db.conn()?;
+                    let mut ids = Vec::with_capacity(previous.len());
                     for &(id, old_o, ref hash) in previous {
+                        ids.push(id);
                         let next_o = photon_core::models::rotate_orientation(old_o, *cw);
                         queries::set_orientation(&mut conn, id, next_o)?;
                         sync_orientation_xmp(&conn, id, next_o);
                         photon_import::thumbnails::invalidate_cache(cache_dir, hash);
                         crate::ui::detail::invalidate_full_res(hash);
                     }
-                    let n = previous.len();
+                    let n = queries::count_distinct_shots(&conn, &ids).unwrap_or(ids.len());
+                    self.regen_ids.extend(ids);
                     Ok(format!("Redid: Rotation ({} photo{})", n, if n == 1 { "" } else { "s" }))
                 }
                 UndoAction::TagAdd { image_ids, tag_id, tag_name } => {

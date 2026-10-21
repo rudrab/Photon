@@ -332,6 +332,7 @@ pub(crate) fn show_import_options_dialog(mw: &MainWindow, source_path: PathBuf, 
                 destination_dir: prefs.library_dir.clone(),
                 verify: prefs.verify_imports,
                 backup_dir: prefs.import_backup_dir,
+                defer_source_removal: mode == FolderImportMode::Move,
                 ..ImportConfig::default()
             };
 
@@ -735,6 +736,7 @@ fn run_import(
     source: Box<dyn photon_import::sources::ImportSource + 'static>,
     config: ImportConfig,
 ) {
+    let verified = config.verify;
     /// Newly committed photos are shown at most this often, so a fast import
     /// doesn't spend its time re-laying out the timeline.
     const LIVE_REFRESH: Duration = Duration::from_millis(1500);
@@ -812,8 +814,12 @@ fn run_import(
         drop(guard.take());
         mw.active_imports.set(mw.active_imports.get().saturating_sub(1));
 
+        let mut removable_sources = Vec::new();
+        let mut source_path = String::new();
         let summary = match result {
-            Ok(batch) => {
+            Ok(mut batch) => {
+                removable_sources = std::mem::take(&mut batch.removable_sources);
+                source_path = batch.source_path.clone();
                 let what = if batch.status == "cancelled" { "Import stopped" } else { "Import complete" };
                 let mut text = format!(
                     "{what}: {} new, {} already in library",
@@ -830,6 +836,10 @@ fn run_import(
         mw.status_label.set_text(&summary);
         mw.progress_bar.set_fraction(1.0);
 
+        if !removable_sources.is_empty() {
+            confirm_delete_imported_sources(&mw, &source_path, removable_sources, verified);
+        }
+
         if let Some(id) = cancel_handler.take() {
             mw.cancel_button.disconnect(id);
         }
@@ -842,6 +852,62 @@ fn run_import(
         });
         glib::ControlFlow::Break
     });
+}
+
+fn confirm_delete_imported_sources(
+    mw: &MainWindow,
+    source_path: &str,
+    sources: Vec<(PathBuf, Option<PathBuf>)>,
+    verified: bool,
+) {
+    let count = sources.len();
+    let noun = if count == 1 { "photo" } else { "photos" };
+    let src = PathBuf::from(source_path);
+    let from_card = src.components().any(|c| c.as_os_str() == "DCIM") || src.join("DCIM").is_dir();
+    let location = if from_card { "SD card" } else { "source folder" };
+
+    let heading = format!("{count} {noun} imported — delete from {location}?");
+    let state = if verified { "copied, verified" } else { "copied (verification is off)" };
+    let body = format!(
+        "{count} {noun} {state} and added to your library.\n\n\
+         Delete the original files from {source_path}?"
+    );
+
+    let dialog = adw::MessageDialog::new(Some(&mw.window), Some(&heading), Some(&body));
+    dialog.add_response("keep", "Keep Originals");
+    dialog.add_response("delete", "Delete Originals");
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("keep"));
+    dialog.set_close_response("keep");
+
+    let mw = mw.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response != "delete" {
+            return;
+        }
+        let sources = sources.clone();
+        let (tx, rx) = async_channel::bounded(1);
+        thread::spawn(move || {
+            let res = photon_import::engine::remove_imported_sources(&sources);
+            let _ = tx.send_blocking(res);
+        });
+        let mw = mw.clone();
+        glib::spawn_future_local(async move {
+            if let Ok((removed, errors)) = rx.recv().await {
+                let noun = if removed == 1 { "photo" } else { "photos" };
+                let msg = if errors.is_empty() {
+                    format!("Deleted {removed} {noun} from {location}")
+                } else {
+                    format!(
+                        "Deleted {removed} {noun} from {location} ({} could not be removed)",
+                        errors.len()
+                    )
+                };
+                (mw.share_context().notify)(&msg);
+            }
+        });
+    });
+    dialog.present();
 }
 
 // ═══════════════════════════════════════════════════════════
