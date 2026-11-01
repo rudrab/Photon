@@ -124,6 +124,10 @@ button.destructive-action {
     opacity: 0.88;
 }
 
+.photon-tile.photon-flagged {
+    outline: 3px solid @warning_color;
+}
+
 .photon-tile.photon-tile-selected {
     outline: 3px solid @accent_bg_color;
     box-shadow: 0 0 0 2px alpha(@accent_bg_color, 0.4);

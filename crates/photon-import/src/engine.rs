@@ -555,10 +555,13 @@ impl ImportEngine {
 
                     if known.contains(src.to_string_lossy().as_ref()) {
                         let item = PreImportItem {
+                            id: 0,
                             path: src.clone(),
                             filename,
                             size_bytes,
                             created_at: None,
+                            camera_model: None,
+                            shot_key: String::new(),
                         };
                         return Some((true, item));
                     }
@@ -572,10 +575,13 @@ impl ImportEngine {
                     let duplicate =
                         suspected.contains(&DuplicateKey::new(&filename, size_bytes, created_at));
                     let item = PreImportItem {
+                        id: 0,
                         path: src.clone(),
                         filename,
                         size_bytes,
                         created_at,
+                        camera_model: meta.camera_model.clone(),
+                        shot_key: String::new(),
                     };
                     Some((duplicate, item))
                 })
@@ -591,16 +597,51 @@ impl ImportEngine {
             }
         }
 
+        // The same grouping the import uses, so a shot's files stay together.
+        let paths: Vec<PathBuf> = report.new_files.iter().map(|i| i.path.clone()).collect();
+        let groups = sidecar::group_map(&paths);
+        for (i, item) in report.new_files.iter_mut().enumerate() {
+            item.id = i as i64;
+            item.shot_key = groups
+                .get(&item.path)
+                .cloned()
+                .unwrap_or_else(|| item.path.to_string_lossy().into_owned());
+        }
+
         Ok(report)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct PreImportItem {
+    /// Position in [`PreImportReport::new_files`] (0 for duplicates); the
+    /// id the quality check ([`crate::quality::review_rejects`]) reports by.
+    pub id: i64,
     pub path: PathBuf,
     pub filename: String,
     pub size_bytes: i64,
     pub created_at: Option<i64>,
+    pub camera_model: Option<String>,
+    /// Files of one shot (RAW + JPG, edits) share this, as they will in the library.
+    pub shot_key: String,
+}
+
+impl crate::quality::BurstItem for PreImportItem {
+    fn item_id(&self) -> i64 {
+        self.id
+    }
+    fn created_at(&self) -> Option<i64> {
+        self.created_at
+    }
+    fn camera_model(&self) -> Option<&str> {
+        self.camera_model.as_deref()
+    }
+    fn flagged(&self) -> i32 {
+        0
+    }
+    fn shot_key(&self) -> Option<&str> {
+        Some(&self.shot_key)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1207,6 +1248,88 @@ mod tests {
         assert_eq!(names(&report.new_files), ["new.jpg"]);
         assert_eq!(names(&report.duplicates), ["old.jpg"]);
         assert_eq!(photos(&engine).len(), 1, "pre-scan must not import");
+    }
+
+    #[test]
+    fn importing_a_chosen_list_leaves_the_rest_on_the_card() {
+        let card = tempfile::tempdir().unwrap();
+        let lib = tempfile::tempdir().unwrap();
+        for (name, seed, date) in [
+            ("a.jpg", 1, "2023:07:04 09:30:00"),
+            ("b.jpg", 2, "2023:07:05 09:30:00"),
+            ("c.jpg", 3, "2023:07:06 09:30:00"),
+        ] {
+            write_jpeg(&card.path().join(name), &Spec { seed, date, ..Default::default() });
+        }
+        let engine = engine();
+        let cfg = config(FolderImportMode::Copy, lib.path());
+        let chosen = vec![card.path().join("b.jpg"), card.path().join("c.jpg")];
+        let source = crate::sources::FileListSource::new(chosen, "card".into());
+
+        let batch = engine.import(&source, &cfg, None).unwrap();
+        assert_eq!(batch.imported_count, 2);
+        let mut names: Vec<_> = photos(&engine).into_iter().map(|i| i.filename).collect();
+        names.sort();
+        assert_eq!(names, ["b.jpg", "c.jpg"]);
+        assert!(card.path().join("a.jpg").exists());
+    }
+
+    #[test]
+    fn pre_scan_keeps_a_shots_files_together_and_numbers_new_files() {
+        let card = tempfile::tempdir().unwrap();
+        write_jpeg(&card.path().join("IMG_1.jpg"), &Spec { seed: 1, ..Default::default() });
+        // Same stem, different extension: one shot.
+        write_jpeg(&card.path().join("IMG_1.jpeg"), &Spec { seed: 2, ..Default::default() });
+        write_jpeg(&card.path().join("IMG_2.jpg"), &Spec { seed: 3, ..Default::default() });
+
+        let engine = engine();
+        let files = DiskSource::new(card.path().to_path_buf(), true).scan().unwrap();
+        let report = engine.pre_scan(&files, FolderImportMode::Copy).unwrap();
+
+        assert_eq!(report.new_files.len(), 3);
+        let mut ids: Vec<_> = report.new_files.iter().map(|i| i.id).collect();
+        ids.sort();
+        assert_eq!(ids, [0, 1, 2]);
+        let key = |name: &str| report.new_files.iter().find(|i| i.filename == name).unwrap().shot_key.clone();
+        assert_eq!(key("IMG_1.jpg"), key("IMG_1.jpeg"));
+        assert_ne!(key("IMG_1.jpg"), key("IMG_2.jpg"));
+        assert_eq!(report.new_files[0].camera_model.as_deref(), Some("P1"));
+    }
+
+    #[test]
+    fn the_review_flags_a_blurred_photo_before_it_is_imported() {
+        let card = tempfile::tempdir().unwrap();
+        // A sharp checkerboard and a flat grey frame.
+        let sharp = image::RgbImage::from_fn(256, 256, |x, y| {
+            let v = if ((x / 8) + (y / 8)) % 2 == 0 { 240 } else { 20 };
+            image::Rgb([v, v, v])
+        });
+        sharp.save(card.path().join("sharp.jpg")).unwrap();
+        image::RgbImage::from_pixel(256, 256, image::Rgb([128, 128, 128]))
+            .save(card.path().join("flat.jpg"))
+            .unwrap();
+
+        let engine = engine();
+        let files = DiskSource::new(card.path().to_path_buf(), true).scan().unwrap();
+        let report = engine.pre_scan(&files, FolderImportMode::Copy).unwrap();
+
+        let to_score = crate::quality::files_to_score(&report.new_files);
+        assert_eq!(to_score.len(), 2);
+        let paths: Vec<PathBuf> = to_score.iter().map(|i| i.path.clone()).collect();
+        let scores = Mutex::new(HashMap::new());
+        crate::thumbnails::quality_of_files(&paths, &AtomicBool::new(false), |i, score| {
+            scores.lock().unwrap().insert(to_score[i].id, score);
+        })
+        .unwrap();
+
+        let flagged = crate::quality::review_rejects(
+            &report.new_files,
+            &scores.into_inner().unwrap(),
+            crate::quality::LibraryReference::default(),
+        );
+        let id_of = |name: &str| report.new_files.iter().find(|i| i.filename == name).unwrap().id;
+        assert!(flagged.contains_key(&id_of("flat.jpg")), "{flagged:?}");
+        assert!(!flagged.contains_key(&id_of("sharp.jpg")), "{flagged:?}");
     }
 
     #[test]

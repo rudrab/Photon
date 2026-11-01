@@ -22,7 +22,7 @@ mod testutil;
 pub use engine::{ImportConfig, ImportEngine};
 pub use export::{batch_export, export_single, ExportConfig, ExportFormat, ExportReport, ExportResize};
 pub use quality::{
-    compute_quality, find_bursts, suggest_rejects, Burst, BurstItem, QualityScore, RejectSuggestion,
+    compute_quality, files_to_score, find_bursts, review_rejects, suggest_rejects, Burst, BurstItem, QualityScore, RejectSuggestion,
     BLUR_SHARPNESS_FLOOR, BURST_SHARPNESS_REJECT_RATIO, HIGHLIGHT_CLIP_REJECT_THRESHOLD,
     QUALITY_LONG_EDGE, QUALITY_VERSION,
 };
@@ -30,6 +30,6 @@ pub use sidecar::{
     file_mtime, find_xcf, find_xmp, is_darktable_edited, read_image_xmp, read_xmp_metadata, reconcile_shots,
     repair_darktable_keyword_tags, sync_xmp_metadata, write_image_xmp, Keywords, XmpUpdate,
 };
-pub use sources::{DiskSource, ImportSource};
+pub use sources::{DiskSource, FileListSource, ImportSource};
 pub use thumbnails::{compute_histogram, HistogramData};
 pub mod icc;

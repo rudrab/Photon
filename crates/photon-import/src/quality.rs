@@ -584,6 +584,41 @@ pub fn suggest_rejects<T: BurstItem + Clone>(
     suggestions
 }
 
+/// The files of `items` worth scoring for [`review_rejects`]: one per shot
+/// (the JPG of a RAW+JPG pair, which is cheaper to read), since a shot is
+/// judged as a whole.
+pub fn files_to_score(items: &[crate::engine::PreImportItem]) -> Vec<&crate::engine::PreImportItem> {
+    let mut by_shot: HashMap<&str, &crate::engine::PreImportItem> = HashMap::new();
+    for item in items {
+        let is_raw = crate::metadata::format_of(&item.path).is_raw();
+        match by_shot.get(item.shot_key.as_str()) {
+            Some(kept) if !crate::metadata::format_of(&kept.path).is_raw() || is_raw => {}
+            _ => {
+                by_shot.insert(&item.shot_key, item);
+            }
+        }
+    }
+    let mut files: Vec<_> = by_shot.into_values().collect();
+    files.sort_by_key(|i| i.id);
+    files
+}
+
+/// Which photos not yet imported look like rejects, and why, keyed by
+/// [`PreImportItem::id`](crate::engine::PreImportItem::id): the same rules as
+/// Photo Quality in the library ([`suggest_rejects`]), without face
+/// detection. A suggestion covers every file of the shot.
+pub fn review_rejects(
+    items: &[crate::engine::PreImportItem],
+    scores: &HashMap<i64, QualityScore>,
+    library: LibraryReference,
+) -> HashMap<i64, String> {
+    let models: HashMap<i64, ImageQuality> = scores.iter().map(|(&id, s)| (id, s.to_model(id, 0))).collect();
+    suggest_rejects(items, &models, library)
+        .into_iter()
+        .map(|s| (s.image_id, s.reason))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

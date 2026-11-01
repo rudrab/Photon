@@ -20,10 +20,14 @@ use photon_core::models::{FolderImportMode, ImportProgress};
 use photon_import::engine::ImportConfig;
 use photon_import::pending_removal;
 use photon_import::sources::disk::DiskSource;
+use photon_import::sources::FileListSource;
 use photon_import::sources::digikam::{self, DigikamSource};
 use photon_import::sources::shotwell::ShotwellSource;
 use photon_import::sources::ImportSource;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -224,27 +228,29 @@ pub(crate) fn show_import_options_dialog(mw: &MainWindow, source_path: PathBuf, 
 
         let list_box = GtkBox::new(Orientation::Vertical, 8);
 
-        // New photos: a grid of previews taken from the files' embedded
-        // thumbnails (a few KB each, even for RAW), filled in as they load.
+        // New photos, one row per day with a checkbox: import only the days
+        // wanted. Previews (the files' embedded thumbnails, a few KB each even
+        // for RAW) load when a day is opened.
+        let review = Review::new(&report.new_files);
+        let import_btn = Button::new();
+        import_btn.add_css_class("suggested-action");
+        let update_import_button = {
+            let (review, import_btn) = (review.clone(), import_btn.clone());
+            Rc::new(move || {
+                let n = review.selected().len();
+                import_btn.set_label(&match n {
+                    0 => "Nothing Selected".to_string(),
+                    1 => "Import 1 Photo".to_string(),
+                    n => format!("Import {n} Photos"),
+                });
+                import_btn.set_sensitive(n > 0);
+            })
+        };
         if !report.new_files.is_empty() {
-            let new_expander = gtk4::Expander::builder()
-                .label(format!("New Photos to Import ({})", report.new_files.len()))
-                .expanded(true)
-                .build();
-            let new_box = GtkBox::new(Orientation::Vertical, 6);
-            new_box.set_margin_top(6);
-            new_box.append(&review_preview_grid(&report.new_files, &d_window));
-            if report.new_files.len() > REVIEW_PREVIEWS {
-                let more_lbl = Label::new(Some(&format!(
-                    "… and {} more",
-                    report.new_files.len() - REVIEW_PREVIEWS
-                )));
-                more_lbl.set_css_classes(&["caption", "dim-label"]);
-                more_lbl.set_halign(Align::Start);
-                new_box.append(&more_lbl);
+            list_box.append(&review_controls(&review, &mw_for_ui, &d_window, update_import_button.clone()));
+            for day in review.days.iter() {
+                list_box.append(&day_row(day, &review, &d_window, update_import_button.clone()));
             }
-            new_expander.set_child(Some(&new_box));
-            list_box.append(&new_expander);
         }
 
         // Duplicates preview (collapsed)
@@ -285,16 +291,11 @@ pub(crate) fn show_import_options_dialog(mw: &MainWindow, source_path: PathBuf, 
         let cancel_btn = Button::with_label("Cancel");
         cancel_btn.add_css_class("flat");
 
-        let import_label = if report.new_files.is_empty() {
-            "No New Photos".to_string()
-        } else {
-            format!("Import {} Photos", report.new_files.len())
-        };
-
-        let import_btn = Button::with_label(&import_label);
-        import_btn.add_css_class("suggested-action");
         if report.new_files.is_empty() {
+            import_btn.set_label("No New Photos");
             import_btn.set_sensitive(false);
+        } else {
+            update_import_button();
         }
 
         btn_box.append(&cancel_btn);
@@ -338,7 +339,8 @@ pub(crate) fn show_import_options_dialog(mw: &MainWindow, source_path: PathBuf, 
                 ..ImportConfig::default()
             };
 
-            let source = DiskSource::new(src_for_import.clone(), true);
+            // Only the days (and photos) left ticked in the review.
+            let source = FileListSource::new(review.selected(), src_for_import.display().to_string());
             run_import(&mw, Box::new(source), config);
         });
 
@@ -346,15 +348,290 @@ pub(crate) fn show_import_options_dialog(mw: &MainWindow, source_path: PathBuf, 
     });
 }
 
-/// How many previews the review dialog shows, and their size.
+/// How many previews one day of the review shows, and their size.
 const REVIEW_PREVIEWS: usize = 120;
 const REVIEW_PREVIEW_PX: u32 = 120;
+
+/// One day of the review: its photos and whether it will be imported.
+struct ReviewDay {
+    items: Vec<photon_import::engine::PreImportItem>,
+    check: CheckButton,
+    /// "· 3 look blurred" once the quality check has run.
+    note: Label,
+}
+
+/// What the review dialog will import, and what its quality check found.
+#[derive(Clone)]
+struct Review {
+    days: Rc<Vec<ReviewDay>>,
+    /// Photos the quality check suggests rejecting, by `PreImportItem::id`,
+    /// with the reason.
+    flags: Rc<RefCell<HashMap<i64, String>>>,
+    /// Leave those out of the import.
+    skip_flagged: CheckButton,
+    /// Tiles built so far, to mark when the quality check finishes.
+    tiles: Rc<RefCell<Vec<(i64, GtkBox)>>>,
+    /// All new photos, for the quality check.
+    all: Rc<Vec<photon_import::engine::PreImportItem>>,
+}
+
+impl Review {
+    fn new(new_files: &[photon_import::engine::PreImportItem]) -> Self {
+        // A shot's files go together: its day is that of its earliest file.
+        let mut shot_time: HashMap<&str, i64> = HashMap::new();
+        for item in new_files {
+            if let Some(t) = item.created_at {
+                let e = shot_time.entry(&item.shot_key).or_insert(t);
+                *e = (*e).min(t);
+            }
+        }
+        // Newest day first: the last trip is what is usually wanted.
+        let mut by_day: std::collections::BTreeMap<std::cmp::Reverse<Option<chrono::NaiveDate>>, Vec<_>> =
+            Default::default();
+        for item in new_files {
+            let day = shot_time
+                .get(item.shot_key.as_str())
+                .and_then(|&t| chrono::DateTime::from_timestamp(t, 0))
+                .map(|d| d.date_naive());
+            by_day.entry(std::cmp::Reverse(day)).or_default().push(item.clone());
+        }
+        let days = by_day
+            .into_iter()
+            .map(|(std::cmp::Reverse(day), items)| {
+                let label = match day {
+                    Some(d) => d.format("%A, %-d %B %Y").to_string(),
+                    None => "Date unknown".to_string(),
+                };
+                let size: i64 = items.iter().map(|i| i.size_bytes).sum();
+                let check = CheckButton::with_label(&format!("{label}  ·  {} ({})", photos_noun(items.len()), format_bytes(size)));
+                check.set_active(true);
+                let note = Label::new(None);
+                note.set_css_classes(&["caption", "warning"]);
+                ReviewDay { items, check, note }
+            })
+            .collect();
+        Self {
+            days: Rc::new(days),
+            flags: Rc::default(),
+            skip_flagged: CheckButton::with_label("Leave out likely rejects"),
+            tiles: Rc::default(),
+            all: Rc::new(new_files.to_vec()),
+        }
+    }
+
+    /// The files to import: those of the ticked days, minus the likely
+    /// rejects when asked.
+    fn selected(&self) -> Vec<PathBuf> {
+        let skip = self.skip_flagged.is_active();
+        let flags = self.flags.borrow();
+        self.days
+            .iter()
+            .filter(|d| d.check.is_active())
+            .flat_map(|d| d.items.iter())
+            .filter(|i| !(skip && flags.contains_key(&i.id)))
+            .map(|i| i.path.clone())
+            .collect()
+    }
+}
+
+fn photos_noun(n: usize) -> String {
+    if n == 1 { "1 photo".to_string() } else { format!("{n} photos") }
+}
+
+/// Select all / none, and the quality check.
+fn review_controls(
+    review: &Review,
+    mw: &MainWindow,
+    dialog: &Window,
+    update_import_button: Rc<dyn Fn()>,
+) -> GtkBox {
+    let bar = GtkBox::new(Orientation::Horizontal, 8);
+    bar.set_margin_bottom(4);
+
+    let all = Button::with_label("Select All");
+    let none = Button::with_label("Select None");
+    for (btn, on) in [(&all, true), (&none, false)] {
+        btn.add_css_class("flat");
+        let (review, update) = (review.clone(), update_import_button.clone());
+        btn.connect_clicked(move |_| {
+            for day in review.days.iter() {
+                day.check.set_active(on);
+            }
+            update();
+        });
+        bar.append(btn);
+    }
+    for day in review.days.iter() {
+        let update = update_import_button.clone();
+        day.check.connect_toggled(move |_| update());
+    }
+
+    let spacer = Label::new(None);
+    spacer.set_hexpand(true);
+    bar.append(&spacer);
+
+    let status = Label::new(None);
+    status.set_css_classes(&["caption", "dim-label"]);
+    bar.append(&status);
+
+    review.skip_flagged.set_sensitive(false);
+    review.skip_flagged.set_tooltip_text(Some("Available after the quality check"));
+    {
+        let update = update_import_button.clone();
+        review.skip_flagged.connect_toggled(move |_| update());
+    }
+    bar.append(&review.skip_flagged);
+
+    let check = Button::with_label("Check Quality");
+    check.set_tooltip_text(Some(
+        "Finds blurred or badly exposed photos before they are copied. Reads each photo's \
+         embedded preview, so it takes a little while on a card.",
+    ));
+    bar.append(&check);
+
+    let (review, mw, dialog, status_lbl) = (review.clone(), mw.clone(), dialog.clone(), status);
+    check.connect_clicked(move |btn| {
+        btn.set_sensitive(false);
+        status_lbl.set_text("Checking…");
+        run_quality_check(&review, &mw, &dialog, &status_lbl, update_import_button.clone());
+    });
+    bar
+}
+
+enum QualityMsg {
+    Progress(usize),
+    Done(HashMap<i64, String>),
+}
+
+/// Score the new photos' previews on worker threads, then mark the likely
+/// rejects. Stops when the dialog closes.
+fn run_quality_check(
+    review: &Review,
+    mw: &MainWindow,
+    dialog: &Window,
+    status: &Label,
+    update_import_button: Rc<dyn Fn()>,
+) {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let flag = cancelled.clone();
+    dialog.connect_destroy(move |_| flag.store(true, Ordering::Relaxed));
+
+    let items = review.all.to_vec();
+    let db = mw.db.clone();
+    let (tx, rx) = async_channel::unbounded::<QualityMsg>();
+    thread::spawn(move || {
+        let library = match db.conn() {
+            Ok(conn) => photon_import::quality::library_reference(&conn),
+            Err(e) => {
+                log::warn!("Quality check without the library's reference: {e}");
+                Default::default()
+            }
+        };
+        let to_score = photon_import::files_to_score(&items);
+        let paths: Vec<PathBuf> = to_score.iter().map(|i| i.path.clone()).collect();
+        let scores = std::sync::Mutex::new(HashMap::new());
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        let result = photon_import::thumbnails::quality_of_files(&paths, &cancelled, |i, score| {
+            if let Ok(mut scores) = scores.lock() {
+                scores.insert(to_score[i].id, score);
+            }
+            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % 5 == 0 {
+                let _ = tx.send_blocking(QualityMsg::Progress(n));
+            }
+        });
+        if let Err(e) = result {
+            log::warn!("Review quality check failed: {e:#}");
+        }
+        let scores = scores.into_inner().unwrap_or_default();
+        let flagged = photon_import::review_rejects(&items, &scores, library);
+        let _ = tx.send_blocking(QualityMsg::Done(flagged));
+    });
+
+    let (review, status, total) = (review.clone(), status.clone(), photon_import::files_to_score(&review.all).len());
+    glib::spawn_future_local(async move {
+        while let Ok(msg) = rx.recv().await {
+            match msg {
+                QualityMsg::Progress(n) => status.set_text(&format!("Checking {n} of {total}…")),
+                QualityMsg::Done(flagged) => {
+                    let count = flagged.len();
+                    status.set_text(&if count == 0 {
+                        "No likely rejects found".to_string()
+                    } else {
+                        format!("{} look like rejects", photos_noun(count))
+                    });
+                    *review.flags.borrow_mut() = flagged;
+                    for day in review.days.iter() {
+                        let n = day.items.iter().filter(|i| review.flags.borrow().contains_key(&i.id)).count();
+                        day.note.set_text(&if n == 0 { String::new() } else { format!("{n} look like rejects") });
+                    }
+                    for (id, tile) in review.tiles.borrow().iter() {
+                        mark_tile(tile, &review.flags.borrow(), *id);
+                    }
+                    review.skip_flagged.set_sensitive(count > 0);
+                    review.skip_flagged.set_tooltip_text(None);
+                    update_import_button();
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Outline `tile` and explain why when the quality check flagged photo `id`.
+fn mark_tile(tile: &GtkBox, flags: &HashMap<i64, String>, id: i64) {
+    match flags.get(&id) {
+        Some(reason) => {
+            tile.add_css_class("photon-flagged");
+            let base = tile.tooltip_text().unwrap_or_default();
+            let base = base.split("\n").next().unwrap_or_default().to_string();
+            tile.set_tooltip_text(Some(&format!("{base}\nLooks like a reject: {reason}")));
+        }
+        None => tile.remove_css_class("photon-flagged"),
+    }
+}
+
+/// An expander for one day: a checkbox in its header, previews inside.
+fn day_row(
+    day: &ReviewDay,
+    review: &Review,
+    dialog: &Window,
+    _update_import_button: Rc<dyn Fn()>,
+) -> gtk4::Expander {
+    let header = GtkBox::new(Orientation::Horizontal, 12);
+    header.append(&day.check);
+    header.append(&day.note);
+
+    let expander = gtk4::Expander::new(None);
+    expander.set_label_widget(Some(&header));
+    let body = GtkBox::new(Orientation::Vertical, 6);
+    body.set_margin_top(6);
+    expander.set_child(Some(&body));
+
+    // Load this day's previews the first time it is opened.
+    let loaded = std::cell::Cell::new(false);
+    let (items, review, dialog) = (day.items.clone(), review.clone(), dialog.clone());
+    expander.connect_expanded_notify(move |e| {
+        if !e.is_expanded() || loaded.replace(true) {
+            return;
+        }
+        body.append(&review_preview_grid(&items, &dialog, &review));
+        if items.len() > REVIEW_PREVIEWS {
+            let more = Label::new(Some(&format!("… and {} more", items.len() - REVIEW_PREVIEWS)));
+            more.set_css_classes(&["caption", "dim-label"]);
+            more.set_halign(Align::Start);
+            body.append(&more);
+        }
+    });
+    expander
+}
 
 /// A grid of placeholder tiles for `items` whose previews load on worker
 /// threads. Loading stops when `dialog` closes.
 fn review_preview_grid(
     items: &[photon_import::engine::PreImportItem],
     dialog: &Window,
+    review: &Review,
 ) -> gtk4::FlowBox {
     let flow = gtk4::FlowBox::builder()
         .selection_mode(gtk4::SelectionMode::None)
@@ -372,6 +649,8 @@ fn review_preview_grid(
         frame.set_overflow(gtk4::Overflow::Hidden);
         frame.add_css_class("photon-tile");
         frame.set_tooltip_text(Some(&format!("{}  ·  {}", item.filename, format_bytes(item.size_bytes))));
+        mark_tile(&frame, &review.flags.borrow(), item.id);
+        review.tiles.borrow_mut().push((item.id, frame.clone()));
         let picture = gtk4::Picture::new();
         picture.set_content_fit(gtk4::ContentFit::Cover);
         picture.set_can_shrink(true);

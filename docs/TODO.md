@@ -88,6 +88,14 @@ Useful tools installed on the dev machine: `xmllint`, `exiv2`, `darktable-cli`,
 7. **Tags:** use `queries::ensure_tag`, never `create_tag` (which returns a wrong
    id when the tag already exists).
 
+### Done (2026-11-01) — don't redo
+
+- Review Import by day and pre-import quality check (`handlers/import_handler.rs`,
+  `FileListSource`, `quality::review_rejects`, `thumbnails::quality_of_files`). Engine and
+  scoring are tested; the dialog is **not checked by hand**: open a card, untick a day, expand a
+  day, press Check Quality, tick "Leave out likely rejects", import, and confirm only the chosen
+  photos arrived (and, with Move, that only those are offered for deletion).
+
 ### Done (2026-10-16) — don't redo
 
 - Review fixes: darktable edit detection by history hashes (defaults no longer count; reset clears the flag); re-render no longer deletes its own thumbnails; renders run after the library check, not in it; full-res cache invalidated on the UI thread; scale benchmark is `#[ignore]` (wall-clock limits).

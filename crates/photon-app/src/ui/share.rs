@@ -1,11 +1,9 @@
-//! Share menu: hand photos to other apps and sites. Needs no API keys:
+//! Share menu: hand photos to other apps. Needs no API keys:
 //!
 //!   * **Copy**: files on the clipboard (paste into Files, a chat, a mail);
 //!     a single photo also goes on as image data, which web chats accept.
 //!   * **Email**: the desktop's mail client via the xdg-desktop-portal Email
 //!     portal (works in Flatpak), falling back to `xdg-email`.
-//!   * **WhatsApp Web / Google Photos**: opens the site; the photos are on
-//!     the clipboard, and tiles can be dragged from Photon onto the page.
 //!   * **Open With**: every installed app that handles all the photos' types
 //!     (Telegram, Thunderbird, GIMP, …), launched with all of them at once.
 //!
@@ -89,8 +87,6 @@ pub fn menu_button(ctx: &Context, photos: Photos) -> MenuButton {
     };
     add("copy", copy);
     add("email", email);
-    add("whatsapp", whatsapp_web);
-    add("google-photos", google_photos);
 
     let open_with = gio::SimpleAction::new("open-with", Some(glib::VariantTy::STRING));
     let (c, p) = (ctx.clone(), photos.clone());
@@ -118,11 +114,6 @@ fn build_menu(images: &[Image]) -> gio::Menu {
     send.append(Some("Copy"), Some("share.copy"));
     send.append(Some("Email…"), Some("share.email"));
     menu.append_section(None, &send);
-
-    let web = gio::Menu::new();
-    web.append(Some("WhatsApp Web"), Some("share.whatsapp"));
-    web.append(Some("Google Photos"), Some("share.google-photos"));
-    menu.append_section(None, &web);
 
     let apps = apps_for(images);
     if !apps.is_empty() {
@@ -275,33 +266,6 @@ fn email(ctx: &Context, images: &[Image]) {
             }
         },
     );
-}
-
-fn open_uri(ctx: &Context, uri: &str) {
-    gtk4::UriLauncher::new(uri).launch(Some(&ctx.window), gio::Cancellable::NONE, |result| {
-        if let Err(e) = result {
-            log::warn!("Could not open browser: {e}");
-        }
-    });
-}
-
-/// WhatsApp has no API for personal chats: copy the photos and open
-/// WhatsApp Web, where they can be pasted or dropped into a chat.
-fn whatsapp_web(ctx: &Context, images: &[Image]) {
-    copy(ctx, images);
-    open_uri(ctx, "https://web.whatsapp.com/");
-    (ctx.notify)(&format!(
-        "{} copied. In a chat, paste with Ctrl+V or drag photos from Photon",
-        plural(images.len())
-    ));
-}
-
-/// Uploading through the Google Photos API needs an OAuth app; the web
-/// page takes photos dropped onto it.
-fn google_photos(ctx: &Context, images: &[Image]) {
-    copy(ctx, images);
-    open_uri(ctx, "https://photos.google.com/");
-    (ctx.notify)("Drag photos from Photon onto the Google Photos page to upload them");
 }
 
 fn launch_with(ctx: &Context, app: &gio::AppInfo, images: &[Image]) {

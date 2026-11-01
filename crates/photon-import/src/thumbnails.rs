@@ -851,6 +851,41 @@ pub fn quick_previews(
     Ok(())
 }
 
+/// Score the sharpness and exposure of a file that is not imported yet, from
+/// the same kind of image the library scores (the embedded preview of a RAW,
+/// scaled to [`crate::QUALITY_LONG_EDGE`]), so the numbers can be compared
+/// with the library's own.
+pub fn quality_of_file(path: &Path) -> Result<crate::QualityScore> {
+    let rgb = load_smart(path, crate::QUALITY_LONG_EDGE)?.into_rgb8();
+    Ok(crate::compute_quality(&rgb))
+}
+
+/// [`quality_of_file`] for many files, a few at a time. `on_score(index, …)`
+/// is called from worker threads; unreadable files are skipped. Stops early
+/// once `cancelled` is set.
+pub fn quality_of_files(
+    paths: &[PathBuf],
+    cancelled: &AtomicBool,
+    on_score: impl Fn(usize, crate::QualityScore) + Sync,
+) -> Result<()> {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(crate::device::PARALLEL_IO_THREADS)
+        .thread_name(|i| format!("photon-review-quality-{i}"))
+        .build()?;
+    pool.install(|| {
+        paths.par_iter().enumerate().for_each(|(i, path)| {
+            if cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+            match quality_of_file(path) {
+                Ok(score) => on_score(i, score),
+                Err(e) => log::info!("No quality score for {}: {e:#}", path.display()),
+            }
+        })
+    });
+    Ok(())
+}
+
 /// A small, upright preview for the pre-import review, reading as little of
 /// the file as possible: the EXIF thumbnail sits in the header (a few KB, even
 /// for 50 MB RAW files). Files without one are decoded only if small.

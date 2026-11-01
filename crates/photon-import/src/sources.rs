@@ -30,3 +30,30 @@ pub trait ImportSource: Send + Sync {
     }
 }
 pub use digikam::DigikamSource;
+
+/// A fixed list of files, for importing a chosen part of a folder or card.
+pub struct FileListSource {
+    files: Vec<PathBuf>,
+    description: String,
+}
+
+impl FileListSource {
+    /// `description` names where the files come from (the folder or card).
+    pub fn new(files: Vec<PathBuf>, description: String) -> Self {
+        Self { files, description }
+    }
+}
+
+impl ImportSource for FileListSource {
+    fn scan(&self) -> anyhow::Result<Vec<PathBuf>> {
+        Ok(self.files.clone())
+    }
+
+    fn source_type(&self) -> &str {
+        "folder"
+    }
+
+    fn source_description(&self) -> &str {
+        &self.description
+    }
+}
