@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.0 — 2026-11-01
+
+### Removed
+- The **WhatsApp Web** and **Google Photos** share entries. They only copied the
+  photos and opened a website, which looked like a one-click send. Use Copy and
+  paste, or Open With for an installed app.
+
+### Added
+- **Import by day**: the Review Import dialog lists every day on the card or
+  in the folder (newest first) with a checkbox, a count and a size; only the
+  ticked days are imported. Previews load when a day is opened, so no day is
+  hidden behind the first 120 photos.
+- **Check Quality before import**: scores the embedded previews on the card
+  with the same rules as Photo Quality, outlines likely rejects and can leave
+  them out of the import. No face detection at this stage.
+
 ## 0.3.0 — 2026-10-21
 
 A release for taking Photon on a photo trip: safer imports, more culling and
