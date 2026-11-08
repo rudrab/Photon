@@ -1,7 +1,14 @@
-//! "Analyse Photo Quality…" results (AI-7): the blurred and badly exposed photos.
+//! "Analyse Photo Quality…" results (AI-7): the blurred, badly exposed and
+//! weak-looking photos, and the photos already rejected.
 //!
 //! Groups photos by burst and standalone candidates, showing thumbnails,
 //! reasons, and checkboxes for the user to confirm before setting rejects.
+//! Technical faults are ticked; matters of taste (a low aesthetic score) are
+//! listed unticked. The photos of the scope that are already rejected are
+//! listed last, ticked: unticking one restores it, so a reject made here (or
+//! by hand) can be undone one photo at a time, not only all at once with Ctrl+Z.
+//! Move Rejects to Trash… saves the choices, then trashes every photo that is
+//! rejected after them (asking first, as Move to Trash does).
 
 #![allow(deprecated)]
 
@@ -12,21 +19,40 @@ use gtk4::{
 };
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use photon_core::models::Image;
-use photon_import::quality::{find_bursts, suggest_rejects, RejectSuggestion};
+use photon_core::models::{Image, ImageQuality};
+use photon_import::quality::{burst_keeper, find_bursts, suggest_rejects, RejectSuggestion};
 use photon_import::thumbnails::{thumb_path, ThumbSize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+/// What the user chose: photos to reject, and rejected photos to restore.
+#[derive(Default)]
+struct Choice {
+    reject: HashSet<i64>,
+    restore: HashSet<i64>,
+}
+
+/// The kind of row, for its checkbox.
+enum Row<'a> {
+    /// Suggested for rejection: ticked = reject.
+    Suggested(&'a RejectSuggestion),
+    /// Already rejected: ticked = stays rejected, unticked = restore.
+    Rejected(Option<&'a RejectSuggestion>),
+    /// Shown for context in a burst: no checkbox.
+    Context { keeper: bool },
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     parent: &impl IsA<Window>,
     photos: Vec<Image>,
-    scores: HashMap<i64, photon_core::models::ImageQuality>,
+    scores: HashMap<i64, ImageQuality>,
     library: photon_import::quality::LibraryReference,
     cache_dir: PathBuf,
-    on_reject: impl Fn(Vec<i64>) + 'static,
+    on_apply: impl Fn(Vec<i64>, Vec<i64>) + 'static,
+    on_trash: impl Fn(Vec<i64>, Vec<i64>, Vec<i64>) + 'static,
     on_reanalyse: impl Fn() + 'static,
 ) {
     if photos.is_empty() {
@@ -35,7 +61,8 @@ pub fn show(
     let on_reanalyse = Rc::new(on_reanalyse);
 
     let suggestions = suggest_rejects(&photos, &scores, library);
-    if suggestions.is_empty() {
+    let rejected: Vec<&Image> = photos.iter().filter(|p| p.flagged == -1).collect();
+    if suggestions.is_empty() && rejected.is_empty() {
         let dialog = adw::MessageDialog::new(
             Some(parent),
             Some("No Problems Found"),
@@ -50,12 +77,24 @@ pub fn show(
         dialog.present();
         return;
     }
+    // Why each rejected photo would have been suggested, had it not been
+    // rejected already (`suggest_rejects` leaves rejected shots out).
+    let unrejected: Vec<Image> = photos
+        .iter()
+        .map(|p| Image { flagged: if p.flagged == -1 { 0 } else { p.flagged }, ..p.clone() })
+        .collect();
+    let rejected_ids: HashSet<i64> = rejected.iter().filter_map(|p| p.id).collect();
+    let rejected_reasons: HashMap<i64, RejectSuggestion> = suggest_rejects(&unrejected, &scores, library)
+        .into_iter()
+        .filter(|s| rejected_ids.contains(&s.image_id))
+        .map(|s| (s.image_id, s))
+        .collect();
 
     let dialog = adw::Window::builder()
         .transient_for(parent)
         .modal(true)
-        .default_width(560)
-        .default_height(680)
+        .default_width(600)
+        .default_height(700)
         .title("Photo Quality")
         .build();
 
@@ -83,11 +122,15 @@ pub fn show(
     header.pack_start(&again_btn);
 
     // Rejecting marks photos, and Ctrl+Z undoes it: not a destructive action.
-    let reject_btn = Button::with_label(&format!("Reject Selected ({})", suggestions.len()));
-    reject_btn.add_css_class("suggested-action");
-    header.pack_end(&reject_btn);
+    let apply_btn = Button::with_label("Apply");
+    apply_btn.add_css_class("suggested-action");
+    header.pack_end(&apply_btn);
 
-    let subtitle = format!("{} of {} photos look blurred or badly exposed", suggestions.len(), photos.len());
+    let flagged = suggestions.iter().map(|s| s.image_id).collect::<HashSet<_>>().len();
+    let mut subtitle = format!("{flagged} of {} photos may be worth rejecting", photos.len());
+    if !rejected.is_empty() {
+        subtitle.push_str(&format!(" · {} rejected", rejected.len()));
+    }
     header.set_title_widget(Some(&adw::WindowTitle::new("Photo Quality", &subtitle)));
     root.append(&header);
 
@@ -104,140 +147,169 @@ pub fn show(
     scroll.set_child(Some(&content_box));
     root.append(&scroll);
 
-    // Map suggestion lookup by id
-    let suggestion_map: HashMap<i64, RejectSuggestion> = suggestions
-        .iter()
-        .map(|s| (s.image_id, s.clone()))
-        .collect();
-
-    // Group photos by burst
-    let bursts = find_bursts(&photos);
-    let mut burst_photo_ids: HashSet<i64> = HashSet::new();
-
-    let selected_ids = Rc::new(RefCell::new(
-        suggestions.iter().map(|s| s.image_id).collect::<HashSet<i64>>(),
+    // Destructive, so apart from Apply and at the bottom; it asks again first.
+    let trash_btn = Button::with_label("Move Rejects to Trash…");
+    trash_btn.add_css_class("destructive-action");
+    trash_btn.set_tooltip_text(Some(
+        "Apply the choices above, then move every photo that is rejected to the Trash \
+         (asks first; restore from the Trash or with Ctrl+Z)",
     ));
+    let bottom = gtk4::ActionBar::new();
+    bottom.pack_end(&trash_btn);
+    root.append(&bottom);
 
-    let update_button_label = {
-        let reject_btn = reject_btn.clone();
-        let selected_ids = selected_ids.clone();
-        Rc::new(move || {
-            let count = selected_ids.borrow().len();
-            reject_btn.set_label(&format!("Reject Selected ({count})"));
-            reject_btn.set_sensitive(count > 0);
+    let suggestion_map: HashMap<i64, RejectSuggestion> =
+        suggestions.iter().map(|s| (s.image_id, s.clone())).collect();
+
+    let choice = Rc::new(RefCell::new(Choice {
+        reject: suggestions.iter().filter(|s| s.preselected).map(|s| s.image_id).collect(),
+        restore: HashSet::new(),
+    }));
+
+    // The photos rejected once the choices are saved.
+    let final_rejects = {
+        let (choice, rejected_ids) = (choice.clone(), rejected_ids.clone());
+        Rc::new(move || -> Vec<i64> {
+            let c = choice.borrow();
+            let mut ids: Vec<i64> = rejected_ids.difference(&c.restore).chain(c.reject.iter()).copied().collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
         })
     };
 
-    // Render bursts first
-    for burst in &bursts {
-        let mut burst_has_suggestion = false;
-        for item in &burst.items {
-            if let Some(id) = item.id {
-                burst_photo_ids.insert(id);
-                if suggestion_map.contains_key(&id) {
-                    burst_has_suggestion = true;
-                }
-            }
-        }
+    let update_button_label: Rc<dyn Fn()> = {
+        let apply_btn = apply_btn.clone();
+        let (trash_btn, final_rejects) = (trash_btn.clone(), final_rejects.clone());
+        let choice = choice.clone();
+        Rc::new(move || {
+            let n = final_rejects().len();
+            trash_btn.set_label(&if n == 0 { "Move Rejects to Trash…".to_string() } else { format!("Move {n} Rejects to Trash…") });
+            trash_btn.set_sensitive(n > 0);
+            let c = choice.borrow();
+            let (r, u) = (c.reject.len(), c.restore.len());
+            let label = match (r, u) {
+                (0, 0) => "Apply".to_string(),
+                (r, 0) => format!("Reject {r}"),
+                (0, u) => format!("Restore {u}"),
+                (r, u) => format!("Reject {r} · Restore {u}"),
+            };
+            apply_btn.set_label(&label);
+            apply_btn.set_sensitive(r + u > 0);
+        })
+    };
+    update_button_label();
 
-        if !burst_has_suggestion {
+    let add_row = |group: &GtkBox, photo: &Image, kind: Row| {
+        group.append(&render_photo_row(photo, kind, scores.get(&photo.id.unwrap_or(0)), &cache_dir, choice.clone(), update_button_label.clone()));
+    };
+
+    // Bursts with something suggested, every frame shown for comparison
+    // (the rejected ones are listed below, with the other rejects).
+    let bursts = find_bursts(&photos);
+    let mut burst_photo_ids: HashSet<i64> = HashSet::new();
+    for burst in &bursts {
+        burst_photo_ids.extend(burst.items.iter().filter_map(|i| i.id));
+        if !burst.items.iter().any(|i| i.id.is_some_and(|id| suggestion_map.contains_key(&id))) {
             continue;
         }
-
-        let group_box = GtkBox::new(Orientation::Vertical, 8);
-        group_box.add_css_class("card");
-        group_box.set_margin_bottom(8);
-
-        let header_row = GtkBox::new(Orientation::Horizontal, 8);
-        header_row.set_margin_top(8);
-        header_row.set_margin_bottom(4);
-        header_row.set_margin_start(12);
-        header_row.set_margin_end(12);
-
+        let keeper: HashSet<i64> = burst_keeper(&burst.items, &scores).into_iter().collect();
         let cam = burst.items.first().and_then(|i| i.camera_model.as_deref()).unwrap_or("Camera");
-        let group_title = Label::new(Some(&format!("Burst: {cam} ({} photos)", burst.items.len())));
-        group_title.add_css_class("heading");
-        group_title.set_halign(Align::Start);
-        header_row.append(&group_title);
-        group_box.append(&header_row);
-
-        for item in &burst.items {
+        let group = group_card(&format!("Burst: {cam} ({} photos)", burst.items.len()), None);
+        for item in burst.items.iter().filter(|i| i.flagged != -1) {
             let Some(id) = item.id else { continue };
-            let suggestion = suggestion_map.get(&id);
-            let row = render_photo_row(
-                item,
-                suggestion,
-                scores.get(&id),
-                &cache_dir,
-                selected_ids.clone(),
-                update_button_label.clone(),
-            );
-            group_box.append(&row);
+            let kind = match suggestion_map.get(&id) {
+                Some(s) => Row::Suggested(s),
+                None => Row::Context { keeper: keeper.contains(&id) },
+            };
+            add_row(&group, item, kind);
         }
-
-        content_box.append(&group_box);
+        content_box.append(&group);
     }
 
-    // Render standalone candidates
+    // Suggested photos outside bursts.
     let standalone: Vec<&Image> = photos
         .iter()
-        .filter(|p| p.id.map(|id| !burst_photo_ids.contains(&id) && suggestion_map.contains_key(&id)).unwrap_or(false))
+        .filter(|p| p.id.is_some_and(|id| !burst_photo_ids.contains(&id) && suggestion_map.contains_key(&id)))
         .collect();
-
     if !standalone.is_empty() {
-        let group_box = GtkBox::new(Orientation::Vertical, 8);
-        group_box.add_css_class("card");
-        group_box.set_margin_bottom(8);
-
-        let header_row = GtkBox::new(Orientation::Horizontal, 8);
-        header_row.set_margin_top(8);
-        header_row.set_margin_bottom(4);
-        header_row.set_margin_start(12);
-        header_row.set_margin_end(12);
-
-        let group_title = Label::new(Some("Individual Photos"));
-        group_title.add_css_class("heading");
-        group_title.set_halign(Align::Start);
-        header_row.append(&group_title);
-        group_box.append(&header_row);
-
+        let group = group_card("Individual Photos", None);
         for item in standalone {
-            let Some(id) = item.id else { continue };
-            let suggestion = suggestion_map.get(&id);
-            let row = render_photo_row(
-                item,
-                suggestion,
-                scores.get(&id),
-                &cache_dir,
-                selected_ids.clone(),
-                update_button_label.clone(),
-            );
-            group_box.append(&row);
+            if let Some(s) = item.id.and_then(|id| suggestion_map.get(&id)) {
+                add_row(&group, item, Row::Suggested(s));
+            }
         }
-
-        content_box.append(&group_box);
+        content_box.append(&group);
     }
 
-    // Confirm button handler
+    if !rejected.is_empty() {
+        let group = group_card(
+            &format!("Already Rejected ({})", rejected.len()),
+            Some("Untick a photo to restore it"),
+        );
+        for item in &rejected {
+            let reason = item.id.and_then(|id| rejected_reasons.get(&id));
+            add_row(&group, item, Row::Rejected(reason));
+        }
+        content_box.append(&group);
+    }
+
+    let (d_trash, choice_trash) = (dialog.clone(), choice.clone());
+    trash_btn.connect_clicked(move |_| {
+        let ids = final_rejects();
+        let c = choice_trash.borrow();
+        let (reject, restore) = (c.reject.iter().copied().collect(), c.restore.iter().copied().collect());
+        drop(c);
+        d_trash.close();
+        on_trash(reject, restore, ids);
+    });
+
     let d_confirm = dialog.clone();
-    let selected_ids_confirm = selected_ids.clone();
-    reject_btn.connect_clicked(move |_| {
-        let ids: Vec<i64> = selected_ids_confirm.borrow().iter().copied().collect();
+    apply_btn.connect_clicked(move |_| {
+        let c = choice.borrow();
+        let reject: Vec<i64> = c.reject.iter().copied().collect();
+        let restore: Vec<i64> = c.restore.iter().copied().collect();
         d_confirm.close();
-        if !ids.is_empty() {
-            on_reject(ids);
+        if !reject.is_empty() || !restore.is_empty() {
+            on_apply(reject, restore);
         }
     });
 
     dialog.present();
 }
 
+/// A card with a heading (and an optional line under it) for a group of rows.
+fn group_card(title: &str, subtitle: Option<&str>) -> GtkBox {
+    let group = GtkBox::new(Orientation::Vertical, 8);
+    group.add_css_class("card");
+    group.set_margin_bottom(8);
+
+    let header = GtkBox::new(Orientation::Vertical, 2);
+    header.set_margin_top(8);
+    header.set_margin_bottom(4);
+    header.set_margin_start(12);
+    header.set_margin_end(12);
+    let heading = Label::new(Some(title));
+    heading.add_css_class("heading");
+    heading.set_halign(Align::Start);
+    header.append(&heading);
+    if let Some(text) = subtitle {
+        let sub = Label::new(Some(text));
+        sub.add_css_class("dim-label");
+        sub.add_css_class("caption");
+        sub.set_halign(Align::Start);
+        header.append(&sub);
+    }
+    group.append(&header);
+    group
+}
+
 fn render_photo_row(
     photo: &Image,
-    suggestion: Option<&RejectSuggestion>,
-    quality: Option<&photon_core::models::ImageQuality>,
+    kind: Row,
+    quality: Option<&ImageQuality>,
     cache_dir: &Path,
-    selected_ids: Rc<RefCell<HashSet<i64>>>,
+    choice: Rc<RefCell<Choice>>,
     update_btn: Rc<dyn Fn()>,
 ) -> GtkBox {
     let row = GtkBox::new(Orientation::Horizontal, 12);
@@ -248,31 +320,41 @@ fn render_photo_row(
     row.set_valign(Align::Center);
 
     let id = photo.id.unwrap_or(0);
-    let is_suggested = suggestion.is_some();
 
-    // Checkbox
     let check = CheckButton::new();
-    check.set_active(is_suggested);
     check.set_valign(Align::Center);
-
-    if !is_suggested {
-        check.set_sensitive(false);
-        check.set_opacity(0.0);
-    } else {
-        let sel_rc = selected_ids.clone();
-        let update_rc = update_btn.clone();
-        check.connect_toggled(move |btn| {
-            if btn.is_active() {
-                sel_rc.borrow_mut().insert(id);
-            } else {
-                sel_rc.borrow_mut().remove(&id);
-            }
-            update_rc();
-        });
+    match kind {
+        Row::Suggested(s) => {
+            check.set_active(s.preselected);
+            check.set_tooltip_text(Some("Ticked: reject this photo"));
+            check.connect_toggled(move |btn| {
+                if btn.is_active() {
+                    choice.borrow_mut().reject.insert(id);
+                } else {
+                    choice.borrow_mut().reject.remove(&id);
+                }
+                update_btn();
+            });
+        }
+        Row::Rejected(_) => {
+            check.set_active(true);
+            check.set_tooltip_text(Some("Untick to restore this photo"));
+            check.connect_toggled(move |btn| {
+                if btn.is_active() {
+                    choice.borrow_mut().restore.remove(&id);
+                } else {
+                    choice.borrow_mut().restore.insert(id);
+                }
+                update_btn();
+            });
+        }
+        Row::Context { .. } => {
+            check.set_sensitive(false);
+            check.set_opacity(0.0);
+        }
     }
     row.append(&check);
 
-    // Thumbnail picture
     let pic = Picture::new();
     pic.set_size_request(64, 48);
     pic.set_content_fit(gtk4::ContentFit::Cover);
@@ -282,7 +364,6 @@ fn render_photo_row(
     }
     row.append(&pic);
 
-    // Info details
     let info_box = GtkBox::new(Orientation::Vertical, 2);
     info_box.set_hexpand(true);
     info_box.set_valign(Align::Center);
@@ -292,29 +373,57 @@ fn render_photo_row(
     name_lbl.set_halign(Align::Start);
     info_box.append(&name_lbl);
 
-    let reason_text = if let Some(s) = suggestion {
-        s.reason.clone()
-    } else if let Some(q) = quality {
-        format!("sharpness {:.1} (best in burst)", q.sharpness)
-    } else {
-        "good quality".to_string()
+    let aesthetic = quality.and_then(|q| {
+        let a = q.aesthetic?;
+        Some(match q.aesthetic_crop.filter(|_| photon_import::quality::crop_helps(q)) {
+            Some(c) => format!("aesthetic {a:.1}, {c:.1} cropped"),
+            None => format!("aesthetic {a:.1}"),
+        })
+    });
+    let (reason, css) = match &kind {
+        Row::Suggested(s) if s.preselected => (s.reason.clone(), "error"),
+        Row::Suggested(s) => (s.reason.clone(), "warning"),
+        Row::Rejected(Some(s)) => (s.reason.clone(), "dim-label"),
+        Row::Rejected(None) => {
+            let mut text = "no fault found".to_string();
+            if let Some(a) = &aesthetic {
+                text.push_str(&format!(" · {a}"));
+            }
+            (text, "dim-label")
+        }
+        Row::Context { .. } => {
+            let mut parts = Vec::new();
+            if let Some(q) = quality {
+                parts.push(format!("sharpness {:.0}", q.sharpness));
+            }
+            parts.extend(aesthetic.clone());
+            (if parts.is_empty() { "good quality".to_string() } else { parts.join(" · ") }, "dim-label")
+        }
     };
-
-    let reason_lbl = Label::new(Some(&reason_text));
-    if is_suggested {
-        reason_lbl.add_css_class("destructive-action");
-    } else {
-        reason_lbl.add_css_class("dim-label");
-    }
+    let reason_lbl = Label::new(Some(&reason));
+    reason_lbl.add_css_class(css);
     reason_lbl.set_halign(Align::Start);
+    reason_lbl.set_wrap(true);
+    reason_lbl.set_xalign(0.0);
     info_box.append(&reason_lbl);
+
+    // A fault's reason doesn't mention how the photo looks: say it too.
+    if let (Row::Suggested(s), Some(a)) = (&kind, &aesthetic) {
+        if s.preselected {
+            let extra = Label::new(Some(a));
+            extra.add_css_class("dim-label");
+            extra.add_css_class("caption");
+            extra.set_halign(Align::Start);
+            info_box.append(&extra);
+        }
+    }
 
     row.append(&info_box);
 
-    // Badge on right if best in burst
-    if !is_suggested {
-        let best_badge = Label::new(Some("★ Sharpest"));
+    if let Row::Context { keeper: true } = kind {
+        let best_badge = Label::new(Some("★ Best"));
         best_badge.add_css_class("photon-badge");
+        best_badge.set_tooltip_text(Some("The frame to keep: the best-looking of the sharp ones (the sharpest without aesthetic scores)"));
         best_badge.set_valign(Align::Center);
         row.append(&best_badge);
     }

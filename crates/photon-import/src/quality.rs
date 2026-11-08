@@ -52,6 +52,39 @@ pub const HIGHLIGHT_CLIP_REJECT_THRESHOLD: f64 = 0.25;
 /// Shadow clipping threshold: photos with > 35% deep shadow pixels are flagged.
 pub const SHADOW_CLIP_REJECT_THRESHOLD: f64 = 0.35;
 
+/// Outside bursts, a shot whose aesthetic score is below this percentile of
+/// the library's is offered as "looks weak". Taste is the photographer's: these
+/// suggestions are listed but not ticked.
+pub const AESTHETIC_WEAK_PERCENTILE: f64 = 0.10;
+/// Fewer aesthetic scores than this in the library: no "looks weak" (a
+/// percentile of a handful of photos means nothing).
+pub const MIN_LIBRARY_AESTHETIC: usize = 30;
+/// In a burst, a sharp frame scoring this much below the burst's best
+/// frame is offered as the weaker one. Near-identical frames differ by
+/// 0.1–0.3 (measured 2026-11-08 on E-M10 II shots: blur costs 0.4–0.8).
+pub const BURST_AESTHETIC_MARGIN: f64 = 0.5;
+/// How much the best of the ~20 square crops beats the uncropped frame by
+/// luck alone: 0.19 at the median on 40 photos (2026-11-08, E-M10 II; 90th
+/// percentile 0.37). A crop counts for this much less.
+pub const CROP_SEARCH_OPTIMISM: f64 = 0.2;
+
+/// How good a shot could look: its aesthetic score, or — when a square crop
+/// keeping the main face was found — that crop's score less
+/// [`CROP_SEARCH_OPTIMISM`], if higher. Photon never crops; this only keeps a
+/// photo that would be strong cropped from being suggested as weak.
+pub fn aesthetic_potential(q: &ImageQuality) -> Option<f64> {
+    let a = q.aesthetic?;
+    Some(match (q.aesthetic_crop, q.crop_rect) {
+        (Some(c), Some(_)) => a.max(c - CROP_SEARCH_OPTIMISM),
+        _ => a,
+    })
+}
+
+/// Whether a crop changes the verdict on `q`: its potential is above its score.
+pub fn crop_helps(q: &ImageQuality) -> bool {
+    matches!((q.aesthetic, aesthetic_potential(q)), (Some(a), Some(p)) if p > a)
+}
+
 /// Scores computed for an image.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QualityScore {
@@ -81,6 +114,9 @@ impl QualityScore {
             computed_at,
             faces: None,
             eye_sharpness: None,
+            aesthetic: None,
+            aesthetic_crop: None,
+            crop_rect: None,
         }
     }
 }
@@ -353,6 +389,9 @@ pub struct RejectSuggestion {
     pub is_burst_best: bool,
     pub burst_relative_percent: Option<f64>,
     pub reason: String,
+    /// A technical fault (blur, clipping): ticked in the results. `false` for
+    /// a matter of taste (a low aesthetic score), listed but not ticked.
+    pub preselected: bool,
 }
 
 /// The files of `items` grouped by shot, in order.
@@ -375,6 +414,9 @@ pub struct LibraryReference {
     pub sharpness_median: Option<f64>,
     /// 80th percentile of eye sharpness over photos with faces.
     pub eye_p80: Option<f64>,
+    /// [`AESTHETIC_WEAK_PERCENTILE`] of the aesthetic scores, with at least
+    /// [`MIN_LIBRARY_AESTHETIC`] of them.
+    pub aesthetic_weak_below: Option<f64>,
 }
 
 /// The library's reference values, from the scores in the database. Errors
@@ -392,7 +434,18 @@ pub fn library_reference(conn: &rusqlite::Connection) -> LibraryReference {
                 log::warn!("Library eye sharpness: {e}");
                 None
             }),
+        aesthetic_weak_below: queries::library_aesthetic_scores(conn)
+            .map(aesthetic_weak_below)
+            .unwrap_or_else(|e| {
+                log::warn!("Library aesthetic scores: {e}");
+                None
+            }),
     }
+}
+
+/// The aesthetic score under which a photo looks weak next to `library`'s.
+pub fn aesthetic_weak_below(library: Vec<f64>) -> Option<f64> {
+    (library.len() >= MIN_LIBRARY_AESTHETIC).then(|| percentile(library, AESTHETIC_WEAK_PERCENTILE)).flatten()
 }
 
 /// How sharp a photo is compared with what is sharp for it, in percent.
@@ -469,6 +522,102 @@ pub fn percentile(mut values: Vec<f64>, p: f64) -> Option<f64> {
     Some(values[idx.min(values.len() - 1)])
 }
 
+/// The score of a shot: its sharpest file's (the RAW and the JPG of
+/// one shot score alike).
+fn shot_score<T: BurstItem>(shot: &[&T], scores: &HashMap<i64, ImageQuality>) -> Option<ImageQuality> {
+    shot.iter()
+        .filter_map(|i| scores.get(&i.item_id()))
+        .max_by(|a, b| a.sharpness.total_cmp(&b.sharpness))
+        .cloned()
+}
+
+/// One shot of a burst, judged against the others.
+struct BurstShot<'a, T> {
+    files: Vec<&'a T>,
+    /// Percent of the burst's sharpest.
+    percent: Option<f64>,
+    /// A technical fault: blurred next to the others, or clipped.
+    fault: Option<String>,
+    /// Sharp, but clearly less good-looking than the keeper.
+    weaker: Option<String>,
+    /// The frame to keep: the best-looking of the sharp ones when every one
+    /// has an aesthetic score, else the sharpest.
+    keeper: bool,
+}
+
+/// The scored shots of a burst's `items`, judged against each other.
+fn judge_burst<'a, T: BurstItem>(items: &'a [T], scores: &HashMap<i64, ImageQuality>) -> Vec<BurstShot<'a, T>> {
+    let scored: Vec<(Vec<&T>, ImageQuality)> =
+        shots(items).into_iter().filter_map(|s| shot_score(&s, scores).map(|q| (s, q))).collect();
+    // A burst of the same face is judged by the eyes: the background's
+    // detail says nothing about whether the subject moved.
+    let by_eyes = !scored.is_empty() && scored.iter().all(|(_, q)| q.eye_sharpness.is_some());
+    let value = |q: &ImageQuality| if by_eyes { q.eye_sharpness.unwrap_or(0.0) } else { q.sharpness };
+    let Some(best) = scored.iter().map(|(_, q)| value(q)).max_by(f64::total_cmp) else { return Vec::new() };
+
+    let mut judged: Vec<BurstShot<T>> = Vec::with_capacity(scored.len());
+    let mut sharpest = None;
+    for (files, q) in &scored {
+        let is_best = value(q) >= best;
+        if is_best && sharpest.is_none() {
+            sharpest = Some(judged.len());
+        }
+        let percent = if best > 0.0 { Some(value(q) / best * 100.0) } else { None };
+        let fault = if !is_best && best > 0.0 && value(q) < BURST_SHARPNESS_REJECT_RATIO * best {
+            let what = if by_eyes { "eyes blurred" } else { "blurred" };
+            Some(format!("{what} — {:.0}% of the sharpest in its burst", percent.unwrap_or(0.0)))
+        } else if !is_best && q.clip_highlights > HIGHLIGHT_CLIP_REJECT_THRESHOLD {
+            Some(format!("highlights clipped ({:.0}%)", q.clip_highlights * 100.0))
+        } else {
+            None
+        };
+        judged.push(BurstShot { files: files.clone(), percent, fault, weaker: None, keeper: false });
+    }
+
+    // Among the sharp frames, the best-looking one as shot is the keeper. A
+    // frame is weaker only if even cropped it falls clearly below it.
+    let sound: Vec<usize> = (0..judged.len()).filter(|&i| judged[i].fault.is_none()).collect();
+    let aesthetic: Option<Vec<f64>> = sound.iter().map(|&i| scored[i].1.aesthetic).collect();
+    match aesthetic {
+        Some(values) if sound.len() >= 2 => {
+            let (top_at, top) = values
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(k, &v)| (sound[k], v))
+                .unwrap_or((sound[0], values[0]));
+            judged[top_at].keeper = true;
+            for (k, &i) in sound.iter().enumerate() {
+                let q = &scored[i].1;
+                let potential = aesthetic_potential(q).unwrap_or(values[k]);
+                if i != top_at && potential < top - BURST_AESTHETIC_MARGIN {
+                    let cropped = if q.aesthetic_crop.is_some() { ", and no crop fixes that" } else { "" };
+                    judged[i].weaker = Some(format!(
+                        "weaker frame — aesthetic {:.1} vs {top:.1} for the best in its burst{cropped}",
+                        values[k]
+                    ));
+                }
+            }
+        }
+        _ => {
+            if let Some(i) = sharpest {
+                judged[i].keeper = true;
+            }
+        }
+    }
+    judged
+}
+
+/// The files of the frame to keep in a burst (see [`find_bursts`]): the
+/// best-looking of its sharp shots, or the sharpest without aesthetic scores.
+pub fn burst_keeper<T: BurstItem>(burst_items: &[T], scores: &HashMap<i64, ImageQuality>) -> Vec<i64> {
+    judge_burst(burst_items, scores)
+        .into_iter()
+        .find(|s| s.keeper)
+        .map(|s| s.files.iter().map(|f| f.item_id()).collect())
+        .unwrap_or_default()
+}
+
 /// Suggest photos to reject. Judged per **shot**: a shot's score is its best
 /// file's (the RAW and the JPG of one shot score alike), and a suggestion
 /// covers every file of the shot, so no blurred copy is left behind.
@@ -479,21 +628,20 @@ pub fn percentile(mut values: Vec<f64>, p: f64) -> Option<f64> {
 /// - Otherwise: below [`BLUR_RATIO_OF_LIBRARY_MEDIAN`] × `library_median`
 ///   (the median sharpness of the whole library, not of the photos looked at:
 ///   a small selection has no useful distribution of its own), or clipped.
+/// - Matters of taste, not ticked ([`RejectSuggestion::preselected`]): a
+///   sharp burst frame that looks clearly worse than the burst's best
+///   ([`BURST_AESTHETIC_MARGIN`]); outside bursts, a shot in the bottom
+///   [`AESTHETIC_WEAK_PERCENTILE`] of the library's aesthetic scores.
 pub fn suggest_rejects<T: BurstItem + Clone>(
     items: &[T],
     scores: &HashMap<i64, ImageQuality>,
     library: LibraryReference,
 ) -> Vec<RejectSuggestion> {
     let library_median = library.sharpness_median;
-    let score_of = |shot: &[&T]| -> Option<ImageQuality> {
-        shot.iter()
-            .filter_map(|i| scores.get(&i.item_id()))
-            .max_by(|a, b| a.sharpness.total_cmp(&b.sharpness))
-            .cloned()
-    };
+    let score_of = |shot: &[&T]| shot_score(shot, scores);
     let skip = |shot: &[&T]| shot.iter().any(|i| i.flagged() != 0);
     let mut suggestions = Vec::new();
-    let mut push = |shot: &[&T], burst_id: Option<usize>, pct: Option<f64>, reason: String| {
+    let mut push = |shot: &[&T], burst_id: Option<usize>, pct: Option<f64>, reason: String, preselected: bool| {
         for item in shot {
             suggestions.push(RejectSuggestion {
                 image_id: item.item_id(),
@@ -501,6 +649,7 @@ pub fn suggest_rejects<T: BurstItem + Clone>(
                 is_burst_best: false,
                 burst_relative_percent: pct,
                 reason: reason.clone(),
+                preselected,
             });
         }
     };
@@ -508,25 +657,14 @@ pub fn suggest_rejects<T: BurstItem + Clone>(
     let mut in_burst = std::collections::HashSet::new();
     for (burst_idx, burst) in find_bursts(items).iter().enumerate() {
         in_burst.extend(burst.items.iter().map(|i| i.item_id()));
-        let burst_shots = shots(&burst.items);
-        let scored: Vec<(&Vec<&T>, ImageQuality)> =
-            burst_shots.iter().filter_map(|s| score_of(s).map(|q| (s, q))).collect();
-        // A burst of the same face is judged by the eyes: the background's
-        // detail says nothing about whether the subject moved.
-        let by_eyes = !scored.is_empty() && scored.iter().all(|(_, q)| q.eye_sharpness.is_some());
-        let value = |q: &ImageQuality| if by_eyes { q.eye_sharpness.unwrap_or(0.0) } else { q.sharpness };
-        let Some(best) = scored.iter().map(|(_, q)| value(q)).max_by(f64::total_cmp) else { continue };
-        for (shot, q) in &scored {
-            if skip(shot) {
+        for shot in judge_burst(&burst.items, scores) {
+            if skip(&shot.files) {
                 continue;
             }
-            let is_best = value(q) >= best;
-            let pct = if best > 0.0 { Some(value(q) / best * 100.0) } else { None };
-            if !is_best && best > 0.0 && value(q) < BURST_SHARPNESS_REJECT_RATIO * best {
-                let what = if by_eyes { "eyes blurred" } else { "blurred" };
-                push(shot, Some(burst_idx), pct, format!("{what} — {:.0}% of the sharpest in its burst", pct.unwrap_or(0.0)));
-            } else if !is_best && q.clip_highlights > HIGHLIGHT_CLIP_REJECT_THRESHOLD {
-                push(shot, Some(burst_idx), pct, format!("highlights clipped ({:.0}%)", q.clip_highlights * 100.0));
+            if let Some(reason) = shot.fault {
+                push(&shot.files, Some(burst_idx), shot.percent, reason, true);
+            } else if let Some(reason) = shot.weaker {
+                push(&shot.files, Some(burst_idx), shot.percent, reason, false);
             }
         }
     }
@@ -566,7 +704,7 @@ pub fn suggest_rejects<T: BurstItem + Clone>(
             .filter(|&(eyes, (reference, _))| reference > 0.0 && eyes < EYE_BLUR_RATIO * reference);
         if let Some((eyes, (reference, in_session))) = eyes_blurred {
             let of = if in_session { "the sharp ones of this session" } else { "your sharp portraits" };
-            push(&shot, None, None, format!("eyes blurred — {:.0}% of {of}", eyes / reference * 100.0));
+            push(&shot, None, None, format!("eyes blurred — {:.0}% of {of}", eyes / reference * 100.0), true);
         } else if q.sharpness < blur_below {
             let reason = match library_median {
                 Some(m) if m > 0.0 => {
@@ -574,14 +712,45 @@ pub fn suggest_rejects<T: BurstItem + Clone>(
                 }
                 _ => format!("blurred (sharpness {:.0})", q.sharpness),
             };
-            push(&shot, None, None, reason);
+            push(&shot, None, None, reason, true);
         } else if q.clip_highlights > HIGHLIGHT_CLIP_REJECT_THRESHOLD {
-            push(&shot, None, None, format!("highlights clipped ({:.0}%)", q.clip_highlights * 100.0));
+            push(&shot, None, None, format!("highlights clipped ({:.0}%)", q.clip_highlights * 100.0), true);
         } else if q.clip_shadows > SHADOW_CLIP_REJECT_THRESHOLD {
-            push(&shot, None, None, format!("shadows clipped ({:.0}%)", q.clip_shadows * 100.0));
+            push(&shot, None, None, format!("shadows clipped ({:.0}%)", q.clip_shadows * 100.0), true);
+        } else if let Some(a) = q.aesthetic.filter(|_| {
+            let weak = |v: f64| library.aesthetic_weak_below.is_some_and(|below| v < below);
+            // Weak as shot, and no crop lifts it out (see `needs_crop_check`).
+            aesthetic_potential(&q).is_some_and(weak)
+        }) {
+            let pct = (AESTHETIC_WEAK_PERCENTILE * 100.0).round();
+            let cropped = if q.aesthetic_crop.is_some() { "; no crop that keeps the face lifts it" } else { "" };
+            push(&shot, None, None, format!("looks weak — aesthetic {a:.1}, in the lowest {pct}% of your photos{cropped}"), false);
         }
     }
     suggestions
+}
+
+/// The photos to check for a better crop before trusting a "looks weak" or
+/// "weaker frame" suggestion: per such shot without a crop reading yet, the
+/// file its score comes from. Checking a crop takes ~20 runs of the model, so
+/// only these photos get it.
+pub fn needs_crop_check<T: BurstItem + Clone>(
+    items: &[T],
+    scores: &HashMap<i64, ImageQuality>,
+    library: LibraryReference,
+) -> Vec<i64> {
+    let taste: std::collections::HashSet<i64> = suggest_rejects(items, scores, library)
+        .into_iter()
+        .filter(|s| !s.preselected)
+        .map(|s| s.image_id)
+        .collect();
+    shots(items)
+        .iter()
+        .filter(|shot| shot.iter().any(|i| taste.contains(&i.item_id())))
+        .filter_map(|shot| shot_score(shot, scores))
+        .filter(|q| q.aesthetic.is_some() && q.aesthetic_crop.is_none())
+        .map(|q| q.image_id)
+        .collect()
 }
 
 /// The files of `items` worth scoring for [`review_rejects`]: one per shot
@@ -615,6 +784,7 @@ pub fn review_rejects(
     let models: HashMap<i64, ImageQuality> = scores.iter().map(|(&id, s)| (id, s.to_model(id, 0))).collect();
     suggest_rejects(items, &models, library)
         .into_iter()
+        .filter(|s| s.preselected)
         .map(|s| (s.image_id, s.reason))
         .collect()
 }
@@ -751,7 +921,7 @@ mod tests {
                 .into_iter()
                 .map(|q| (q.image_id, q))
                 .collect();
-        let mut ids: Vec<i64> = suggest_rejects(&files, &scores, LibraryReference { sharpness_median: Some(1348.0), eye_p80: None }).iter().map(|s| s.image_id).collect();
+        let mut ids: Vec<i64> = suggest_rejects(&files, &scores, LibraryReference { sharpness_median: Some(1348.0), ..Default::default() }).iter().map(|s| s.image_id).collect();
         ids.sort();
         assert_eq!(ids, [105, 113], "both files of the blurred shot, nothing else");
 
@@ -806,19 +976,19 @@ mod tests {
         let mut scores = HashMap::new();
         scores.insert(1, ImageQuality {
             image_id: 1, sharpness: 100.0, sharpness_global: 80.0, clip_shadows: 0.0, clip_highlights: 0.0,
-            mean_luma: 120.0, quality_version: 1, computed_at: 0, faces: None, eye_sharpness: None
+            mean_luma: 120.0, quality_version: 1, computed_at: 0, faces: None, eye_sharpness: None, aesthetic: None, aesthetic_crop: None, crop_rect: None
         });
         scores.insert(2, ImageQuality {
             image_id: 2, sharpness: 30.0, sharpness_global: 20.0, clip_shadows: 0.0, clip_highlights: 0.0,
-            mean_luma: 120.0, quality_version: 1, computed_at: 0, faces: None, eye_sharpness: None
+            mean_luma: 120.0, quality_version: 1, computed_at: 0, faces: None, eye_sharpness: None, aesthetic: None, aesthetic_crop: None, crop_rect: None
         });
         scores.insert(3, ImageQuality {
             image_id: 3, sharpness: 25.0, sharpness_global: 15.0, clip_shadows: 0.0, clip_highlights: 0.0,
-            mean_luma: 120.0, quality_version: 1, computed_at: 0, faces: None, eye_sharpness: None
+            mean_luma: 120.0, quality_version: 1, computed_at: 0, faces: None, eye_sharpness: None, aesthetic: None, aesthetic_crop: None, crop_rect: None
         });
         scores.insert(4, ImageQuality {
             image_id: 4, sharpness: 80.0, sharpness_global: 60.0, clip_shadows: 0.0, clip_highlights: 0.35,
-            mean_luma: 200.0, quality_version: 1, computed_at: 0, faces: None, eye_sharpness: None
+            mean_luma: 200.0, quality_version: 1, computed_at: 0, faces: None, eye_sharpness: None, aesthetic: None, aesthetic_crop: None, crop_rect: None
         });
 
         let suggestions = suggest_rejects(&items, &scores, LibraryReference::default());
@@ -833,7 +1003,7 @@ mod tests {
     fn scored(id: i64, sharpness: f64, clip_highlights: f64) -> ImageQuality {
         ImageQuality {
             image_id: id, sharpness, sharpness_global: sharpness, clip_shadows: 0.0, clip_highlights,
-            mean_luma: 120.0, quality_version: QUALITY_VERSION, computed_at: 0, faces: None, eye_sharpness: None,
+            mean_luma: 120.0, quality_version: QUALITY_VERSION, computed_at: 0, faces: None, eye_sharpness: None, aesthetic: None, aesthetic_crop: None, crop_rect: None,
         }
     }
 
@@ -888,7 +1058,7 @@ mod tests {
                 (id, q)
             })
             .collect();
-        let reference = LibraryReference { sharpness_median: Some(1348.0), eye_p80: None };
+        let reference = LibraryReference { sharpness_median: Some(1348.0), eye_p80: None, aesthetic_weak_below: None };
 
         let mut ids: Vec<i64> = suggest_rejects(&items, &scores, reference).iter().map(|s| s.image_id).collect();
         ids.sort();
@@ -902,8 +1072,110 @@ mod tests {
     }
 
     #[test]
+    fn the_best_looking_sharp_frame_is_kept_and_clearly_weaker_ones_offered_unticked() {
+        let cam = || Some("E-M10MarkII".to_string());
+        let items: Vec<DummyItem> =
+            (1..=4).map(|id| DummyItem { id, created: Some(1000 + id), cam: cam(), flag: 0 }).collect();
+        let with = |id, sharpness, aesthetic| ImageQuality { aesthetic: Some(aesthetic), ..scored(id, sharpness, 0.0) };
+        // 1 is the sharpest; 2 is nearly as sharp and looks best; 3 is sharp
+        // but looks clearly worse; 4 is blurred, however good it looks.
+        let scores: HashMap<i64, ImageQuality> =
+            [with(1, 1000.0, 5.3), with(2, 950.0, 5.6), with(3, 900.0, 4.9), with(4, 300.0, 6.5)]
+                .into_iter()
+                .map(|q| (q.image_id, q))
+                .collect();
+
+        let suggestions = suggest_rejects(&items, &scores, LibraryReference::default());
+        let found: Vec<(i64, bool)> = suggestions.iter().map(|s| (s.image_id, s.preselected)).collect();
+        assert_eq!(found, [(3, false), (4, true)], "{suggestions:#?}");
+        assert!(suggestions[0].reason.contains("4.9 vs 5.6"), "{}", suggestions[0].reason);
+        assert_eq!(burst_keeper(&items, &scores), [2]);
+
+        // Without aesthetic scores for every sharp frame: the sharpest is kept, nothing is a matter of taste.
+        let mut partial = scores.clone();
+        partial.get_mut(&3).unwrap().aesthetic = None;
+        assert_eq!(burst_keeper(&items, &partial), [1]);
+        assert!(suggest_rejects(&items, &partial, LibraryReference::default()).iter().all(|s| s.preselected));
+    }
+
+    #[test]
+    fn a_photo_that_is_strong_cropped_is_not_offered_as_weak() {
+        let cam = || Some("E-M10MarkII".to_string());
+        let library = LibraryReference { sharpness_median: Some(1348.0), eye_p80: None, aesthetic_weak_below: Some(4.6) };
+        // Standalone shots, weak as shot (4.3).
+        let items: Vec<DummyItem> =
+            (1..=3).map(|id| DummyItem { id, created: Some(id * 10_000), cam: cam(), flag: 0 }).collect();
+        let weak = |id| ImageQuality { aesthetic: Some(4.3), ..scored(id, 1500.0, 0.0) };
+        let mut scores: HashMap<i64, ImageQuality> = (1..=3).map(|id| (id, weak(id))).collect();
+
+        // Not checked yet: all three are offered, and all three need a crop check.
+        assert_eq!(suggest_rejects(&items, &scores, library).len(), 3);
+        assert_eq!(needs_crop_check(&items, &scores, library), [1, 2, 3]);
+
+        // 1: a crop reaches 5.2 (5.0 after the search's optimism): strong cropped.
+        // 2: the best crop gains only the optimism: still weak.
+        // 3: checked, no crop kept the face: still weak.
+        let rect = Some([0.0, 0.0, 0.67, 1.0]);
+        *scores.get_mut(&1).unwrap() = ImageQuality { aesthetic_crop: Some(5.2), crop_rect: rect, ..weak(1) };
+        *scores.get_mut(&2).unwrap() = ImageQuality { aesthetic_crop: Some(4.45), crop_rect: rect, ..weak(2) };
+        *scores.get_mut(&3).unwrap() = ImageQuality { aesthetic_crop: Some(4.3), crop_rect: None, ..weak(3) };
+        let suggested: Vec<i64> = suggest_rejects(&items, &scores, library).iter().map(|s| s.image_id).collect();
+        assert_eq!(suggested, [2, 3]);
+        assert!(needs_crop_check(&items, &scores, library).is_empty(), "each is checked once");
+        assert!(crop_helps(&scores[&1]) && !crop_helps(&scores[&2]) && !crop_helps(&scores[&3]));
+
+        // In a burst: a frame 0.7 below the keeper is weaker, unless cropped it
+        // comes within the margin. The keeper stays the best frame as shot.
+        let burst: Vec<DummyItem> = (1..=2).map(|id| DummyItem { id, created: Some(1000 + id), cam: cam(), flag: 0 }).collect();
+        let mut scores: HashMap<i64, ImageQuality> = [
+            ImageQuality { aesthetic: Some(5.5), ..scored(1, 1000.0, 0.0) },
+            ImageQuality { aesthetic: Some(4.8), ..scored(2, 1000.0, 0.0) },
+        ]
+        .into_iter()
+        .map(|q| (q.image_id, q))
+        .collect();
+        assert_eq!(needs_crop_check(&burst, &scores, LibraryReference::default()), [2]);
+        let frame = scores.get_mut(&2).unwrap();
+        frame.aesthetic_crop = Some(5.4);
+        frame.crop_rect = rect;
+        assert!(suggest_rejects(&burst, &scores, LibraryReference::default()).is_empty());
+        assert_eq!(burst_keeper(&burst, &scores), [1]);
+    }
+
+    #[test]
+    fn weak_looking_photos_are_offered_unticked_and_a_fault_comes_first() {
+        let cam = || Some("E-M10MarkII".to_string());
+        let items: Vec<DummyItem> =
+            (1..=3).map(|id| DummyItem { id, created: Some(id * 10_000), cam: cam(), flag: 0 }).collect();
+        let mut scores: HashMap<i64, ImageQuality> = [
+            ImageQuality { aesthetic: Some(4.0), ..scored(1, 1500.0, 0.0) },
+            ImageQuality { aesthetic: Some(5.0), ..scored(2, 1500.0, 0.0) },
+            ImageQuality { aesthetic: Some(3.5), ..scored(3, 1500.0, 0.6) }, // clipped too
+        ]
+        .into_iter()
+        .map(|q| (q.image_id, q))
+        .collect();
+        let library = LibraryReference { sharpness_median: Some(1348.0), eye_p80: None, aesthetic_weak_below: Some(4.3) };
+
+        let suggestions = suggest_rejects(&items, &scores, library);
+        let found: Vec<(i64, bool)> = suggestions.iter().map(|s| (s.image_id, s.preselected)).collect();
+        assert_eq!(found, [(1, false), (3, true)], "{suggestions:#?}");
+        assert!(suggestions[1].reason.contains("highlights"), "the fault is the reason given");
+
+        // The pre-import review only leaves out faults.
+        scores.get_mut(&3).unwrap().clip_highlights = 0.0;
+        assert_eq!(suggest_rejects(&items, &scores, library).iter().filter(|s| s.preselected).count(), 0);
+
+        // Too few scores in the library to say what "weak" is.
+        assert_eq!(aesthetic_weak_below(vec![5.0; MIN_LIBRARY_AESTHETIC - 1]), None);
+        let library: Vec<f64> = (0..100).map(|i| 3.0 + i as f64 * 0.03).collect();
+        let below = aesthetic_weak_below(library).unwrap();
+        assert!((below - 3.3).abs() < 0.05, "{below}");
+    }
+
+    #[test]
     fn grades_follow_the_reject_thresholds() {
-        let library = LibraryReference { sharpness_median: Some(1348.0), eye_p80: Some(116.0) };
+        let library = LibraryReference { sharpness_median: Some(1348.0), eye_p80: Some(116.0), aesthetic_weak_below: None };
         let eyes = |e: f64, session: Option<f64>| {
             let mut q = scored(1, 2000.0, 0.0);
             q.eye_sharpness = Some(e);

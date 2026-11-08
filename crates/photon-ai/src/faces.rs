@@ -151,6 +151,12 @@ pub fn largest_face_eyes(detector: &mut FaceDetector, img: &RgbImage) -> Result<
     Ok((faces.len(), eyes))
 }
 
+/// The largest face in `img`, if any.
+pub fn largest_face(detector: &mut FaceDetector, img: &RgbImage) -> Result<Option<Face>> {
+    let faces = detector.detect(img, MIN_SCORE)?;
+    Ok(faces.into_iter().max_by(|a, b| (a.w * a.h).total_cmp(&(b.w * b.h))))
+}
+
 fn iou(a: &Face, b: &Face) -> f32 {
     let (x1, y1) = (a.x.max(b.x), a.y.max(b.y));
     let (x2, y2) = ((a.x + a.w).min(b.x + b.w), (a.y + a.h).min(b.y + b.h));

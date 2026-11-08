@@ -1,5 +1,6 @@
 //! photon-ai: Inference runtime, model manager, and hardware acceleration for Photon.
 
+pub mod aesthetic;
 pub mod backend;
 pub mod devices;
 pub mod faces;

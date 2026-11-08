@@ -44,6 +44,8 @@ pub fn run_migrations(conn: &Connection) -> Result<(), PhotonError> {
         (18, MIGRATION_018_HIERARCHICAL_TAGS),
         (19, MIGRATION_019_DARKTABLE_EDITED_AND_FTS_OPT),
         (20, MIGRATION_020_XCF_PROJECT),
+        (21, MIGRATION_021_AESTHETIC_SCORE),
+        (22, MIGRATION_022_AESTHETIC_CROP),
     ];
 
     for (version, sql) in migrations {
@@ -433,6 +435,25 @@ INSERT INTO images_fts(images_fts) VALUES('rebuild');
 // ---------------------------------------------------------------------------
 const MIGRATION_020_XCF_PROJECT: &str = "
 ALTER TABLE images ADD COLUMN has_xcf INTEGER NOT NULL DEFAULT 0;
+";
+
+// ---------------------------------------------------------------------------
+// Migration 021: learned aesthetic score (AI-7, CLIP + LAION aesthetic head)
+// ---------------------------------------------------------------------------
+const MIGRATION_021_AESTHETIC_SCORE: &str = "
+ALTER TABLE image_quality ADD COLUMN aesthetic REAL;
+";
+
+// ---------------------------------------------------------------------------
+// Migration 022: the best square crop's aesthetic score and where it is (AI-7).
+// Only a reading: Photon never crops a photo.
+// ---------------------------------------------------------------------------
+const MIGRATION_022_AESTHETIC_CROP: &str = "
+ALTER TABLE image_quality ADD COLUMN aesthetic_crop REAL;
+ALTER TABLE image_quality ADD COLUMN crop_x REAL;
+ALTER TABLE image_quality ADD COLUMN crop_y REAL;
+ALTER TABLE image_quality ADD COLUMN crop_w REAL;
+ALTER TABLE image_quality ADD COLUMN crop_h REAL;
 ";
 
 #[cfg(test)]

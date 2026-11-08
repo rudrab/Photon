@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Aesthetic score** in Analyse Photo Quality (optional, ~612 MB download,
+  MIT + Apache-2.0): CLIP ViT-L/14 with the LAION aesthetic predictor judges how
+  good a photo looks as a whole, not just whether it is sharp. Weak-looking
+  photos and clearly weaker burst frames are listed (not ticked), the best
+  frame of a burst is the best-looking sharp one, and the info panel shows the
+  score and its rank in the library. Runs locally, on the GPU when there is one.
+- **Crop-aware weak suggestions:** before a photo is offered as weak-looking,
+  about 20 square crops that keep the main face are scored; if one is clearly
+  stronger, the photo isn't suggested, and the info panel says which crop
+  (Photon never crops).
+- **Restore rejected photos** from the Photo Quality results: the rejected
+  photos of the selection or view are listed, ticked; untick one to restore it.
+- **Move Rejects to Trash…** in the Photo Quality results: applies the choices,
+  then trashes every rejected photo there (asks first, undoable, follows
+  "Move to Trash Removes").
+
 ## 0.4.0 — 2026-11-01
 
 ### Removed

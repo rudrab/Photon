@@ -139,6 +139,16 @@ pub struct ImageQuality {
     pub faces: Option<i32>,
     /// Sharpness of the eyes of the largest face (`photon_ai::faces::eye_sharpness`).
     pub eye_sharpness: Option<f64>,
+    /// How good the photo looks as a whole, ~1–10 (`photon_ai::aesthetic`);
+    /// `None` = not scored (the aesthetic model isn't downloaded).
+    pub aesthetic: Option<f64>,
+    /// The aesthetic score of the best square crop that keeps the main face,
+    /// checked only for photos that look weak as shot. `None` = not checked.
+    pub aesthetic_crop: Option<f64>,
+    /// That crop as fractions of the (upright) frame: `[x, y, w, h]`. `None`
+    /// with an `aesthetic_crop` = checked, but no crop kept the face. Only a
+    /// reading for the user: Photon never crops.
+    pub crop_rect: Option<[f64; 4]>,
 }
 
 // ---------------------------------------------------------------------------

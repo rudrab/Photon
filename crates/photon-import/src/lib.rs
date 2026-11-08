@@ -22,7 +22,7 @@ mod testutil;
 pub use engine::{ImportConfig, ImportEngine};
 pub use export::{batch_export, export_single, ExportConfig, ExportFormat, ExportReport, ExportResize};
 pub use quality::{
-    compute_quality, files_to_score, find_bursts, review_rejects, suggest_rejects, Burst, BurstItem, QualityScore, RejectSuggestion,
+    burst_keeper, compute_quality, files_to_score, find_bursts, needs_crop_check, review_rejects, suggest_rejects, Burst, BurstItem, QualityScore, RejectSuggestion,
     BLUR_SHARPNESS_FLOOR, BURST_SHARPNESS_REJECT_RATIO, HIGHLIGHT_CLIP_REJECT_THRESHOLD,
     QUALITY_LONG_EDGE, QUALITY_VERSION,
 };

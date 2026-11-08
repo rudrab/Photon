@@ -2570,6 +2570,9 @@ mod tests {
             computed_at: 1_700_000_010,
             faces: Some(1),
             eye_sharpness: Some(500.0),
+            aesthetic: None,
+            aesthetic_crop: None,
+            crop_rect: None,
         };
         {
             let conn = db.conn().unwrap();

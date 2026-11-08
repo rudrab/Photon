@@ -14,3 +14,37 @@ inputs = [[1, 3, 640, 640]]
 # 640x640 frame, but the GPU costs ~460 MB more and decoding the preview takes longer than
 # either. NPU first once a plugin exists (low power for library-wide scans).
 preferred_devices = ["npu", "cpu", "gpu"]
+
+# Aesthetic score (AI-7 learned): the CLIP ViT-L/14 image encoder gives a 768-value
+# embedding, and the LAION aesthetic head turns it into a 1–10 score.
+[[model]]
+id = "clip-vit-l14-vision-fp16"
+task = "image-embedding"
+file = "clip_vit_large_patch14_vision_fp16.onnx"
+# Xenova's ONNX export of openai/clip-vit-large-patch14 (vision tower + projection,
+# `pixel_values` → `image_embeds`), pinned to a commit. fp16 weights, float32 in/out.
+url = "https://huggingface.co/Xenova/clip-vit-large-patch14/resolve/c307790166907339eed5a9a53a249af534102536/onnx/vision_model_fp16.onnx"
+sha256 = "6e6b9e280b73bdc432b6c3b1c05f33596bbe5570f6825f1174eaa207fc1d22dc"
+size_bytes = 608690866
+licence = "MIT"
+# OpenAI released the CLIP code and weights under MIT (the model card asks that
+# deployed use be tested first; it is a note, not a licence term).
+licence_url = "https://github.com/openai/CLIP/blob/main/LICENSE"
+source = "OpenAI CLIP (ONNX export by Xenova)"
+inputs = [[1, 3, 224, 224]]
+# ~80 GFLOPs per photo: the GPU is several times faster than the CPU.
+preferred_devices = ["gpu", "cpu"]
+
+[[model]]
+id = "laion-aesthetic-v2-l14"
+task = "aesthetic-head"
+file = "sac+logos+ava1-l14-linearMSE.pth"
+url = "https://raw.githubusercontent.com/christophschuhmann/improved-aesthetic-predictor/6934dd81792f086e613a121dbce43082cb8be85e/sac%2Blogos%2Bava1-l14-linearMSE.pth"
+sha256 = "21dd590f3ccdc646f0d53120778b296013b096a035a2718c9cb0d511bff0f1e0"
+size_bytes = 3714759
+licence = "Apache-2.0"
+licence_url = "https://github.com/christophschuhmann/improved-aesthetic-predictor/blob/main/LICENSE"
+source = "LAION improved aesthetic predictor"
+inputs = [[1, 768]]
+# Five small linear layers, evaluated in Rust (`aesthetic.rs`), not by OpenVINO.
+preferred_devices = ["cpu"]

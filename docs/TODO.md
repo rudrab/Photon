@@ -88,6 +88,11 @@ Useful tools installed on the dev machine: `xmllint`, `exiv2`, `darktable-cli`,
 7. **Tags:** use `queries::ensure_tag`, never `create_tag` (which returns a wrong
    id when the tag already exists).
 
+### Done (2026-11-08) — don't redo
+
+- AI-7 learned aesthetic score (CLIP ViT-L/14 + LAION aesthetic head) and restoring
+  rejects from the Photo Quality results. See AI-7; **not checked by hand in the GUI**.
+
 ### Done (2026-11-01) — don't redo
 
 - Review Import by day and pre-import quality check (`handlers/import_handler.rs`,
@@ -912,7 +917,7 @@ was benchmarked: none with verified OSI-licensed ONNX weights was chosen yet (AI
 - Also gives AI-quality "find similar", on top of PART 4's perceptual hash.
 
 ### 🟢 AI-7 · Image quality sorter (classical) · S–M
-### 🟡 AI-7 · Learned score · S–M (deferred until OSI-licensed technical quality weights are verified)
+### 🟢 AI-7 · Learned score (aesthetic) · S–M — done 2026-11-08, GUI not checked by hand
 
 Done 2026-09-29 (implemented by another agent, reviewed and corrected). Menu: "Analyse
 Photo Quality…" (scores what isn't scored in the selection/view, then shows the
@@ -951,6 +956,82 @@ blurred and badly exposed photos to reject, with Analyse Again); filter "Possibl
 
 **Not verified by hand in the GUI:** the analysis run and its results on a real burst,
 undo restoring the sidecars. Check on a copy of the library.
+
+**Learned aesthetic score (2026-11-08).** The classical score only says whether a photo
+is technically sound; the user asked for composition too. Chosen by the user over
+classical composition heuristics:
+
+- `photon-ai::aesthetic`: CLIP ViT-L/14 image encoder (OpenAI, MIT; Xenova's fp16 ONNX
+  export, 609 MB, pinned commit + sha256) → 768-d embedding → LAION improved aesthetic
+  predictor `sac+logos+ava1-l14-linearMSE.pth` (Apache-2.0, 3.7 MB, pinned commit). The
+  head is five linear layers with no activations, read straight from the PyTorch zip
+  (stored, storages `data/0–9` in state-dict order) and evaluated in Rust; checked against
+  a NumPy reference (ignored test `real_head_matches_the_reference`, `PHOTON_AESTHETIC_HEAD`).
+  Preprocessing as CLIP: shortest edge → 224 bicubic, centre crop, CLIP mean/std.
+  `InferenceBackend::load_with_input_shape` fixes the dynamic ONNX input to 1×3×224×224
+  (OpenVINO `reshape_single_input`). GPU first, CPU fallback. Measured (Core Ultra 5 125H,
+  incl. full-size JPEG decode): Arc GPU 0.1–0.25 s, CPU 0.8 s per photo; CPU and GPU
+  agree to 0.01. `examples/aesthetic.rs` prints scores. On 12 E-M10 II photos: 4.3–5.7;
+  Gaussian blur costs 0.4–0.8; a 9° tilt ~0 (CLIP doesn't care about tilt).
+- `ModelStore` writes `<file>.verified` (sha, size, mtime) after a successful hash so
+  `status()` doesn't re-hash 600 MB on the UI thread (Preferences); `verify()` before a
+  load always hashes.
+- Migration 021 `image_quality.aesthetic`; the upsert keeps a saved aesthetic score when
+  re-scored without the model. `get_unscored_images(.., need_aesthetic)` re-queues
+  photos scored before the model was downloaded.
+- Suggestions (`quality::suggest_rejects`, `RejectSuggestion::preselected = false`, not
+  ticked): outside bursts, below the library's 10th percentile (≥ 30 scores,
+  `AESTHETIC_WEAK_PERCENTILE`, `MIN_LIBRARY_AESTHETIC`); in a burst, a sharp frame ≥ 0.5
+  below the best-looking sharp frame (`BURST_AESTHETIC_MARGIN`). `burst_keeper` = best-looking
+  sharp frame (sharpest without scores) → "★ Best" badge. Pre-import review ignores taste.
+  Info panel: "Aesthetic: 5.2 / 10, better than N% of your photos"; a taste-only
+  suggestion doesn't turn the gauge red.
+- Offered on Analyse Photo Quality after the face model (`with_aesthetic_model`), with a
+  progress bar and Stop (`download_models`).
+- **Crop-aware taste suggestions (2026-11-08):** a photo weak as shot can be strong cropped.
+  `quality::needs_crop_check` lists the shots about to be offered as "looks weak" / "weaker
+  frame" with no crop reading; `MainWindow::check_weak_crops` (after scoring, before the
+  results; progress + Stop) runs `AestheticScorer::best_crop` on their Large preview: 21
+  square crops (`crop_candidates`: sides 100/85/70 % of the short edge × 3×3 positions;
+  squares because CLIP sees a square), only those containing the largest YuNet face
+  (`faces::largest_face`; without the face model, unguarded). Migration 022:
+  `aesthetic_crop`, `crop_x/y/w/h` (`save_aesthetic_crop`; cleared when a new aesthetic score
+  is saved; rect NULL = no crop kept the face). `aesthetic_potential` = max(score, crop −
+  `CROP_SEARCH_OPTIMISM` 0.2: the best of 21 beats the frame by 0.19 at the median by luck,
+  measured on 40 photos). Weak/weaker use the potential; the burst keeper stays the best as
+  shot. Info panel: "Stronger cropped (5.5): a square from the left, keeping 54% of the
+  frame". **Photon never crops** (decided). `examples/aesthetic.rs` with `CROPS=1
+  FACES=<yunet>` prints the crop.
+  Why not MUSIQ (tested 2026-11-08 with Google's code and AVA checkpoint, removed): it
+  disagreed with LAION on 40 photos (rank corr. 0.23), and on 576 crops of 8 face photos it
+  could not tell face-keeping crops from face-cutting ones (AUC 0.49; its favourite crop of
+  one photo was a headless baby), LAION 0.69. Q-Align: non-commercial licence + 16 GB.
+  Limits: only the largest face is kept whole (a half-visible bystander can be "largest");
+  square crops only; thresholds from 40 photos.
+- Not done: storing the CLIP embedding (AI-6 could reuse it for search instead of
+  running CLIP again); sort/filter by aesthetic score; thresholds tuned on more than a
+  dozen photos.
+
+**Restore from Photo Quality (2026-11-08).** Once rejected, a photo never appeared in the
+results again (`suggest_rejects` skips rejects), so only Ctrl+Z (the whole batch) or
+finding it in the grid took a reject back. The results now end with "Already Rejected":
+every rejected photo of the scope, ticked, with the reason it would have been suggested;
+unticking restores it (flag 0 + XMP). `apply_quality_choices(reject, restore, then)`: one
+undo step for each half. **Move Rejects to Trash…** (bottom bar) saves the choices, then
+passes the photos rejected after them (re-read; only `flagged == -1` ones) to
+`selection_bar::confirm_trash_images`, the same confirm + trash + undo as Delete on a
+selection (`MainWindow::selection_context` builds the bar's context for both).
+
+**Not verified by hand (2026-11-08):** run Analyse Photo Quality on a copy of the library:
+accept the aesthetic model download (progress, Stop), check the scores and "★ Best" on a
+burst, that weak-looking photos are listed unticked, untick an "Already Rejected" photo
+and Apply (it shows as unflagged, its sidecar has no `xmp:Rating="-1"`), Ctrl+Z twice
+after a mixed Reject + Restore, the info panel's aesthetic line, and Move Rejects to
+Trash… (count follows the ticks; Cancel in the confirmation keeps the files but the
+rejects/restores are already saved; the files and sidecars land in the Trash; Ctrl+Z
+brings them back; RAW+JPG follows the preference). Crop check: after scoring, "Checking
+crops of N weak-looking photos" runs (Stop works), photos a crop rescues drop out of the
+results, and the info panel shows "Stronger cropped …" for them.
 
 ### 🟡 AI-8 · AI masks handed over to darktable · spike, then M–L — needs AI-5; decide first
 

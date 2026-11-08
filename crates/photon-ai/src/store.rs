@@ -65,10 +65,15 @@ impl ModelStore {
                     };
                 }
 
+                if self.verified_marker_matches(spec, &meta) {
+                    return ModelStatus::Ready { size_bytes: size };
+                }
+
                 // Verify SHA-256 hash
                 match self.compute_sha256(&path) {
                     Ok(hash) => {
                         if hash.eq_ignore_ascii_case(&spec.sha256) {
+                            self.write_verified_marker(spec, &meta);
                             ModelStatus::Ready { size_bytes: size }
                         } else {
                             ModelStatus::Corrupt {
@@ -105,6 +110,9 @@ impl ModelStore {
                 spec.sha256,
                 computed
             );
+        }
+        if let Ok(meta) = fs::metadata(&path) {
+            self.write_verified_marker(spec, &meta);
         }
 
         Ok(path)
@@ -195,6 +203,9 @@ impl ModelStore {
             )
         })?;
 
+        if let Ok(meta) = fs::metadata(&final_path) {
+            self.write_verified_marker(spec, &meta);
+        }
         log::info!("Successfully downloaded and verified {}", spec.id);
         Ok(final_path)
     }
@@ -205,6 +216,10 @@ impl ModelStore {
         if path.exists() {
             fs::remove_file(&path)
                 .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+        let marker = self.marker_path(spec);
+        if marker.exists() {
+            let _ = fs::remove_file(marker);
         }
         let part = self.base_dir.join(format!("{}.part", spec.file));
         if part.exists() {
@@ -222,6 +237,37 @@ impl ModelStore {
             }
         }
         total
+    }
+
+    /// Where the record of the last successful hash check of `spec` is kept.
+    fn marker_path(&self, spec: &ModelSpec) -> PathBuf {
+        self.base_dir.join(format!("{}.verified", spec.file))
+    }
+
+    /// What the marker records: the expected hash, and the file's size and
+    /// modification time when it matched.
+    fn marker_text(spec: &ModelSpec, meta: &fs::Metadata) -> Option<String> {
+        let mtime = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+        Some(format!("{} {} {}\n", spec.sha256.to_ascii_lowercase(), meta.len(), mtime))
+    }
+
+    /// Whether the file was hashed and matched since it last changed: hashing
+    /// a 600 MB model takes seconds, too long for every status check (the
+    /// Preferences window asks for each model when it opens). `verify`, run
+    /// before a model is loaded, always hashes.
+    fn verified_marker_matches(&self, spec: &ModelSpec, meta: &fs::Metadata) -> bool {
+        match (fs::read_to_string(self.marker_path(spec)), Self::marker_text(spec, meta)) {
+            (Ok(found), Some(expected)) => found == expected,
+            _ => false,
+        }
+    }
+
+    fn write_verified_marker(&self, spec: &ModelSpec, meta: &fs::Metadata) {
+        if let Some(text) = Self::marker_text(spec, meta) {
+            if let Err(e) = fs::write(self.marker_path(spec), text) {
+                log::debug!("Couldn't record that {} was verified: {e}", spec.file);
+            }
+        }
     }
 
     fn compute_sha256(&self, path: &Path) -> Result<String> {
@@ -280,6 +326,14 @@ mod tests {
 
         // Verify succeeds
         assert!(store.verify(&spec).is_ok());
+
+        // Replaced by another file of the same size after it was verified:
+        // the marker no longer matches, so the file is hashed again.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&path, b"tesx").unwrap();
+        assert!(matches!(store.status(&spec), ModelStatus::Corrupt { .. }));
+        fs::write(&path, b"test").unwrap();
+        assert_eq!(store.status(&spec), ModelStatus::Ready { size_bytes: 4 });
 
         // Delete removes file
         store.delete(&spec).unwrap();

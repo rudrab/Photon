@@ -6,7 +6,7 @@
 use crate::backend::{Device, DeviceInfo, InferenceBackend, LoadedModel, Tensor};
 use crate::devices::{cpu_name, why_openvino_failed, why_unavailable};
 use anyhow::{bail, Context, Result};
-use openvino::{Core, DeviceType, ElementType, PropertyKey, RwPropertyKey, Shape, Tensor as OvTensor};
+use openvino::{Core, DeviceType, ElementType, PartialShape, PropertyKey, RwPropertyKey, Shape, Tensor as OvTensor};
 use std::path::{Path, PathBuf};
 
 /// OpenVINO inference engine backend.
@@ -104,6 +104,18 @@ impl InferenceBackend for OpenVinoBackend {
     }
 
     fn load(&self, model_path: &Path, device: Device) -> Result<Box<dyn LoadedModel>> {
+        self.load_reshaped(model_path, device, None)
+    }
+
+    fn load_with_input_shape(&self, model_path: &Path, device: Device, input_shape: &[usize]) -> Result<Box<dyn LoadedModel>> {
+        self.load_reshaped(model_path, device, Some(input_shape))
+    }
+}
+
+impl OpenVinoBackend {
+    /// Read `model_path`, fix a dynamic single input to `input_shape` if given,
+    /// and compile it for `device`.
+    fn load_reshaped(&self, model_path: &Path, device: Device, input_shape: Option<&[usize]>) -> Result<Box<dyn LoadedModel>> {
         if !model_path.exists() {
             bail!("Model file not found at {}", model_path.display());
         }
@@ -122,9 +134,16 @@ impl InferenceBackend for OpenVinoBackend {
         }
 
         let model_path_str = model_path.to_str().context("invalid UTF-8 model path")?;
-        let model = core
+        let mut model = core
             .read_model_from_file(model_path_str, "")
             .with_context(|| format!("Failed to read model from {}", model_path.display()))?;
+        if let Some(shape) = input_shape.filter(|_| model.is_dynamic()) {
+            let dims: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
+            let partial = PartialShape::new_static(dims.len() as i64, &dims)?;
+            model
+                .reshape_single_input(&partial)
+                .with_context(|| format!("Failed to fix the input of {} to {shape:?}", model_path.display()))?;
+        }
 
         let mut compiled = core
             .compile_model(&model, dev_type)

@@ -78,6 +78,7 @@ pub struct MainWindow {
     library_check: Rc<Cell<(Option<std::time::Instant>, bool)>>,
     /// The user said "Not Now" to downloading the face model, this session.
     face_model_declined: Rc<Cell<bool>>,
+    aesthetic_model_declined: Rc<Cell<bool>>,
     /// Generation counter for timeline loads to ignore out-of-order queries.
     pub timeline_generation: Rc<Cell<u64>>,
     /// Imports running now. Closing the window while one runs asks first.
@@ -460,6 +461,7 @@ impl MainWindow {
             timeline_stale: Rc::new(Cell::new(true)),
             library_check: Rc::new(Cell::new((None, false))),
             face_model_declined: Rc::new(Cell::new(false)),
+            aesthetic_model_declined: Rc::new(Cell::new(false)),
             active_imports: Rc::new(Cell::new(0)),
             timeline_generation: Rc::new(Cell::new(0)),
             rating_filter,
@@ -667,27 +669,7 @@ impl MainWindow {
         let share_ctx = mw.share_context();
         mw.timeline.set_drag_filter(move |images| share::versions_to_share(&share_ctx, images));
 
-        let mw_changed = mw.clone();
-        let mw_export = mw.clone();
-        let mw_ss_sel = mw.clone();
-        let bottom_bar_handle = selection_bar::attach(
-            &mw.timeline,
-            selection_bar::Context {
-                window: mw.window.clone().upcast(),
-                db: mw.db.clone(),
-                prefs: mw.prefs.clone(),
-                on_library_changed: Rc::new(move || mw_changed.refresh()),
-                on_export: Rc::new(move |images| mw_export.start_export(images)),
-                share: mw.share_context(),
-                undo_manager: mw.undo_manager.clone(),
-                current_album_id: mw.current_album_id.clone(),
-                on_start_slideshow: Some(Rc::new(move || mw_ss_sel.start_slideshow())),
-                on_compare: {
-                    let mw = mw.clone();
-                    Rc::new(move |ids| mw.show_compare(ids))
-                },
-            },
-        );
+        let bottom_bar_handle = selection_bar::attach(&mw.timeline, mw.selection_context());
         content_box.append(&bottom_bar_handle.widget);
         bottom_bar_handle.widget.set_revealed(true);
         *mw.bottom_bar.borrow_mut() = Some(bottom_bar_handle);
@@ -1102,6 +1084,24 @@ impl MainWindow {
     }
 
     /// For Share menus: the window, and in-app notifications.
+    /// What the selection bar's actions (and the Photo Quality results'
+    /// Move Rejects to Trash) need from the window.
+    fn selection_context(&self) -> selection_bar::Context {
+        let (mw_changed, mw_export, mw_ss, mw_cmp) = (self.clone(), self.clone(), self.clone(), self.clone());
+        selection_bar::Context {
+            window: self.window.clone().upcast(),
+            db: self.db.clone(),
+            prefs: self.prefs.clone(),
+            on_library_changed: Rc::new(move || mw_changed.refresh()),
+            on_export: Rc::new(move |images| mw_export.start_export(images)),
+            share: self.share_context(),
+            undo_manager: self.undo_manager.clone(),
+            current_album_id: self.current_album_id.clone(),
+            on_start_slideshow: Some(Rc::new(move || mw_ss.start_slideshow())),
+            on_compare: Rc::new(move |ids| mw_cmp.show_compare(ids)),
+        }
+    }
+
     pub fn share_context(&self) -> share::Context {
         let toasts = self.toasts.clone();
         share::Context {
@@ -1716,14 +1716,193 @@ impl MainWindow {
         }
         let mw = self.clone();
         let ids_after = ids.clone();
-        self.analyse_quality_in(Some(ids), what, false, Some(Box::new(move || mw.open_quality_results(ids_after, what))));
+        self.analyse_quality_in(Some(ids), what, false, Some(Box::new(move || mw.check_crops_then_show(ids_after, what))));
     }
 
     /// Score `ids` again from scratch, then show the results again.
     fn reanalyse_quality(&self, ids: Vec<i64>, what: &'static str) {
         let mw = self.clone();
         let ids_after = ids.clone();
-        self.analyse_quality_in(Some(ids), what, true, Some(Box::new(move || mw.open_quality_results(ids_after, what))));
+        self.analyse_quality_in(Some(ids), what, true, Some(Box::new(move || mw.check_crops_then_show(ids_after, what))));
+    }
+
+    fn check_crops_then_show(&self, ids: Vec<i64>, what: &'static str) {
+        let mw = self.clone();
+        let ids_after = ids.clone();
+        self.check_weak_crops(ids, Box::new(move || mw.open_quality_results(ids_after, what)));
+    }
+
+    /// Before a photo of `ids` is offered as weak-looking, check whether a
+    /// square crop keeping its main face would make it strong
+    /// (`quality::needs_crop_check`; ~20 runs of the aesthetic model each, so
+    /// only for those photos), and save what was found. Photon never crops:
+    /// this only spares a photo the suggestion and gives a hint. Runs in the
+    /// background with progress and Stop; `then` runs when done (also when
+    /// there was nothing to check or the model isn't there; not when stopped).
+    fn check_weak_crops(&self, ids: Vec<i64>, then: Box<dyn FnOnce()>) {
+        let store = photon_ai::store::ModelStore::default_store();
+        if self.progress_revealer.reveals_child()
+            || !photon_ai::openvino::OpenVinoBackend::is_available()
+            || !photon_ai::aesthetic::model_ready(&store)
+        {
+            return then();
+        }
+
+        enum Progress {
+            Total(usize),
+            Step(usize),
+            Done { checked: usize, stopped: bool },
+        }
+        let (tx, rx) = async_channel::bounded::<Progress>(64);
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let mw = self.clone();
+        let cancel_ui = cancel.clone();
+        glib::spawn_future_local(async move {
+            let mut then = Some(then);
+            let mut total = 0;
+            let mut cancel_handler = None;
+            while let Ok(msg) = rx.recv().await {
+                match msg {
+                    Progress::Total(n) => {
+                        total = n;
+                        mw.status_label.set_text(&format!("Checking crops of {n} weak-looking photos…"));
+                        mw.progress_bar.set_fraction(0.0);
+                        mw.cancel_button.set_label("Stop");
+                        mw.cancel_button.set_visible(true);
+                        mw.progress_revealer.set_reveal_child(true);
+                        let c = cancel_ui.clone();
+                        cancel_handler = Some(
+                            mw.cancel_button.connect_clicked(move |_| c.store(true, std::sync::atomic::Ordering::Relaxed)),
+                        );
+                    }
+                    Progress::Step(done) => {
+                        mw.progress_bar.set_fraction(done as f64 / total.max(1) as f64);
+                        mw.status_label.set_text(&format!("Checking crops of weak-looking photos: {done} of {total}"));
+                    }
+                    Progress::Done { checked, stopped } => {
+                        mw.progress_revealer.set_reveal_child(false);
+                        mw.cancel_button.set_visible(false);
+                        if let Some(h) = cancel_handler.take() {
+                            mw.cancel_button.disconnect(h);
+                        }
+                        if stopped {
+                            mw.toast(&format!("Crop check stopped after {checked} of {total} photos"));
+                        } else if let Some(then) = then.take() {
+                            then();
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
+        let db = self.db.clone();
+        let thumbs = photon_import::thumbnails::ThumbnailGenerator::new(self.cache_dir.clone());
+        std::thread::spawn(move || {
+            use std::sync::atomic::Ordering;
+            let done = |checked, stopped| {
+                let _ = tx.send_blocking(Progress::Done { checked, stopped });
+            };
+            let candidates = db.conn().map_err(|e| e.to_string()).and_then(|conn| {
+                let images: Vec<Image> = ids.iter().filter_map(|&id| queries::get_image(&conn, id).ok().flatten()).collect();
+                let scores = queries::get_image_quality_batch(&conn, &ids).map_err(|e| e.to_string())?;
+                let library = photon_import::quality::library_reference(&conn);
+                Ok((photon_import::quality::needs_crop_check(&images, &scores, library), scores))
+            });
+            let (candidates, scores) = match candidates {
+                Ok(c) => c,
+                Err(e) => {
+                    log::warn!("Finding the photos whose crops to check: {e}");
+                    return done(0, false);
+                }
+            };
+            if candidates.is_empty() {
+                return done(0, false);
+            }
+            let _ = tx.send_blocking(Progress::Total(candidates.len()));
+
+            let backend = photon_ai::openvino::OpenVinoBackend::new();
+            let mut scorer = match photon_ai::aesthetic::load_scorer(&store, &backend) {
+                Ok(Some((scorer, device))) => {
+                    log::info!("Checking crops on {device}");
+                    scorer
+                }
+                Ok(None) => return done(0, false),
+                Err(e) => {
+                    log::warn!("Aesthetic model unavailable; crops not checked: {e:#}");
+                    return done(0, false);
+                }
+            };
+            // Without the face model, crops are tried without keeping a face.
+            let mut detector = match photon_ai::faces::load_detector(&store, &backend) {
+                Ok(found) => found.map(|(d, _)| d),
+                Err(e) => {
+                    log::warn!("Face model unavailable; crops checked without keeping faces: {e:#}");
+                    None
+                }
+            };
+
+            let mut checked = 0;
+            for (n, id) in candidates.iter().enumerate() {
+                if cancel.load(Ordering::Relaxed) {
+                    return done(checked, true);
+                }
+                if n > 0 {
+                    let _ = tx.send_blocking(Progress::Step(n));
+                }
+                let preview = db
+                    .conn()
+                    .map_err(|e| e.to_string())
+                    .and_then(|conn| queries::get_image(&conn, *id).map_err(|e| e.to_string()))
+                    .and_then(|img| img.ok_or_else(|| "no longer in the library".to_string()))
+                    .and_then(|img| {
+                        thumbs.ensure(&img, photon_import::thumbnails::ThumbSize::Large).map_err(|e| format!("{e:#}"))
+                    })
+                    .and_then(|path| image::open(&path).map(|d| d.to_rgb8()).map_err(|e| e.to_string()));
+                let rgb = match preview {
+                    Ok(rgb) => rgb,
+                    Err(e) => {
+                        log::info!("No crop check for photo {id}: {e}");
+                        continue;
+                    }
+                };
+                let (w, h) = (rgb.width() as f64, rgb.height() as f64);
+                let face = detector.as_mut().and_then(|d| match photon_ai::faces::largest_face(d, &rgb) {
+                    Ok(face) => face,
+                    Err(e) => {
+                        log::warn!("Face detection for photo {id}: {e:#}");
+                        None
+                    }
+                });
+                let keep = face.map(|f| {
+                    let (x0, y0) = ((f.x as f64 / w).clamp(0.0, 1.0), (f.y as f64 / h).clamp(0.0, 1.0));
+                    let (x1, y1) = (((f.x + f.w) as f64 / w).clamp(0.0, 1.0), ((f.y + f.h) as f64 / h).clamp(0.0, 1.0));
+                    photon_ai::aesthetic::CropRect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
+                });
+                let reading = match scorer.best_crop(&rgb, keep.as_ref()) {
+                    Ok(Some((rect, score))) => (score, Some([rect.x, rect.y, rect.w, rect.h])),
+                    // No crop keeps the face: the frame as shot is the reading.
+                    Ok(None) => match scores.get(id).and_then(|q| q.aesthetic) {
+                        Some(a) => (a, None),
+                        None => continue,
+                    },
+                    Err(e) => {
+                        log::warn!("Crop check for photo {id}: {e:#}");
+                        continue;
+                    }
+                };
+                let saved = db
+                    .conn()
+                    .map_err(|e| e.to_string())
+                    .and_then(|conn| queries::save_aesthetic_crop(&conn, *id, reading.0, reading.1).map_err(|e| e.to_string()));
+                match saved {
+                    Ok(()) => checked += 1,
+                    Err(e) => log::warn!("Saving the crop check of photo {id}: {e}"),
+                }
+            }
+            done(checked, false);
+        });
     }
 
     fn open_quality_results(&self, target_ids: Vec<i64>, what: &'static str) {
@@ -1737,7 +1916,7 @@ impl MainWindow {
         let library = photon_import::quality::library_reference(&conn);
         drop(conn);
 
-        let mw = self.clone();
+        let (mw, mw_trash) = (self.clone(), self.clone());
         let (mw_again, ids_again) = (self.clone(), target_ids.clone());
         crate::ui::rejects_dialog::show(
             &self.window,
@@ -1745,57 +1924,106 @@ impl MainWindow {
             scores,
             library,
             self.cache_dir.clone(),
-            move |reject_ids| mw.apply_rejects(reject_ids),
+            move |reject_ids, restore_ids| mw.apply_quality_choices(reject_ids, restore_ids, None),
+            move |reject_ids, restore_ids, final_rejects| mw_trash.trash_quality_rejects(reject_ids, restore_ids, final_rejects),
             move || mw_again.reanalyse_quality(ids_again.clone(), what),
         );
     }
 
-    /// Reject the photos the user confirmed in the Photo Quality results: the same DB
-    /// write and XMP sync as culling by hand, off the UI thread. Undoable once
-    /// saved; sidecars that couldn't be written are reported.
-    pub fn apply_rejects(&self, reject_ids: Vec<i64>) {
-        if reject_ids.is_empty() {
+    /// Reject the photos the user ticked in the Photo Quality results and
+    /// restore (unflag) the rejected ones they unticked: the same DB write and
+    /// XMP sync as culling by hand, off the UI thread. Each half is one undo
+    /// step; sidecars that couldn't be written are reported.
+    /// `then` runs once they are saved (not if saving failed).
+    pub fn apply_quality_choices(&self, reject_ids: Vec<i64>, restore_ids: Vec<i64>, then: Option<Box<dyn FnOnce()>>) {
+        if reject_ids.is_empty() && restore_ids.is_empty() {
+            if let Some(then) = then {
+                then();
+            }
             return;
         }
         let db = self.db.clone();
         let mw = self.clone();
         glib::spawn_future_local(async move {
-            let result = gio::spawn_blocking(move || -> Result<(Vec<(i64, i32)>, usize), String> {
+            type Changed = (Vec<(i64, i32)>, i32);
+            let result = gio::spawn_blocking(move || -> Result<(Vec<Changed>, usize), String> {
                 let mut conn = db.conn().map_err(|e| e.to_string())?;
-                let mut previous = Vec::with_capacity(reject_ids.len());
-                for &id in &reject_ids {
-                    if let Some(img) = queries::get_image(&conn, id).map_err(|e| e.to_string())? {
-                        previous.push((id, img.flagged));
+                let mut changes = Vec::new();
+                let mut xmp_failed = 0;
+                for (ids, flag) in [(restore_ids, 0), (reject_ids, -1)] {
+                    let mut previous = Vec::with_capacity(ids.len());
+                    for &id in &ids {
+                        if let Some(img) = queries::get_image(&conn, id).map_err(|e| e.to_string())? {
+                            previous.push((id, img.flagged));
+                        }
                     }
+                    if previous.is_empty() {
+                        continue;
+                    }
+                    let ids: Vec<i64> = previous.iter().map(|&(id, _)| id).collect();
+                    queries::batch_set_flag(&mut conn, &ids, flag).map_err(|e| e.to_string())?;
+                    xmp_failed +=
+                        crate::ui::timeline::sync_cull_to_xmp(&conn, &ids, crate::ui::timeline::XmpFields::CULL);
+                    changes.push((previous, flag));
                 }
-                let ids: Vec<i64> = previous.iter().map(|&(id, _)| id).collect();
-                queries::batch_set_flag(&mut conn, &ids, -1).map_err(|e| e.to_string())?;
-                let xmp_failed = crate::ui::timeline::sync_cull_to_xmp(&conn, &ids, crate::ui::timeline::XmpFields::CULL);
-                Ok((previous, xmp_failed))
+                Ok((changes, xmp_failed))
             })
             .await
             .unwrap_or_else(|_| Err("the worker thread panicked".into()));
 
             match result {
-                Ok((previous, xmp_failed)) => {
-                    let count = previous.len();
-                    mw.undo_manager.borrow_mut().push(crate::ui::undo::UndoAction::Flag { previous, new_flag: -1 });
+                Ok((changes, xmp_failed)) => {
+                    let mut done = Vec::new();
+                    for (previous, flag) in changes {
+                        let n = previous.len();
+                        let photos = if n == 1 { "photo" } else { "photos" };
+                        done.push(if flag == -1 { format!("Rejected {n} {photos}") } else { format!("restored {n} {photos}") });
+                        mw.undo_manager.borrow_mut().push(crate::ui::undo::UndoAction::Flag { previous, new_flag: flag });
+                    }
                     mw.timeline_stale.set(true);
                     mw.refresh();
+                    let mut text = done.join(", ");
+                    if let Some(first) = text.get(0..1) {
+                        text = first.to_uppercase() + &text[1..];
+                    }
                     if xmp_failed > 0 {
-                        mw.toast(&format!(
-                            "Rejected {count} photos, but {xmp_failed} XMP sidecars couldn't be updated (see the log)"
-                        ));
+                        mw.toast(&format!("{text}, but {xmp_failed} XMP sidecars couldn't be updated (see the log)"));
                     } else {
-                        mw.toast(&format!("Rejected {count} photos (Ctrl+Z to undo)"));
+                        mw.toast(&format!("{text} (Ctrl+Z to undo)"));
+                    }
+                    if let Some(then) = then {
+                        then();
                     }
                 }
                 Err(e) => {
-                    log::error!("Rejecting suggested photos: {e}");
-                    mw.show_error(&format!("The photos couldn't be rejected: {e}"));
+                    log::error!("Applying the Photo Quality choices: {e}");
+                    mw.show_error(&format!("The photos couldn't be updated: {e}"));
                 }
             }
         });
+    }
+
+    /// "Move Rejects to Trash…" in the Photo Quality results: save the
+    /// choices made there first, then offer to trash `final_rejects` — the
+    /// photos that are rejected once they are saved — the same way as Move to
+    /// Trash on a selection (asks first, follows "Move to Trash Removes",
+    /// undoable). A photo that isn't rejected by then is left alone.
+    fn trash_quality_rejects(&self, reject_ids: Vec<i64>, restore_ids: Vec<i64>, final_rejects: Vec<i64>) {
+        let mw = self.clone();
+        self.apply_quality_choices(reject_ids, restore_ids, Some(Box::new(move || {
+            let images: Vec<Image> = match mw.db.conn() {
+                Ok(conn) => final_rejects
+                    .iter()
+                    .filter_map(|&id| queries::get_image(&conn, id).ok().flatten())
+                    .filter(|img| img.flagged == -1)
+                    .collect(),
+                Err(e) => return mw.show_error(&e.to_string()),
+            };
+            if images.is_empty() {
+                return mw.toast("No rejected photos to move to the Trash");
+            }
+            selection_bar::confirm_trash_images(images, &mw.timeline.downgrade(), &mw.selection_context());
+        })));
     }
 
     /// Score the photos without a current quality score (AI-7), in the
@@ -1858,7 +2086,147 @@ impl MainWindow {
     /// selection or view, and show what looks blurred or badly exposed.
     pub fn analyse_quality(&self) {
         let mw = self.clone();
-        self.with_face_model(Rc::new(move || mw.run_quality_check()));
+        self.with_face_model(Rc::new(move || {
+            let mw2 = mw.clone();
+            mw.with_aesthetic_model(Rc::new(move || mw2.run_quality_check()));
+        }));
+    }
+
+    /// Run `then`, first offering to download the aesthetic model if it isn't
+    /// there yet and could run: without it, the analysis sees only sharpness
+    /// and exposure, not whether a photo looks good.
+    fn with_aesthetic_model(&self, then: Rc<dyn Fn()>) {
+        let store = photon_ai::store::ModelStore::default_store();
+        let specs = photon_ai::aesthetic::specs();
+        let offer = !self.aesthetic_model_declined.get()
+            && specs.len() == 2
+            && !photon_ai::aesthetic::model_ready(&store)
+            && photon_ai::openvino::OpenVinoBackend::is_available();
+        if !offer {
+            return then();
+        }
+        let missing: Vec<_> = specs
+            .into_iter()
+            .filter(|s| !matches!(store.status(s), photon_ai::store::ModelStatus::Ready { .. }))
+            .collect();
+        let bytes: u64 = missing.iter().map(|s| s.size_bytes).sum();
+        let licences: Vec<String> = photon_ai::aesthetic::specs()
+            .iter()
+            .map(|s| format!("{} ({}, {} licence)", s.id, s.source, s.licence))
+            .collect();
+
+        let dialog = adw::MessageDialog::new(
+            Some(&self.window),
+            Some("Judge How Photos Look?"),
+            Some(&format!(
+                "Sharpness and exposure can't tell a well-composed photo from a dull one. \
+                 A learned aesthetic model scores how good each photo looks as a whole — \
+                 composition, light, subject — so the best frame of a burst is kept and weak \
+                 photos are offered for rejection (never ticked for you).\n\n\
+                 {} MB download: {}\n\
+                 It runs on this computer; no photo leaves it. About 0.2 s per photo on a GPU, \
+                 1 s on the CPU.",
+                bytes / 1_000_000,
+                licences.join(", ")
+            )),
+        );
+        dialog.add_response("later", "Not Now");
+        dialog.add_response("download", "Download");
+        dialog.set_response_appearance("download", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("download"));
+        dialog.set_close_response("later");
+        let mw = self.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response != "download" {
+                mw.aesthetic_model_declined.set(true);
+                return then();
+            }
+            let (mw2, then) = (mw.clone(), then.clone());
+            mw.download_models(missing.clone(), "the aesthetic model", Box::new(move |result| {
+                match result {
+                    Ok(()) => then(),
+                    Err(e) => {
+                        mw2.aesthetic_model_declined.set(true);
+                        mw2.toast(&format!("{e}. Continuing without the aesthetic score."));
+                        then();
+                    }
+                }
+            }));
+        });
+        dialog.present();
+    }
+
+    /// Download `specs` in the background, with progress and Stop in the
+    /// bottom bar, then call `done` (an error says what failed or that it was
+    /// stopped).
+    fn download_models(
+        &self,
+        specs: Vec<photon_ai::manifest::ModelSpec>,
+        what: &'static str,
+        done: Box<dyn FnOnce(Result<(), String>)>,
+    ) {
+        if self.progress_revealer.reveals_child() {
+            return done(Err("Another task is running".into()));
+        }
+        let total: u64 = specs.iter().map(|s| s.size_bytes).sum::<u64>().max(1);
+        self.status_label.set_text(&format!("Downloading {what}…"));
+        self.progress_bar.set_fraction(0.0);
+        self.cancel_button.set_label("Stop");
+        self.cancel_button.set_visible(true);
+        self.progress_revealer.set_reveal_child(true);
+
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_c = cancel.clone();
+        let cancel_handler = self
+            .cancel_button
+            .connect_clicked(move |_| cancel_c.store(true, std::sync::atomic::Ordering::Relaxed));
+
+        let (tx, rx) = async_channel::bounded::<u64>(16);
+        let mw = self.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(bytes) = rx.recv().await {
+                mw.progress_bar.set_fraction(bytes as f64 / total as f64);
+                mw.status_label.set_text(&format!(
+                    "Downloading {what}: {} of {} MB",
+                    bytes / 1_000_000,
+                    total / 1_000_000
+                ));
+            }
+        });
+
+        let mw = self.clone();
+        glib::spawn_future_local(async move {
+            let result = gio::spawn_blocking(move || -> Result<(), String> {
+                let store = photon_ai::store::ModelStore::default_store();
+                let mut before = 0u64;
+                for spec in &specs {
+                    let last_sent = std::sync::atomic::AtomicU64::new(0);
+                    let progress = |got: u64, _: u64| {
+                        // A message per megabyte at most.
+                        if got - last_sent.load(std::sync::atomic::Ordering::Relaxed) >= 1_000_000 {
+                            last_sent.store(got, std::sync::atomic::Ordering::Relaxed);
+                            let _ = tx.try_send(before + got);
+                        }
+                    };
+                    store.download(spec, Some(&progress), Some(&cancel)).map_err(|e| {
+                        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            "Download stopped".to_string()
+                        } else {
+                            log::warn!("Downloading {}: {e:#}", spec.id);
+                            format!("{} couldn't be downloaded: {e}", spec.id)
+                        }
+                    })?;
+                    before += spec.size_bytes;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap_or_else(|_| Err("The download worker crashed".into()));
+            mw.progress_revealer.set_reveal_child(false);
+            mw.cancel_button.set_visible(false);
+            mw.cancel_button.disconnect(cancel_handler);
+            done(result);
+        });
     }
 
     /// Score the photos of `scope` (all photos if `None`; `what` names it)
@@ -1878,13 +2246,16 @@ impl MainWindow {
         // "Unscored below version MAX" = every photo that can be scored.
         let below = if force { i32::MAX } else { photon_import::QUALITY_VERSION };
         // With the face model downloaded, photos scored before it get their faces checked.
-        let faces_on = photon_ai::faces::model_ready(&photon_ai::store::ModelStore::default_store())
-            && photon_ai::openvino::OpenVinoBackend::is_available();
+        let store = photon_ai::store::ModelStore::default_store();
+        let openvino = photon_ai::openvino::OpenVinoBackend::is_available();
+        let faces_on = openvino && photon_ai::faces::model_ready(&store);
+        // Likewise, the aesthetic score once its model is downloaded.
+        let aesthetic_on = openvino && photon_ai::aesthetic::model_ready(&store);
         let mut unscored = match self
             .db
             .conn()
             .map_err(|e| e.to_string())
-            .and_then(|c| queries::get_unscored_images(&c, below, faces_on).map_err(|e| e.to_string()))
+            .and_then(|c| queries::get_unscored_images(&c, below, faces_on, aesthetic_on).map_err(|e| e.to_string()))
         {
             Ok(list) => list,
             Err(e) => return self.show_error(&e),
@@ -1967,9 +2338,10 @@ impl MainWindow {
                 (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
             // One detector for all workers: inference takes ~5 ms, decoding
             // the preview longer, so they rarely wait for it.
+            let backend = photon_ai::openvino::OpenVinoBackend::new();
+            let store = photon_ai::store::ModelStore::default_store();
             let detector = if faces_on {
-                let backend = photon_ai::openvino::OpenVinoBackend::new();
-                match photon_ai::faces::load_detector(&photon_ai::store::ModelStore::default_store(), &backend) {
+                match photon_ai::faces::load_detector(&store, &backend) {
                     Ok(Some((detector, device))) => {
                         log::info!("Face-aware quality analysis on {device}");
                         Some(std::sync::Mutex::new(detector))
@@ -1977,6 +2349,23 @@ impl MainWindow {
                     Ok(None) => None,
                     Err(e) => {
                         log::warn!("Face model unavailable; scoring without faces: {e:#}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            // One aesthetic scorer too: OpenVINO already spreads one photo
+            // over every core (or runs it on the GPU).
+            let scorer = if aesthetic_on {
+                match photon_ai::aesthetic::load_scorer(&store, &backend) {
+                    Ok(Some((scorer, device))) => {
+                        log::info!("Aesthetic score on {device}");
+                        Some(std::sync::Mutex::new(scorer))
+                    }
+                    Ok(None) => None,
+                    Err(e) => {
+                        log::warn!("Aesthetic model unavailable; scoring without it: {e:#}");
                         None
                     }
                 }
@@ -2012,6 +2401,16 @@ impl MainWindow {
                                     model.eye_sharpness = eyes;
                                 }
                                 Err(e) => log::warn!("Face detection for photo {id}: {e:#}"),
+                            }
+                        }
+                        if let Some(scorer) = &scorer {
+                            let score = scorer
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("aesthetic scorer poisoned"))
+                                .and_then(|mut s| s.score(&rgb));
+                            match score {
+                                Ok(a) => model.aesthetic = Some(a),
+                                Err(e) => log::warn!("Aesthetic score for photo {id}: {e:#}"),
                             }
                         }
                         let saved = db

@@ -2603,8 +2603,9 @@ pub fn save_image_quality(conn: &Connection, q: &ImageQuality) -> Result<(), Pho
     let mut stmt = conn.prepare_cached(
         "INSERT INTO image_quality (
             image_id, sharpness, sharpness_global, clip_shadows, clip_highlights,
-            mean_luma, quality_version, computed_at, faces, eye_sharpness
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            mean_luma, quality_version, computed_at, faces, eye_sharpness, aesthetic,
+            aesthetic_crop, crop_x, crop_y, crop_w, crop_h
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
         ON CONFLICT(image_id) DO UPDATE SET
             sharpness = excluded.sharpness,
             sharpness_global = excluded.sharpness_global,
@@ -2614,7 +2615,17 @@ pub fn save_image_quality(conn: &Connection, q: &ImageQuality) -> Result<(), Pho
             quality_version = excluded.quality_version,
             computed_at = excluded.computed_at,
             faces = excluded.faces,
-            eye_sharpness = excluded.eye_sharpness",
+            eye_sharpness = excluded.eye_sharpness,
+            -- Doesn't depend on the classical scores' version: a re-score
+            -- without the model keeps the one saved.
+            aesthetic = COALESCE(excluded.aesthetic, image_quality.aesthetic),
+            -- The crop reading goes with the aesthetic score it was made
+            -- against: a new score clears it (checked again if still weak).
+            aesthetic_crop = CASE WHEN excluded.aesthetic IS NULL THEN image_quality.aesthetic_crop ELSE excluded.aesthetic_crop END,
+            crop_x = CASE WHEN excluded.aesthetic IS NULL THEN image_quality.crop_x ELSE excluded.crop_x END,
+            crop_y = CASE WHEN excluded.aesthetic IS NULL THEN image_quality.crop_y ELSE excluded.crop_y END,
+            crop_w = CASE WHEN excluded.aesthetic IS NULL THEN image_quality.crop_w ELSE excluded.crop_w END,
+            crop_h = CASE WHEN excluded.aesthetic IS NULL THEN image_quality.crop_h ELSE excluded.crop_h END",
     )?;
     stmt.execute(params![
         q.image_id,
@@ -2627,13 +2638,35 @@ pub fn save_image_quality(conn: &Connection, q: &ImageQuality) -> Result<(), Pho
         q.computed_at,
         q.faces,
         q.eye_sharpness,
+        q.aesthetic,
+        q.aesthetic_crop,
+        q.crop_rect.map(|r| r[0]),
+        q.crop_rect.map(|r| r[1]),
+        q.crop_rect.map(|r| r[2]),
+        q.crop_rect.map(|r| r[3]),
     ])?;
+    Ok(())
+}
+
+/// Save the crop reading of an image already scored: the best crop's score,
+/// and where it is (`None`: no crop kept the main face).
+pub fn save_aesthetic_crop(
+    conn: &Connection,
+    image_id: i64,
+    score: f64,
+    rect: Option<[f64; 4]>,
+) -> Result<(), PhotonError> {
+    conn.execute(
+        "UPDATE image_quality SET aesthetic_crop = ?2, crop_x = ?3, crop_y = ?4, crop_w = ?5, crop_h = ?6
+         WHERE image_id = ?1",
+        params![image_id, score, rect.map(|r| r[0]), rect.map(|r| r[1]), rect.map(|r| r[2]), rect.map(|r| r[3])],
+    )?;
     Ok(())
 }
 
 /// An `image_quality` row selected as `image_id, sharpness, sharpness_global,
 /// clip_shadows, clip_highlights, mean_luma, quality_version, computed_at,
-/// faces, eye_sharpness`.
+/// faces, eye_sharpness, aesthetic, aesthetic_crop, crop_x, crop_y, crop_w, crop_h`.
 fn quality_from_row(r: &rusqlite::Row) -> rusqlite::Result<ImageQuality> {
     Ok(ImageQuality {
         image_id: r.get(0)?,
@@ -2646,6 +2679,12 @@ fn quality_from_row(r: &rusqlite::Row) -> rusqlite::Result<ImageQuality> {
         computed_at: r.get(7)?,
         faces: r.get(8)?,
         eye_sharpness: r.get(9)?,
+        aesthetic: r.get(10)?,
+        aesthetic_crop: r.get(11)?,
+        crop_rect: match (r.get(12)?, r.get(13)?, r.get(14)?, r.get(15)?) {
+            (Some(x), Some(y), Some(w), Some(h)) => Some([x, y, w, h]),
+            _ => None,
+        },
     })
 }
 
@@ -2653,7 +2692,8 @@ fn quality_from_row(r: &rusqlite::Row) -> rusqlite::Result<ImageQuality> {
 pub fn get_image_quality(conn: &Connection, image_id: i64) -> Result<Option<ImageQuality>, PhotonError> {
     let mut stmt = conn.prepare_cached(
         "SELECT image_id, sharpness, sharpness_global, clip_shadows, clip_highlights,
-                mean_luma, quality_version, computed_at, faces, eye_sharpness
+                mean_luma, quality_version, computed_at, faces, eye_sharpness, aesthetic,
+                aesthetic_crop, crop_x, crop_y, crop_w, crop_h
          FROM image_quality WHERE image_id = ?1",
     )?;
     let q = stmt
@@ -2671,6 +2711,23 @@ pub fn library_eye_sharpness(conn: &Connection, version: i32) -> Result<Vec<f64>
     )?;
     let values = stmt.query_map(params![version], |r| r.get(0))?.collect::<Result<Vec<f64>, _>>()?;
     Ok(values)
+}
+
+/// The aesthetic score of every photo that has one.
+pub fn library_aesthetic_scores(conn: &Connection) -> Result<Vec<f64>, PhotonError> {
+    let mut stmt = conn.prepare("SELECT aesthetic FROM image_quality WHERE aesthetic IS NOT NULL")?;
+    let values = stmt.query_map([], |r| r.get(0))?.collect::<Result<Vec<f64>, _>>()?;
+    Ok(values)
+}
+
+/// How many photos have an aesthetic score below `value`, and how many have one.
+pub fn aesthetic_rank(conn: &Connection, value: f64) -> Result<(usize, usize), PhotonError> {
+    let (below, total): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*) FILTER (WHERE aesthetic < ?1), COUNT(*) FROM image_quality WHERE aesthetic IS NOT NULL",
+        params![value],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok((below as usize, total as usize))
 }
 
 /// The median sharpness of the library's photos scored with `version`, the
@@ -2703,7 +2760,8 @@ pub fn get_image_quality_batch(
         let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
             "SELECT image_id, sharpness, sharpness_global, clip_shadows, clip_highlights,
-                    mean_luma, quality_version, computed_at, faces, eye_sharpness
+                    mean_luma, quality_version, computed_at, faces, eye_sharpness, aesthetic,
+                    aesthetic_crop, crop_x, crop_y, crop_w, crop_h
              FROM image_quality WHERE image_id IN ({placeholders})"
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -2719,14 +2777,14 @@ pub fn get_image_quality_batch(
     Ok(map)
 }
 
-/// Get images that lack quality scores or have scores older than `current_version`.
-/// Returns `(image_id, hash, path)`.
-/// Photos to (re)score: no score, or one older than `current_version`, or —
-/// with `need_faces`, once a face model is available — never checked for faces.
+/// Photos to (re)score, as `(image_id, hash, path)`: no score, or one older
+/// than `current_version`, or — once that model is available — never checked
+/// for faces (`need_faces`) or never given an aesthetic score (`need_aesthetic`).
 pub fn get_unscored_images(
     conn: &Connection,
     current_version: i32,
     need_faces: bool,
+    need_aesthetic: bool,
 ) -> Result<Vec<(i64, String, PathBuf)>, PhotonError> {
     let mut stmt = conn.prepare(
         "SELECT i.id, i.hash, i.path
@@ -2734,11 +2792,12 @@ pub fn get_unscored_images(
          LEFT JOIN image_quality q ON i.id = q.image_id
          WHERE i.hidden = 0
            AND COALESCE(i.missing, 0) = 0
-           AND (q.quality_version IS NULL OR q.quality_version < ?1 OR (?2 AND q.faces IS NULL))
+           AND (q.quality_version IS NULL OR q.quality_version < ?1 OR (?2 AND q.faces IS NULL)
+                OR (?3 AND q.aesthetic IS NULL))
            AND (i.format IS NULL OR i.format NOT LIKE 'VIDEO%')
          ORDER BY COALESCE(i.created_at, i.imported_at) DESC, i.id DESC",
     )?;
-    let rows = stmt.query_map(params![current_version, need_faces], |r| {
+    let rows = stmt.query_map(params![current_version, need_faces, need_aesthetic], |r| {
         let id: i64 = r.get(0)?;
         let hash: String = r.get(1)?;
         let path_str: String = r.get(2)?;
@@ -3257,7 +3316,7 @@ mod tests {
             (id1, id2)
         };
 
-        let unscored = get_unscored_images(&conn, 1, false).unwrap();
+        let unscored = get_unscored_images(&conn, 1, false, false).unwrap();
         assert_eq!(unscored.len(), 2);
 
         let q1 = ImageQuality {
@@ -3271,15 +3330,32 @@ mod tests {
             computed_at: 1700000000,
             faces: Some(1),
             eye_sharpness: Some(88.0),
+            aesthetic: None,
+            aesthetic_crop: None,
+            crop_rect: None,
         };
         save_image_quality(&conn, &q1).unwrap();
 
         let fetched = get_image_quality(&conn, id1).unwrap();
         assert_eq!(fetched, Some(q1.clone()));
 
-        let unscored_now = get_unscored_images(&conn, 1, false).unwrap();
+        let unscored_now = get_unscored_images(&conn, 1, false, false).unwrap();
         assert_eq!(unscored_now.len(), 1);
         assert_eq!(unscored_now[0].0, id2);
+
+        // Once the aesthetic model is there, a photo scored without it is due
+        // again; with its aesthetic score saved, it isn't.
+        assert_eq!(get_unscored_images(&conn, 1, false, true).unwrap().len(), 2);
+        let q1 = ImageQuality { aesthetic: Some(5.25), ..q1 };
+        save_image_quality(&conn, &q1).unwrap();
+        assert_eq!(get_image_quality(&conn, id1).unwrap(), Some(q1.clone()));
+        assert_eq!(get_unscored_images(&conn, 1, false, true).unwrap().len(), 1);
+        assert_eq!(library_aesthetic_scores(&conn).unwrap(), vec![5.25]);
+        assert_eq!(aesthetic_rank(&conn, 6.0).unwrap(), (1, 1));
+        assert_eq!(aesthetic_rank(&conn, 5.0).unwrap(), (0, 1));
+        save_image_quality(&conn, &ImageQuality { aesthetic: None, ..q1.clone() }).unwrap();
+        assert_eq!(get_image_quality(&conn, id1).unwrap().and_then(|q| q.aesthetic), Some(5.25));
+
 
         let batch = get_image_quality_batch(&conn, &[id1, id2]).unwrap();
         assert_eq!(batch.len(), 1);
@@ -3305,6 +3381,21 @@ mod tests {
         };
         save_image_quality(&conn, &ImageQuality { image_id: id3, sharpness: 30.0, ..q1.clone() }).unwrap();
         assert_eq!(library_sharpness_median(&conn, 1).unwrap(), Some(120.5));
+
+        // The crop reading is kept by a re-score without the model, cleared
+        // by a new aesthetic score.
+        save_aesthetic_crop(&conn, id1, 5.6, Some([0.1, 0.0, 0.5, 0.75])).unwrap();
+        let got = get_image_quality(&conn, id1).unwrap().unwrap();
+        assert_eq!((got.aesthetic_crop, got.crop_rect), (Some(5.6), Some([0.1, 0.0, 0.5, 0.75])));
+        save_image_quality(&conn, &ImageQuality { aesthetic: None, ..q1.clone() }).unwrap();
+        assert_eq!(get_image_quality(&conn, id1).unwrap().unwrap().aesthetic_crop, Some(5.6));
+        save_image_quality(&conn, &ImageQuality { aesthetic: Some(5.3), ..q1.clone() }).unwrap();
+        let got = get_image_quality(&conn, id1).unwrap().unwrap();
+        assert_eq!((got.aesthetic, got.aesthetic_crop, got.crop_rect), (Some(5.3), None, None));
+        // Checked, no crop kept the face.
+        save_aesthetic_crop(&conn, id1, 5.3, None).unwrap();
+        let got = get_image_quality(&conn, id1).unwrap().unwrap();
+        assert_eq!((got.aesthetic_crop, got.crop_rect), (Some(5.3), None));
     }
 
     #[test]

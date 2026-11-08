@@ -728,7 +728,13 @@ fn trash_plan(db: &Database, selected: Vec<Image>, mode: Versions) -> TrashPlan 
 }
 
 fn confirm_trash(timeline: &WeakTimeline, ctx: &Context) {
-    let selected = selected_images(timeline, &ctx.db);
+    confirm_trash_images(selected_images(timeline, &ctx.db), timeline, ctx);
+}
+
+/// Ask, then move `selected` (and, by the "Move to Trash Removes"
+/// preference, the other versions of their shots) to the Trash and remove
+/// them from the library. Undoable. Also used by the Photo Quality results.
+pub fn confirm_trash_images(selected: Vec<Image>, timeline: &WeakTimeline, ctx: &Context) {
     if selected.is_empty() {
         return;
     }

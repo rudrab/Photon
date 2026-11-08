@@ -1095,9 +1095,26 @@ pub(crate) fn quality_reading_conn(conn: &rusqlite::Connection, img: &Image) -> 
         }
         None => "Sharpness: nothing to compare with yet".to_string(),
     };
-    if let Some(s) = &suggested {
-        text.push_str(&format!("\nSuggested to reject: {}", s.reason));
+    if let Some(a) = q.aesthetic {
+        text.push_str(&format!("\nAesthetic: {a:.1} / 10"));
+        if let Ok((below, total)) = queries::aesthetic_rank(conn, a) {
+            if total >= quality::MIN_LIBRARY_AESTHETIC {
+                text.push_str(&format!(", better than {:.0}% of your photos", below as f64 / total as f64 * 100.0));
+            }
+        }
+        // Only a hint: Photon never crops.
+        if let (true, Some(c), Some([x, y, w, h])) = (quality::crop_helps(q), q.aesthetic_crop, q.crop_rect) {
+            let rect = photon_ai::aesthetic::CropRect { x, y, w, h };
+            text.push_str(&format!("\nStronger cropped ({c:.1}): {}", rect.describe()));
+        }
     }
+    match &suggested {
+        Some(s) if s.preselected => text.push_str(&format!("\nSuggested to reject: {}", s.reason)),
+        Some(s) => text.push_str(&format!("\nMaybe reject: {}", s.reason)),
+        None => {}
+    }
+    // Only a fault turns the gauge red; a weak look is a matter of taste.
+    let suggested = suggested.filter(|s| s.preselected);
     let score = match (relative, &suggested) {
         (Some(r), Some(_)) => Some((r.percent, Grade::Bad)),
         (Some(r), None) => Some((r.percent, quality::grade(&r))),

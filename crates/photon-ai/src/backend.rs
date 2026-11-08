@@ -75,6 +75,15 @@ pub trait InferenceBackend: Send + Sync {
 
     /// Load and compile a model for the specified device.
     fn load(&self, model_path: &Path, device: Device) -> Result<Box<dyn LoadedModel>>;
+
+    /// Load a model whose single input has dynamic dimensions (an ONNX export
+    /// with `batch_size`, `height`…) fixed to `input_shape` first: a GPU or NPU
+    /// compiles a static model faster and runs it better. Backends that can't
+    /// reshape load it as it is.
+    fn load_with_input_shape(&self, model_path: &Path, device: Device, input_shape: &[usize]) -> Result<Box<dyn LoadedModel>> {
+        let _ = input_shape;
+        self.load(model_path, device)
+    }
 }
 
 /// An instantiated, compiled model ready to run inference.
