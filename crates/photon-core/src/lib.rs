@@ -5,6 +5,7 @@
 
 pub mod db;
 pub mod error;
+pub mod host;
 pub mod models;
 
 pub use db::Database;

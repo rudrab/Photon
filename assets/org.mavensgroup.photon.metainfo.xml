@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.mavensgroup.photon</id>
+  <name>Photon</name>
+  <summary>Cull and organise photos, with darktable round trips</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="org.mavensgroup">
+    <name>Rudra Banerjee</name>
+  </developer>
+  <description>
+    <p>
+      Photon is a fast, non-destructive photo manager and culling workstation for GNOME.
+      It never changes your originals: ratings, picks, rejects, colour labels and keywords
+      go to XMP sidecars that darktable and other tools read and write too.
+    </p>
+    <ul>
+      <li>Safe imports from cards, cameras and folders, verified and with an optional backup copy</li>
+      <li>Keyboard culling with ratings, picks, rejects, colour labels and compare mode</li>
+      <li>RAW, JPEG, HEIC, AVIF and video, with 1:1 zoom</li>
+      <li>Optional, local AI quality analysis: blur, missed focus, exposure and an aesthetic score</li>
+      <li>Albums, events, hierarchical keywords and smart collections</li>
+      <li>Export with colour management, metadata and your darktable edits</li>
+    </ul>
+    <p>
+      This build uses your own darktable, exiftool and editors, and keeps its library in the
+      same folders as a build from source.
+    </p>
+  </description>
+  <launchable type="desktop-id">org.mavensgroup.photon.desktop</launchable>
+  <url type="homepage">https://github.com/rudrab/Photon</url>
+  <url type="bugtracker">https://github.com/rudrab/Photon/issues</url>
+  <url type="help">https://rudrab.github.io/Photon/</url>
+  <categories>
+    <category>Graphics</category>
+    <category>Photography</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.5.0" date="2026-11-08">
+      <description>
+        <p>
+          A learned aesthetic score with a crop check, restoring rejected photos from Photo
+          Quality, and Move Rejects to Trash. Linux builds are now a Flatpak.
+        </p>
+      </description>
+    </release>
+  </releases>
+</component>

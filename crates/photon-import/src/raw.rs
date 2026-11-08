@@ -18,7 +18,7 @@ use image::{DynamicImage, RgbImage};
 use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -146,9 +146,8 @@ pub fn darktable_cli() -> Option<PathBuf> {
     static FOUND: OnceLock<Option<PathBuf>> = OnceLock::new();
     FOUND
         .get_or_init(|| {
-            std::env::split_paths(&std::env::var_os("PATH")?)
-                .map(|dir| dir.join("darktable-cli"))
-                .find(|p| p.is_file())
+            // On the host when Photon runs as a Flatpak.
+            photon_core::host::find_program(std::ffi::OsStr::new("darktable-cli"))
         })
         .clone()
 }
@@ -174,7 +173,7 @@ pub fn render_with_darktable(raw: &Path, xmp: Option<&Path>, space: ColorSpace, 
     let configdir = private_darktable_config(work.path())?;
     let out = work.path().join("render.tif");
 
-    let mut cmd = Command::new(cli);
+    let mut cmd = photon_core::host::command(cli);
     cmd.arg(raw);
     if let Some(xmp) = xmp {
         cmd.arg(xmp);
@@ -194,7 +193,7 @@ pub fn render_with_darktable(raw: &Path, xmp: Option<&Path>, space: ColorSpace, 
             break status;
         }
         if started.elapsed() > DARKTABLE_TIMEOUT {
-            let _ = child.kill();
+            photon_core::host::terminate(&mut child);
             let _ = child.wait();
             bail!("darktable-cli took over {} s; abandoned", DARKTABLE_TIMEOUT.as_secs());
         }
@@ -221,7 +220,7 @@ pub fn render_darktable_preview(raw: &Path, xmp: Option<&Path>, max_width: u32) 
     let configdir = private_darktable_config(work.path())?;
     let out = work.path().join("preview.jpg");
 
-    let mut cmd = Command::new(cli);
+    let mut cmd = photon_core::host::command(cli);
     cmd.arg(raw);
     if let Some(xmp) = xmp {
         cmd.arg(xmp);
@@ -241,7 +240,7 @@ pub fn render_darktable_preview(raw: &Path, xmp: Option<&Path>, max_width: u32) 
             break status;
         }
         if started.elapsed() > DARKTABLE_TIMEOUT {
-            let _ = child.kill();
+            photon_core::host::terminate(&mut child);
             let _ = child.wait();
             bail!("darktable-cli took over {} s; abandoned", DARKTABLE_TIMEOUT.as_secs());
         }

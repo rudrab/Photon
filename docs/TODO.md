@@ -90,6 +90,20 @@ Useful tools installed on the dev machine: `xmllint`, `exiv2`, `darktable-cli`,
 
 ### Done (2026-11-08) — don't redo
 
+- **Linux ships as a Flatpak only** (decided by the user 2026-11-08; RPM/DEB dropped, source
+  code still attached to releases). `flatpak/org.mavensgroup.photon.yml` (GNOME 51), built by
+  `flatpak/build.sh` and `.github/workflows/release.yml` (Flathub's builder image/action,
+  crates vendored with flatpak-cargo-generator at a pinned commit). Decisions: `--filesystem=host`
+  (sidecars anywhere); host programs (darktable-cli, exiftool, thumbnailers, editors) through
+  `flatpak-spawn --host` (`photon_core::host::command`; a missing one fails with `NotFound` as
+  natively) — so **not Flathub-compatible**; the library stays in the host's
+  `~/.local/share|.cache|.config/photon` (`host::use_host_folders` sets the XDG variables and a
+  host-visible `TMPDIR` first thing in `main`); OpenVINO 2026.0 CPU bundled **from the PyPI wheel
+  (Apache-2.0)** — Intel's prebuilt archives are under the proprietary "OpenVINO Distribution
+  License", don't use them; libheif 1.23.7 + libde265 built in (the runtime's libheif has no
+  HEVC decoder). **Any new external program must be spawned with `photon_core::host::command`.**
+  Not done: an aarch64 Flatpak (OpenVINO is x86_64-only there); GPU/NPU AI in the Flatpak.
+
 - AI-7 learned aesthetic score (CLIP ViT-L/14 + LAION aesthetic head) and restoring
   rejects from the Photo Quality results. See AI-7. Checked by hand by the user on 2026-11-08.
 

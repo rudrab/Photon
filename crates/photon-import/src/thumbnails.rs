@@ -659,7 +659,7 @@ pub fn load_video_frame(path: &Path, long_edge: u32) -> Result<DynamicImage> {
     let tmp_path = tmp.path().to_path_buf();
 
     // 1. Try gst-video-thumbnailer (standard on GNOME / Fedora)
-    let gst_status = std::process::Command::new("gst-video-thumbnailer")
+    let gst_status = photon_core::host::command("gst-video-thumbnailer")
         .arg("--input-path")
         .arg(path)
         .arg("--output")
@@ -674,7 +674,7 @@ pub fn load_video_frame(path: &Path, long_edge: u32) -> Result<DynamicImage> {
     }
 
     // 2. Try ffmpegthumbnailer
-    let ffmpeg_status = std::process::Command::new("ffmpegthumbnailer")
+    let ffmpeg_status = photon_core::host::command("ffmpegthumbnailer")
         .arg("-i")
         .arg(path)
         .arg("-o")
@@ -692,7 +692,7 @@ pub fn load_video_frame(path: &Path, long_edge: u32) -> Result<DynamicImage> {
 
     // 3. Fallback to gst-launch-1.0
     let uri = format!("file://{}", path.canonicalize().unwrap_or_else(|_| path.to_path_buf()).display());
-    let gst_launch = std::process::Command::new("gst-launch-1.0")
+    let gst_launch = photon_core::host::command("gst-launch-1.0")
         .arg("-q")
         .arg("playbin")
         .arg(format!("uri={uri}"))

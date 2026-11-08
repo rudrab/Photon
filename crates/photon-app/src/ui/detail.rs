@@ -1709,7 +1709,7 @@ fn populate_info_panel(
     let p1 = image.path.clone();
     let cmd1 = prefs.viewer.clone();
     btn_view.connect_clicked(move |_| {
-        let _ = Command::new(&cmd1).arg(&p1).spawn();
+        let _ = photon_core::host::command(&cmd1).arg(&p1).spawn();
     });
     open_col.append(&btn_view);
 
@@ -1726,7 +1726,7 @@ fn populate_info_panel(
     let img_id = image.id;
     let tool = editor_cmd.clone();
     btn_edit.connect_clicked(move |_| {
-        let _ = Command::new(&cmd2).arg(&p2).spawn();
+        let _ = photon_core::host::command(&cmd2).arg(&p2).spawn();
         if let (Some(id), Ok(conn)) = (img_id, db2.conn()) {
             let _ = queries::record_edit(&conn, id, &tool, None);
         }
@@ -1742,7 +1742,7 @@ fn populate_info_panel(
         let img_id2 = image.id;
         let tool2 = prefs.raster_editor.clone();
         btn_raster.connect_clicked(move |_| {
-            let _ = Command::new(&cmd3).arg(&p3).spawn();
+            let _ = photon_core::host::command(&cmd3).arg(&p3).spawn();
             if let (Some(id), Ok(conn)) = (img_id2, db3.conn()) {
                 let _ = queries::record_edit(&conn, id, &tool2, None);
             }
@@ -1795,7 +1795,7 @@ fn populate_info_panel(
                         let gi_id = gi.id;
                         let tool_name = cmd.clone();
                         btn.connect_clicked(move |_| {
-                            let _ = Command::new(&cmd_clone).arg(&path).spawn();
+                            let _ = photon_core::host::command(&cmd_clone).arg(&path).spawn();
                             if let (Some(id), Ok(conn)) = (gi_id, db_g.conn()) {
                                 let _ = queries::record_edit(&conn, id, &tool_name, None);
                             }
@@ -1871,7 +1871,7 @@ fn open_in_editor(
     } else {
         image.path.clone()
     };
-    let mut child = Command::new(cmd).arg(&target).spawn().map_err(|e| {
+    let mut child = photon_core::host::command(cmd).arg(&target).spawn().map_err(|e| {
         log::warn!("Starting {cmd} for {}: {e}", image.path.display());
         if e.kind() == std::io::ErrorKind::NotFound {
             format!("Couldn't open the editor: “{cmd}” isn't installed (Preferences → Editors)")

@@ -820,7 +820,7 @@ fn embed_metadata(out: &Path, format: ExportFormat, e: &Embed) -> Result<Vec<Str
         return Ok(warnings);
     }
 
-    let mut cmd = std::process::Command::new("exiftool");
+    let mut cmd = photon_core::host::command("exiftool");
     cmd.args(["-q", "-q", "-m", "-overwrite_original", "-charset", "iptc=UTF8"]);
     if e.metadata {
         cmd.arg("-TagsFromFile")
@@ -887,7 +887,7 @@ fn embed_copyright(out: &Path, c: &CopyrightInfo) -> Option<String> {
     if c.is_empty() {
         return None;
     }
-    let mut cmd = std::process::Command::new("exiftool");
+    let mut cmd = photon_core::host::command("exiftool");
     cmd.args(["-q", "-q", "-m", "-overwrite_original", "-wm", "cg", "-charset", "iptc=UTF8", "-IPTC:CodedCharacterSet=UTF8"]);
     let (creator, notice, terms) = (c.creator.trim(), c.notice.trim(), c.usage_terms.trim());
     if !creator.is_empty() {
@@ -1586,7 +1586,7 @@ mod tests {
         let (out, warning) = export_single_with_warning(&src, &keywords, &config).unwrap();
         assert_eq!(warning, None);
 
-        let output = std::process::Command::new("exiftool")
+        let output = photon_core::host::command("exiftool")
             .args(["-s3", "-XMP-dc:Title", "-XMP-dc:Subject", "-IPTC:Keywords", "-XMP-xmp:Rating"])
             .arg(&out)
             .output()

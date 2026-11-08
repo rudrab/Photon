@@ -15,3 +15,12 @@ photon.db-wal
 
 # Local build configuration (machine-specific paths)
 /.cargo/
+
+# Flatpak builds (flatpak/build.sh)
+/flatpak/build-dir/
+/flatpak/repo/
+/flatpak/.flatpak-builder/
+/flatpak/cargo-sources.json
+/flatpak/flatpak-cargo-generator.py
+/.flatpak-builder/
+/photon.flatpak

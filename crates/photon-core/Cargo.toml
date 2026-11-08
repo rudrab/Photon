@@ -16,6 +16,7 @@ r2d2.workspace = true
 r2d2_sqlite.workspace = true
 thiserror.workspace = true
 thumbhash.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.10"

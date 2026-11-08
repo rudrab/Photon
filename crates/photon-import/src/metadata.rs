@@ -30,7 +30,6 @@ use photon_core::models::ImageFormat;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
-use std::process::Command;
 
 /// Read sizes for EXIF attempts, smallest first.
 const FIRST_READ: u64 = 96 * 1024;
@@ -395,7 +394,7 @@ fn gps_coordinate(exif: &Exif, tag: Tag, ref_tag: Tag, negative_ref: u8, limit: 
 
 fn exiftool(path: &Path) -> Option<ImageMetadata> {
     // -n: machine-readable values (signed GPS, numeric exposure, raw date strings).
-    let output = Command::new("exiftool")
+    let output = photon_core::host::command("exiftool")
         .args(["-json", "-n", "-q"])
         .args([
             "-DateTimeOriginal",

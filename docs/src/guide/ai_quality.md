@@ -19,6 +19,10 @@ Photon can check your photos for blur, missed eye focus, clipped exposure and â€
 
 ### Install OpenVINO
 
+**Flatpak:** nothing to install. OpenVINO 2026.0 (CPU) is included; the Intel GPU and NPU are not available from the Flatpak, so AI runs on the CPU (about 1 s per photo for the aesthetic score).
+
+**Build from source:**
+
 ```bash
 # Fedora
 sudo dnf install openvino tbb

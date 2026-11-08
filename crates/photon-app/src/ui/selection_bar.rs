@@ -28,7 +28,6 @@ use photon_core::models::{Image, Preferences, Versions};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::process::Command;
 use std::rc::Rc;
 use std::thread;
 
@@ -576,7 +575,7 @@ fn open_in_editors(images: &[Image], ctx: &Context) {
             continue;
         }
         let paths: Vec<&PathBuf> = group.iter().map(|img| &img.path).collect();
-        match Command::new(editor).args(&paths).spawn() {
+        match photon_core::host::command(editor).args(&paths).spawn() {
             Ok(_) => {
                 if let Ok(conn) = ctx.db.conn() {
                     for img in &group {

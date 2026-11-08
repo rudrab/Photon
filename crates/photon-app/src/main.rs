@@ -20,6 +20,9 @@ const APP_ID: &str = "org.mavensgroup.photon";
 const APP_CSS: &str = include_str!("../resources/style.css");
 
 fn main() -> Result<()> {
+    // Inside the Flatpak: the user's real folders and a /tmp host programs can
+    // see. First, before GLib or any thread reads the environment.
+    photon_core::host::use_host_folders();
     env_logger::init();
 
     let app = adw::Application::builder().application_id(APP_ID).build();

@@ -5,6 +5,13 @@
 Photo Quality now judges how a photo looks, not only whether it is sharp, and
 lets you take back or act on its rejects.
 
+### Changed
+- **Linux releases are a Flatpak** (`photon.flatpak`, x86_64), alongside the
+  source code. The RPM is gone: distribution packages kept breaking on library
+  versions. The Flatpak uses the same library folders as a source build, runs
+  your own darktable-cli, exiftool, thumbnailers and editors, and includes
+  OpenVINO (CPU) for the AI analysis. Build it with `flatpak/build.sh`.
+
 ### Added
 - **Aesthetic score** in Analyse Photo Quality (optional, ~612 MB download,
   MIT + Apache-2.0): CLIP ViT-L/14 with the LAION aesthetic predictor judges how

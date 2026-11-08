@@ -104,7 +104,30 @@ Unlike legacy managers that lock edits into proprietary catalogs or freeze under
 
 ---
 
-## 🚀 Building & Installation
+## 🚀 Installation
+
+### Flatpak (recommended, any Linux distribution)
+
+Linux releases ship as a **Flatpak** (x86_64). Download `photon.flatpak` from the [latest release](https://github.com/rudrab/Photon/releases), then:
+
+```bash
+# Once: Flathub provides the GNOME runtime
+flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+
+flatpak install --user ./photon.flatpak
+flatpak run org.mavensgroup.photon
+```
+
+The Flatpak behaves like a native install:
+
+* **Same library folders** as a build from source (`~/.local/share/photon`, `~/.cache/photon`, `~/.config/photon`), so switching between the two keeps your catalogue, thumbnails and models.
+* **Your own tools:** `darktable-cli`, `exiftool`, the video thumbnailers and your editors run from your system. Install them with your distribution's packages as usual.
+* **AI included:** OpenVINO (CPU) is bundled. The Intel GPU and NPU are not available from the Flatpak; build from source for those.
+* **Permissions:** full access to your files (sidecars are written next to photos anywhere, including external drives) and to run host programs. It is not a tight sandbox, by design.
+
+There are no RPM or DEB packages any more: distribution packages kept breaking on library versions. On other systems, build from source.
+
+## 🛠 Building from Source
 
 ### 1. System Dependencies
 
@@ -114,7 +137,7 @@ Unlike legacy managers that lock edits into proprietary catalogs or freeze under
 
 | Extra | Enables | Without it |
 | :--- | :--- | :--- |
-| OpenVINO 2026.x + oneTBB | AI eye-focus scoring | AI shows as unavailable; blur and exposure checks still work |
+| OpenVINO 2026.x + oneTBB | AI analysis (faces, eye focus, aesthetic score) | AI shows as unavailable; blur and exposure checks still work |
 | GStreamer plugins (`-good`, `-libav`) | Video playback | Videos do not play |
 | `darktable-cli` | RAW export with your darktable edits | Built-in RAW renderer |
 | `exiftool` | Fuller metadata in exports | Reduced built-in writer |
@@ -158,6 +181,15 @@ cargo test --release
 # Build and run
 cargo run --release -p photon-app
 ```
+
+### 3. Build the Flatpak yourself
+
+```bash
+flatpak/build.sh            # builds and installs it for your user
+flatpak/build.sh --bundle   # also writes photon.flatpak
+```
+
+Needs `flatpak-builder` and Python 3 with `aiohttp`, `PyYAML` and `tomlkit`. See the [installation guide](https://rudrab.github.io/Photon/installation.html).
 
 ---
 

@@ -1,0 +1,148 @@
+# Flatpak manifest for Photon. Build with `flatpak/build.sh` (or see
+# docs/src/installation.md); the release workflow builds the same way.
+#
+# Photon is a front end to the user's own photos and tools, so this build is
+# deliberately not a tight sandbox (and not meant for Flathub as is):
+#   - --filesystem=host: XMP sidecars are written next to photos anywhere,
+#     including archives imported in place on external drives.
+#   - org.freedesktop.Flatpak: darktable-cli (RAW exports with darktable
+#     edits), exiftool, the video thumbnailers and the user's editors run on
+#     the host through `flatpak-spawn --host` (photon_core::host).
+#   - The catalogue, thumbnails, models and preferences stay in
+#     ~/.local/share/photon, ~/.cache/photon and ~/.config/photon, shared with a
+#     source build (photon_core::host::use_host_folders).
+id: org.mavensgroup.photon
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: photon
+
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # Sound of videos played in the viewer.
+  - --socket=pulseaudio
+  # Downloading the AI models (only after the user agrees).
+  - --share=network
+  # Photos and sidecars anywhere; removable drives.
+  - --filesystem=host
+  # The host's .desktop files, for Preferences → Editors.
+  - --filesystem=host-os:ro
+  # Host programs: darktable-cli, exiftool, thumbnailers, editors.
+  - --talk-name=org.freedesktop.Flatpak
+  # Cameras and phones mounted by GVfs (import from device).
+  - --talk-name=org.gtk.vfs.*
+  - --filesystem=xdg-run/gvfs
+  - --filesystem=xdg-run/gvfsd
+  # "Show in Files".
+  - --talk-name=org.freedesktop.FileManager1
+  # The bundled OpenVINO (CPU), found by the openvino crate's finder.
+  - --env=OPENVINO_INSTALL_DIR=/app/openvino
+
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /lib/cmake
+  - /share/man
+  - '*.a'
+  - '*.la'
+
+modules:
+  # HEVC decoder for HEIC photos. The runtime's libheif is built without it.
+  - name: libde265
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DENABLE_SDL=OFF
+      - -DENABLE_DECODER=OFF
+      - -DENABLE_ENCODER=OFF
+    sources:
+      - type: git
+        url: https://github.com/strukturag/libde265.git
+        tag: v1.1.3
+        commit: ba62bf4cfb3242f3bf0a45617ff09e35236e4d82
+
+  # HEIC (libde265) and AVIF (dav1d, aom from the runtime) decoding, built in.
+  # Photon needs libheif >= 1.23 (libheif-rs "v1_23").
+  - name: libheif
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DBUILD_TESTING=OFF
+      - -DENABLE_PLUGIN_LOADING=OFF
+      - -DWITH_LIBDE265=ON
+      - -DWITH_LIBDE265_PLUGIN=OFF
+      - -DWITH_DAV1D=ON
+      - -DWITH_DAV1D_PLUGIN=OFF
+      - -DWITH_AOM_DECODER=ON
+      - -DWITH_AOM_DECODER_PLUGIN=OFF
+      - -DWITH_AOM_ENCODER=OFF
+      - -DWITH_X265=OFF
+      - -DWITH_EXAMPLES=OFF
+      - -DWITH_GDK_PIXBUF=OFF
+      - -DWITH_FUZZERS=OFF
+    sources:
+      - type: git
+        url: https://github.com/strukturag/libheif.git
+        tag: v1.23.7
+        commit: 12a259a5882dd99d45ec5fc77e296a3b620d1e2e
+
+  # OpenVINO runtime for the optional AI analysis, taken from the PyPI wheel,
+  # which is Apache-2.0 (Intel's own prebuilt archives are under a proprietary
+  # distribution licence, so they can't be used). Only the CPU plugin, the ONNX
+  # and IR readers and oneTBB; the libraries find each other through
+  # RPATH=$ORIGIN. /app/openvino/runtime/lib/intel64 is the layout the openvino
+  # crate's finder expects (OPENVINO_INSTALL_DIR above). No GPU: that needs
+  # Intel's compute runtime, which the sandbox lacks.
+  - name: openvino
+    buildsystem: simple
+    only-arches:
+      - x86_64
+    build-commands:
+      - python3 -m zipfile -e openvino.whl wheel
+      - install -d /app/openvino/runtime/lib/intel64
+      - >-
+        cd wheel/openvino/libs && cp -a
+        libopenvino.so.2600 libopenvino_c.so.2600
+        libopenvino_intel_cpu_plugin.so
+        libopenvino_onnx_frontend.so.2600 libopenvino_ir_frontend.so.2600
+        libtbb.so.12 libtbbmalloc.so.2 libtbbbind_2_5.so.3 libhwloc.so.15
+        /app/openvino/runtime/lib/intel64/
+      - ln -s libopenvino_c.so.2600 /app/openvino/runtime/lib/intel64/libopenvino_c.so
+      - install -d /app/share/licenses/openvino
+      - cp -r wheel/openvino-2026.0.0.dist-info/licenses/. /app/share/licenses/openvino/
+    sources:
+      - type: file
+        url: https://files.pythonhosted.org/packages/3c/f8/bd25df6ebd42b2425a2d5fe504389e941adbee41356078a97357469d18cb/openvino-2026.0.0-20965-cp312-cp312-manylinux_2_28_x86_64.whl
+        sha256: 4ad9cbf77ed954b64b056cb91ebb95e5691da1c86238e610b565e5347e73a5c5
+        dest-filename: openvino.whl
+
+  - name: photon
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/photon/cargo
+        CARGO_NET_OFFLINE: 'true'
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml --verbose
+      - cargo --offline build --release --locked -p photon-app
+      - install -Dm755 target/release/photon /app/bin/photon
+      - install -Dm644 assets/org.mavensgroup.photon.desktop /app/share/applications/org.mavensgroup.photon.desktop
+      - install -Dm644 assets/org.mavensgroup.photon.svg /app/share/icons/hicolor/scalable/apps/org.mavensgroup.photon.svg
+      - install -Dm644 assets/org.mavensgroup.photon.metainfo.xml /app/share/metainfo/org.mavensgroup.photon.metainfo.xml
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - target
+          - .flatpak-builder
+          - flatpak/build-dir
+          - flatpak/repo
+      # Every crate in Cargo.lock, for the offline build. Generated by
+      # flatpak/build.sh with flatpak-cargo-generator; not committed.
+      - cargo-sources.json

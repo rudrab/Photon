@@ -680,6 +680,12 @@ fn discover_image_apps() -> Vec<DesktopApp> {
 
     // Directories to scan
     let mut dirs: Vec<PathBuf> = vec![PathBuf::from("/usr/share/applications")];
+    // In the Flatpak, /usr is the runtime's; the host's apps (which
+    // `host::command` launches) are under /run/host (`--filesystem=host-os:ro`).
+    if photon_core::host::in_flatpak() {
+        dirs.insert(0, PathBuf::from("/run/host/usr/share/applications"));
+        dirs.insert(1, PathBuf::from("/run/host/usr/local/share/applications"));
+    }
     if let Some(data) = dirs::data_dir() {
         dirs.push(data.join("applications"));
     }
