@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — 2026-11-08
+
+Photo Quality now judges how a photo looks, not only whether it is sharp, and
+lets you take back or act on its rejects.
 
 ### Added
 - **Aesthetic score** in Analyse Photo Quality (optional, ~612 MB download,

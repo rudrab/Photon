@@ -91,7 +91,7 @@ Useful tools installed on the dev machine: `xmllint`, `exiv2`, `darktable-cli`,
 ### Done (2026-11-08) — don't redo
 
 - AI-7 learned aesthetic score (CLIP ViT-L/14 + LAION aesthetic head) and restoring
-  rejects from the Photo Quality results. See AI-7; **not checked by hand in the GUI**.
+  rejects from the Photo Quality results. See AI-7. Checked by hand by the user on 2026-11-08.
 
 ### Done (2026-11-01) — don't redo
 
@@ -917,7 +917,7 @@ was benchmarked: none with verified OSI-licensed ONNX weights was chosen yet (AI
 - Also gives AI-quality "find similar", on top of PART 4's perceptual hash.
 
 ### 🟢 AI-7 · Image quality sorter (classical) · S–M
-### 🟢 AI-7 · Learned score (aesthetic) · S–M — done 2026-11-08, GUI not checked by hand
+### 🟢 AI-7 · Learned score (aesthetic) · S–M — done 2026-11-08, checked by hand by the user
 
 Done 2026-09-29 (implemented by another agent, reviewed and corrected). Menu: "Analyse
 Photo Quality…" (scores what isn't scored in the selection/view, then shows the
@@ -1022,7 +1022,7 @@ passes the photos rejected after them (re-read; only `flagged == -1` ones) to
 `selection_bar::confirm_trash_images`, the same confirm + trash + undo as Delete on a
 selection (`MainWindow::selection_context` builds the bar's context for both).
 
-**Not verified by hand (2026-11-08):** run Analyse Photo Quality on a copy of the library:
+**Checked by hand by the user (2026-11-08):** run Analyse Photo Quality on a copy of the library:
 accept the aesthetic model download (progress, Stop), check the scores and "★ Best" on a
 burst, that weak-looking photos are listed unticked, untick an "Already Rejected" photo
 and Apply (it shows as unflagged, its sidecar has no `xmp:Rating="-1"`), Ctrl+Z twice
